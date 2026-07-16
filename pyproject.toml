@@ -86,8 +86,10 @@ dev = [
 atlas = "atlas.cli:app"
 
 [tool.hatch.build]
-# The local codebase graph is a development aid, never a distributable asset.
-exclude = ["/.codebase-memory"]
+# Development and packaging metadata are not runtime package contents. Keeping
+# the Homebrew formula out of the sdist also lets its checksum safely point at
+# the immutable sdist release asset.
+exclude = ["/.codebase-memory", "/packaging"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/atlas"]

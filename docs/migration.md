@@ -19,17 +19,19 @@ directories.
 | Log dir | macOS: `~/Library/Logs/atlas`; Linux: `~/.local/state/atlas/log` |
 | Default output dir | `~/Downloads/atlas` |
 
-## Install This Pre-release Checkout
+## Install Atlas
 
-This repository is distributed as a source preview, not as a supported package
-release. The unqualified PyPI and Homebrew `atlas` names belong to unrelated
-projects; this project uses the collision-safe distribution name
-`atlas-download-manager` while keeping the `atlas` command. No package release
-exists yet, so install the current checkout with uv:
+The supported package is available from the official Homebrew tap. The
+unqualified PyPI and Homebrew `atlas` names belong to unrelated projects; this
+project uses the collision-safe distribution and formula name
+`atlas-download-manager` while keeping the `atlas` command:
 
 ```bash
-uv tool install . --force
+brew install xkam7ar/tap/atlas-download-manager
 ```
+
+Contributors can instead install the current checkout with
+`uv tool install . --force`.
 
 The local guided installer can be reviewed without mutation:
 
@@ -37,8 +39,8 @@ The local guided installer can be reviewed without mutation:
 bash install.sh --no-install --no-menu --yes
 ```
 
-A future supported release must publish a tag and its full commit ID. Verify the
-release metadata, then install using the commit ID:
+A supported release publishes a tag and its full commit ID. Verify the release
+metadata, then install a Python-only fallback using the commit ID:
 
 ```bash
 release_commit=0123456789abcdef0123456789abcdef01234567
