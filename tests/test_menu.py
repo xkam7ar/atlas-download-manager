@@ -10,6 +10,7 @@ from rich.console import Console
 from rich.text import Text
 from rich.theme import Theme
 
+from atlas import menu as menu_module
 from atlas.config import AtlasSettings
 from atlas.directory_index import DirectoryEntry, DirectoryIndex
 from atlas.errors import AtlasError
@@ -840,20 +841,22 @@ def test_questionary_text_keeps_blank_distinct_from_cancel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     blank_questionary = FakeQuestionary(text_answer="   ")
-    monkeypatch.setattr(
-        "atlas.menu.importlib.import_module",
-        lambda _name: blank_questionary,
-    )
-
-    assert QuestionaryPromptUI().text("Optional value") == ""
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            menu_module.importlib,
+            "import_module",
+            lambda _name: blank_questionary,
+        )
+        assert QuestionaryPromptUI().text("Optional value") == ""
 
     canceled_questionary = FakeQuestionary(text_answer=None)
-    monkeypatch.setattr(
-        "atlas.menu.importlib.import_module",
-        lambda _name: canceled_questionary,
-    )
-
-    assert QuestionaryPromptUI().text("Optional value") is None
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            menu_module.importlib,
+            "import_module",
+            lambda _name: canceled_questionary,
+        )
+        assert QuestionaryPromptUI().text("Optional value") is None
 
 
 def test_questionary_secret_uses_hidden_password_prompt(
