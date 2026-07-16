@@ -390,7 +390,6 @@ atlas site "https://example.com/docs/" --depth 1
 atlas site "https://example.com/docs/" --no-assets
 atlas site "https://example.com/docs/" --span-hosts
 atlas site "https://example.com/docs/" --same-domain-www
-atlas site "https://example.com/docs/" --max-files 500 --adaptive --explain
 atlas site "https://example.com/docs/" --max-total-size 5G --max-runtime 1800
 atlas site "https://example.com/docs/" --accept html,css,png,jpg
 atlas site from-file urls.txt --force-sitemap --base "https://example.com/"
@@ -440,7 +439,7 @@ path layout (`--directories/--no-directories`,
 `--overwrite/--no-overwrite`), archival mode (`--warc-file`,
 `--warc-compression/--no-warc-compression`, `--warc-cdx`, `--warc-max-size`),
 authenticated mirror UX (`--cookies/--no-cookies`, `--cookies-from-browser`,
-`--browser-cookies`, `--load-cookies`, `--save-cookies`,
+`--load-cookies`, `--save-cookies`,
 `--keep-session-cookies`, `--cookie-suffixes`, `--netrc/--no-netrc`,
 `--netrc-file`, `--http-user`, `--http-password`, `--proxy-user`,
 `--proxy-password`), HTTP request controls (`--user-agent`, `--header`,
@@ -468,6 +467,13 @@ signature verification (`--verify-sig`, `--signature-extensions`,
 `--tls-false-start/--no-tls-false-start`), and structured stats summaries
 (`--stats/--no-stats`) for site/server/DNS/TLS/OCSP state.
 
+Recursive mirror safety is stricter than the parser surface: request-body
+options are rejected because Wget can replay private bodies across redirects;
+secret-bearing custom headers and referrers are rejected for the same reason.
+Site Basic authentication requires Wget2—the GNU Wget fallback is refused.
+WARC output is staged in a private directory and published atomically with
+owner-only permissions; an existing symlink is never followed.
+
 Mirror scope presets are mutually exclusive:
 
 - `--same-host-only`: exact seed host only.
@@ -476,15 +482,16 @@ Mirror scope presets are mutually exclusive:
 
 Mirror bounds:
 
-- `--max-files N`: adaptive scan guard; fails before execution when scan counts exceed the limit.
+- `--max-files N`: a hard cap only for signature-recognized exact directory
+  indexes. Conventional Wget/Wget2 recursion is rejected because it cannot
+  guarantee a file-count stop.
 - `--max-total-size SIZE`: friendly alias for Wget2 quota.
 - `--max-runtime SEC`: Atlas-enforced subprocess runtime cap.
 
 `--adaptive` scans the starting page, applies the selected politeness profile,
-and adds crawler queue guidance to the plan preview. Website plans and ordinary
-HTML directory indexes are executed by Wget2/Wget. Signature-recognized
-CopyParty indexes can resolve to Atlas's bounded `native-exact-index` path
-instead, as described below.
+and adds crawler queue guidance to the plan preview. Website plans are executed
+by Wget2/Wget. Use `atlas dir` for signature-recognized CopyParty indexes that
+can resolve to Atlas's bounded `native-exact-index` path, as described below.
 
 ## `atlas dir URL`
 
@@ -501,8 +508,7 @@ atlas dir "https://example.com/files/" --same-host-only --max-files 500 --adapti
 atlas dir "https://example.com/files/" --same-domain-www --max-total-size 5G
 atlas dir "https://example.com/files/" --backend wget2
 atlas dir "http://textfiles.com/directory.html" \
-  --no-parent --domains textfiles.com,www.textfiles.com \
-  --wait 0.5 --random-wait --timeout 60 --tries 5 --continue
+  --no-parent --same-domain-www --wait 0.5 --timeout 60 --tries 5 --continue
 atlas dir "https://example.com/files/" --adaptive --max-concurrency 4 --per-host-concurrency 2
 atlas dir "https://example.com/files/" --adaptive --explain --json
 atlas dir "https://example.com/files/" --dry-run --json
@@ -563,8 +569,9 @@ native exact-index executor preserves relative paths, rejects traversal,
 symlink escapes, and case-folded collisions, honors resume/timestamp/overwrite
 and runtime bounds, and checks cancellation between files and during native
 file progress. Exact-index transfer is currently sequential, one native file at
-a time. Mirror `--wait` and `--random-wait` apply to recursive Wget2/Wget work,
-not this exact native loop. Ordinary HTML trees remain recursive Wget2/Wget work.
+a time. Mirror `--wait` applies to recursive Wget2/Wget work, not this exact
+native loop. The `dir` command does not expose `--random-wait`; ordinary HTML
+trees remain recursive Wget2/Wget work.
 
 Wget2 stats are parsed after mirror runs. Successful mirrors show URL counts,
 failures, redirects, downloaded bytes, hosts, and DNS/TLS/OCSP summaries when

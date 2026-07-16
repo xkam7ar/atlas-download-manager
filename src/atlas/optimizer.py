@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
 from time import monotonic
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
 
 from atlas.adaptive import (
     AdaptiveScheduler,
@@ -20,6 +20,7 @@ from atlas.adaptive import (
 )
 from atlas.backends import FileDownloadEngine, SiteMirrorEngine, filename_from_url
 from atlas.config import AtlasSettings
+from atlas.directory_index import http_url_origin, safe_http_url_path_parts, same_http_origin
 from atlas.errors import AtlasError
 from atlas.file_probe import probe_direct_file, unprobed_direct_file
 from atlas.models import (
@@ -759,6 +760,14 @@ class DownloadOptimizer:
                 dry_run=options.dry_run,
                 timeout=_directory_scan_timeout(options, deadline),
             )
+        execution_url = options.url
+        if item.final_url and item.final_url != options.url:
+            if not options.span_hosts and not same_http_origin(options.url, item.final_url):
+                raise AtlasError(
+                    "Mirror seed redirected outside the requested origin; use an explicit "
+                    "spanning policy or start from the final URL"
+                )
+            execution_url = item.final_url
         exact_items: tuple[WorkItem, ...] | None = None
         if isinstance(options, DirectoryMirrorOptions) and (
             item.scan_type in _EXACT_DIRECTORY_SCAN_TYPES
@@ -771,7 +780,12 @@ class DownloadOptimizer:
             monotonic() - planning_started,
         )
         if not (options.adaptive or options.explain) and exact_items is None:
-            return options.model_copy(update={"planning_runtime_seconds": planning_runtime_seconds})
+            return options.model_copy(
+                update={
+                    "url": execution_url,
+                    "planning_runtime_seconds": planning_runtime_seconds,
+                }
+            )
         plan_kind = HubKind.dir if is_directory else HubKind.site
         if plan_kind == HubKind.dir:
             item = item.model_copy(update={"kind": HubKind.dir})
@@ -801,6 +815,7 @@ class DownloadOptimizer:
         }[options.politeness.value]
         wait = max(options.wait or 0.0, wait_floor)
         update: dict[str, object] = {
+            "url": execution_url,
             "wait": wait,
             "adaptive_plan": adaptive_plan,
             "planning_runtime_seconds": planning_runtime_seconds,
@@ -999,50 +1014,17 @@ def _directory_relative_name(base_url: str, item_url: str) -> str:
 
 
 def _directory_url_origin(value: str) -> tuple[str, str, int]:
-    parsed = urlparse(value)
-    scheme = parsed.scheme.casefold()
-    if (
-        scheme not in {"http", "https"}
-        or parsed.hostname is None
-        or parsed.username is not None
-        or parsed.password is not None
-    ):
+    origin = http_url_origin(value)
+    if origin is None:
         raise AtlasError("Directory index contains an unsafe URL origin.")
-    try:
-        host = parsed.hostname.rstrip(".").encode("idna").decode("ascii").casefold()
-        port = parsed.port or (443 if scheme == "https" else 80)
-    except (UnicodeError, ValueError) as exc:
-        raise AtlasError("Directory index contains an unsafe URL origin.") from exc
-    return scheme, host, port
+    return origin
 
 
 def _safe_url_path_parts(path: str) -> tuple[str, ...]:
-    parts: list[str] = []
-    for raw_part in path.split("/"):
-        if not raw_part:
-            continue
-        if re.search(r"%(?![0-9A-Fa-f]{2})", raw_part):
-            raise AtlasError("Directory index contains an unsafe path component.")
-        part = raw_part
-        for _ in range(8):
-            if re.search(r"%[0-9A-Fa-f]{2}", part) is None:
-                break
-            decoded = unquote(part)
-            if decoded == part:
-                break
-            part = decoded
-        else:
-            if re.search(r"%[0-9A-Fa-f]{2}", part):
-                raise AtlasError("Directory index contains an unsafe path component.")
-        if (
-            part in {".", ".."}
-            or "/" in part
-            or "\\" in part
-            or any(ord(char) < 32 or ord(char) == 127 for char in part)
-        ):
-            raise AtlasError("Directory index contains an unsafe path component.")
-        parts.append(part)
-    return tuple(parts)
+    parts = safe_http_url_path_parts(path)
+    if parts is None:
+        raise AtlasError("Directory index contains an unsafe path component.")
+    return parts
 
 
 def _directory_item_selected(options: DirectoryMirrorOptions, relative_name: str) -> bool:

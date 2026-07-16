@@ -948,6 +948,8 @@ def scan_site(url: str, *, dry_run: bool = False, timeout: float = 10.0) -> Work
         if directory_index.parser_name == "copyparty-text"
         else "directory-style CopyParty HTML index"
         if directory_index.parser_name == "copyparty-html"
+        else "directory-style HTML index"
+        if directory_index.parser_name == "autoindex-html"
         else _scan_type(url=final_url or url, content_type=content_type, counts=counts)
     )
     recommended_mode = (
@@ -958,7 +960,7 @@ def scan_site(url: str, *, dry_run: bool = False, timeout: float = 10.0) -> Work
     recommended_strategy = (
         "download as a direct file or use a supported directory index"
         if parser_error
-        else _recommended_strategy(counts)
+        else _recommended_strategy(scan_type=scan_type, counts=counts)
     )
     estimated_bytes = None if incomplete_scan else _scan_estimated_bytes(discovered_items)
     no_links = counts["links"] == 0 and counts["same_host"] == 0
@@ -1211,6 +1213,7 @@ def _discovered_work_items_from_directory_entries(
                 host=host,
                 final_host=host,
                 kind=kind,
+                filename=entry.name,
                 content_type=entry.content_type,
                 content_length=entry.visible_size,
                 last_modified=(
@@ -1375,7 +1378,8 @@ def _scan_type(*, url: str, content_type: str | None, counts: dict[str, int]) ->
         return "direct file"
     if content_type and "html" not in content_type.lower():
         return "non-HTML resource"
-    if counts.get("folders", 0) or counts.get("files", 0) >= 5:
+    folders = counts.get("folders", 0)
+    if folders and folders >= counts.get("html", 0):
         return "directory-style HTML index"
     if counts.get("html", 0) >= counts.get("files", 0):
         return "HTML page"
@@ -1383,22 +1387,30 @@ def _scan_type(*, url: str, content_type: str | None, counts: dict[str, int]) ->
 
 
 def _recommended_mode(*, scan_type: str, counts: dict[str, int]) -> str:
+    if "directory" in scan_type and "index" in scan_type:
+        return "Recursive directory mirror with HTML preservation"
     if scan_type == "media link" or counts.get("media", 0) > max(counts.get("files", 0), 0):
         return "Media extraction with yt-dlp"
     if scan_type == "direct file":
         return "Direct file download"
+    if scan_type == "HTML page":
+        return "Offline website copy with page requisites"
     if counts.get("folders", 0) or counts.get("files", 0) >= counts.get("html", 0):
         return "Recursive directory mirror with HTML preservation"
     return "Offline website copy with page requisites"
 
 
-def _recommended_strategy(counts: dict[str, int]) -> str:
+def _recommended_strategy(*, scan_type: str, counts: dict[str, int]) -> str:
     files = counts.get("files", 0)
     folders = counts.get("folders", 0)
     html = counts.get("html", 0)
     media = counts.get("media", 0)
+    if "directory" in scan_type and "index" in scan_type:
+        return "bounded recursive mirror: same-host/no-parent safety with adaptive queue lanes"
     if media and media >= files:
         return "route media URLs to yt-dlp; keep postprocessing budget separate"
+    if scan_type == "HTML page":
+        return "offline website copy: preserve page requisites and keep traversal bounded"
     if files >= 50 and html <= files:
         return "adaptive small-file lane: high queue concurrency, low per-file threading"
     if folders or html:

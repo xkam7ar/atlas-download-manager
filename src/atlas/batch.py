@@ -315,10 +315,12 @@ def run_batch_concurrent(
     results: list[BatchItemResult] = []
     worker_count = min(concurrency, len(entries))
     unrestricted_queue = per_host_concurrency is None and control is None
+    runtime_control = control or BatchControl()
     pending = list(reversed(entries)) if unrestricted_queue else list(entries)
     active: dict[Future[BatchItemResult], str] = {}
     active_by_host: dict[str, int] = {}
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+    executor = ThreadPoolExecutor(max_workers=worker_count)
+    try:
         while pending or active:
             while pending and len(active) < worker_count:
                 selected_index = (
@@ -343,7 +345,7 @@ def run_batch_concurrent(
                         entry,
                         handler,
                         progress_hook_factory,
-                        control,
+                        runtime_control,
                         host,
                     )
                 except BaseException:
@@ -364,6 +366,14 @@ def run_batch_concurrent(
                 host = active.pop(future)
                 _release_concurrent_host(active_by_host, host)
                 results.append(future.result())
+    except BaseException:
+        runtime_control.cancel_all("batch interrupted")
+        for future in active:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
 
     for item in sorted(results, key=lambda result: result.entry.line_no):
         _add_result(summary, item)
@@ -391,8 +401,10 @@ def run_batch_adaptive(
     results: list[BatchItemResult] = []
     max_workers = max(1, min(scheduler.global_max_concurrency, len(entries)))
     active: dict[Future[BatchItemResult], _AdaptiveBatchSlot] = {}
+    runtime_control = control or BatchControl()
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    try:
         while pending or active:
             _submit_adaptive_ready_items(
                 pending,
@@ -403,7 +415,7 @@ def run_batch_adaptive(
                 progress_hook_factory=progress_hook_factory,
                 host_resolver=host_resolver,
                 max_workers=max_workers,
-                control=control,
+                control=runtime_control,
             )
             if not active:
                 if control is not None and _all_pending_entries_paused(
@@ -421,6 +433,16 @@ def run_batch_adaptive(
                 result = future.result()
                 results.append(result)
                 _record_adaptive_batch_result(scheduler, result, host=slot.host)
+    except BaseException:
+        runtime_control.cancel_all("batch interrupted")
+        for future in active:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+        for slot in active.values():
+            slot.release()
+        raise
+    else:
+        executor.shutdown(wait=True)
 
     for item in sorted(results, key=lambda result: result.entry.line_no):
         _add_result(summary, item)
@@ -456,8 +478,12 @@ def _release_concurrent_host(active_by_host: dict[str, int], host: str) -> None:
 class _AdaptiveBatchSlot:
     context: AbstractContextManager[None]
     host: str | None
+    released: bool = False
 
     def release(self) -> None:
+        if self.released:
+            return
+        self.released = True
         self.context.__exit__(None, None, None)
 
 
@@ -473,8 +499,10 @@ def _submit_adaptive_ready_items(
     max_workers: int,
     control: BatchControl | None,
 ) -> None:
-    target = max(1, min(scheduler.current_concurrency, max_workers))
-    while pending and len(active) < target:
+    while pending:
+        target = max(1, min(scheduler.current_concurrency, max_workers))
+        if len(active) >= target:
+            return
         selected_index = _next_adaptive_entry_index(
             pending,
             scheduler=scheduler,
@@ -546,10 +574,14 @@ def _record_adaptive_batch_result(
     *,
     host: str | None,
 ) -> None:
-    if result.status == DownloadStatus.canceled:
-        return
-    if result.status in {DownloadStatus.success, DownloadStatus.dry_run, DownloadStatus.skipped}:
+    if result.status == DownloadStatus.success:
         scheduler.record_success(host=host)
+        return
+    if result.status in {
+        DownloadStatus.canceled,
+        DownloadStatus.dry_run,
+        DownloadStatus.skipped,
+    }:
         return
     status_code = _backoff_status_code(result.message)
     reason = _backoff_reason(result.message)

@@ -13,6 +13,7 @@ from atlas.models import (
     DownloadEngineChoice,
     FpsChoice,
     HdrChoice,
+    InfoOptions,
     OrganizeMode,
     QualityIntent,
     ResolutionChoice,
@@ -416,6 +417,10 @@ def test_playlist_item_validation(tmp_path: Path) -> None:
     assert _video(tmp_path, playlist_items="1-10,15,20-").playlist_items == "1-10,15,20-"
     with pytest.raises(ValueError):
         _video(tmp_path, playlist_items="10-2")
+    with pytest.raises(ValueError, match="must start at 1"):
+        _video(tmp_path, playlist_items="0")
+    with pytest.raises(ValueError, match="must start at 1"):
+        InfoOptions(url="https://example.com/playlist", playlist_items="0-2")
 
 
 def test_chunk_size_validation_normalizes_suffix(tmp_path: Path) -> None:

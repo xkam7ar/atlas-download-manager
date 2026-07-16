@@ -546,6 +546,7 @@ To add a new settings source:
 
 1. Prefer a pydantic-settings source over manual parsing.
 2. Add it in `AtlasSettings.settings_customise_sources`.
-3. Preserve source priority: init values, environment, TOML, dotenv, secrets,
-   defaults.
+3. Preserve source priority: init values, `ATLAS_` environment, TOML, defaults.
+   Dotenv and file-secret hooks are inactive unless a future implementation
+   explicitly configures their locations.
 4. Add tests that load from a real temporary config file.

@@ -15,13 +15,14 @@ from typer.testing import CliRunner
 import atlas.cli as cli
 from atlas.cli import (
     _print_hub_plan,
+    _print_site_summary,
     _run_batch_hub_plan,
     _write_batch_artifacts,
     _write_mirror_artifacts,
     app,
 )
 from atlas.config import AtlasSettings
-from atlas.errors import AtlasError
+from atlas.errors import AtlasError, ConfigError
 from atlas.models import (
     AdaptiveDownloadPlan,
     AdaptivePoliteness,
@@ -126,6 +127,27 @@ def test_version() -> None:
     assert result.output == "atlas 0.1.0\n"
 
 
+def test_site_summary_handles_unset_optional_bounds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = StringIO()
+    monkeypatch.setattr(
+        cli,
+        "console",
+        Console(file=output, width=100, theme=Theme(resolve_theme(AtlasThemeName.light))),
+    )
+    options = SiteDownloadOptions(
+        url="https://example.com/",
+        output_dir=tmp_path,
+    )
+
+    _print_site_summary(options, "wget2")
+
+    assert "Site Mirror" in output.getvalue()
+    assert "max-runtime" not in output.getvalue()
+
+
 def test_plain_help_and_parse_errors_are_ascii() -> None:
     help_result = runner.invoke(app, ["--plain", "--help"])
     no_unicode_help_result = runner.invoke(app, ["--no-unicode", "--help"])
@@ -212,7 +234,45 @@ def test_no_args_json_suppresses_menu(monkeypatch: pytest.MonkeyPatch) -> None:
     result = runner.invoke(app, ["--json"])
 
     assert result.exit_code == 0
-    assert "Usage: atlas" in result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "help"
+    assert payload["name"] == "atlas"
+    assert "Usage: atlas" in payload["help"]
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["get", "--json"],
+        [
+            "file",
+            "https://example.com/archive.zip",
+            "--backend",
+            "bogus",
+            "--dry-run",
+            "--json",
+        ],
+        ["file", "https://example.com/archive.zip", "--unknown-option", "--json"],
+    ],
+)
+def test_parser_errors_are_single_json_documents(args: list[str]) -> None:
+    result = runner.invoke(app, args)
+
+    assert result.exit_code == 2
+    payload = json.loads(result.output)
+    assert payload["status"] == "error"
+    assert payload["exit_code"] == 2
+    assert "Usage:" not in result.output
+
+
+def test_parser_error_is_one_terminal_ndjson_event() -> None:
+    result = runner.invoke(app, ["get", "--progress", "json"])
+
+    assert result.exit_code == 2
+    lines = [json.loads(line) for line in result.output.splitlines() if line]
+    assert len(lines) == 1
+    assert lines[0]["status"] == "error"
+    assert lines[0]["exit_code"] == 2
 
 
 def test_menu_command_forces_launcher(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -253,6 +313,24 @@ def test_doctor_json_output(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.exit_code == 0
     assert '"name": "Python"' in result.output
     assert '"ok": true' in result.output
+
+
+def test_doctor_json_config_error_is_machine_readable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_config() -> AtlasSettings:
+        raise ConfigError("Invalid TOML: secret_token=TOPSECRET")
+
+    monkeypatch.setattr("atlas.cli.load_config", fail_config)
+
+    result = runner.invoke(app, ["doctor", "--json"])
+
+    assert result.exit_code == 2
+    payload = json.loads(result.output)
+    assert payload["status"] == "error"
+    assert payload["exit_code"] == 2
+    assert payload["error"]["type"] == "ConfigError"
+    assert "TOPSECRET" not in result.output
 
 
 def test_doctor_network_json_filters_network_checks(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -563,6 +641,37 @@ def test_doctor_fix_json_includes_setup_plan(
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["doctor"]["checks"][0]["name"] == "Python"
+    assert payload["setup_plan"]["missing_tools"] == ["ffmpeg"]
+
+
+def test_doctor_fix_network_json_fails_on_https_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "atlas.cli.run_doctor",
+        lambda _settings, **_kwargs: DoctorReport(
+            checks=[
+                DoctorCheck(name="Python", ok=True, detail="3.12.7"),
+                DoctorCheck(
+                    name="HTTPS verification",
+                    ok=False,
+                    detail="TLS certificate verification failed",
+                    required=False,
+                ),
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        "atlas.cli.build_setup_plan",
+        lambda _settings, *, mode: _fake_setup_plan(tmp_path),
+    )
+
+    result = runner.invoke(app, ["doctor", "--network", "--json", "--fix"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["doctor"]["checks"][1]["name"] == "HTTPS verification"
     assert payload["setup_plan"]["missing_tools"] == ["ffmpeg"]
 
 
@@ -884,6 +993,47 @@ def test_file_dry_run_json() -> None:
     assert "archive.zip" in result.output
 
 
+def test_persisted_aria2_defaults_apply_to_file_and_media_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = AtlasSettings(
+        output_dir=tmp_path,
+        archive_file=tmp_path / "archive.txt",
+        aria2_connections=7,
+        aria2_splits=6,
+        aria2_chunk_size="4M",
+    )
+    monkeypatch.setattr("atlas.cli.load_config", lambda: settings)
+    monkeypatch.setattr("atlas.planner.which", lambda _name: "/opt/bin/aria2c")
+
+    file_result = runner.invoke(
+        app,
+        [
+            "file",
+            "https://example.com/archive.zip",
+            "--backend",
+            "aria2",
+            "--dry-run",
+            "--json",
+        ],
+    )
+    video_result = runner.invoke(
+        app,
+        ["video", "https://example.com/watch?v=1", "--dry-run", "--json"],
+    )
+
+    assert file_result.exit_code == 0
+    file_payload = json.loads(file_result.output)
+    assert file_payload["summary"]["connections"] == 7
+    assert file_payload["summary"]["splits"] == 6
+    assert file_payload["summary"]["chunk_size"] == "4M"
+    assert video_result.exit_code == 0
+    assert '"-x7"' in video_result.output
+    assert '"-s6"' in video_result.output
+    assert '"-k4M"' in video_result.output
+
+
 def test_file_dry_run_json_accepts_wget2_backend() -> None:
     result = runner.invoke(
         app,
@@ -912,7 +1062,7 @@ def test_file_dry_run_json_accepts_wget2_backend() -> None:
     assert "--limit-rate=2M" in result.output
 
 
-def test_file_dry_run_json_redacts_sensitive_backend_args() -> None:
+def test_file_dry_run_json_rejects_sensitive_headers_on_redirecting_backend() -> None:
     result = runner.invoke(
         app,
         [
@@ -931,13 +1081,13 @@ def test_file_dry_run_json_redacts_sensitive_backend_args() -> None:
         ],
     )
 
-    assert result.exit_code == 0
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
     assert "super-secret" not in result.output
     assert "secret-token" not in result.output
     assert "/tmp/atlas-secret-cookies.txt" not in result.output
-    assert "--http-password=<redacted>" in result.output
-    assert "--load-cookies=<redacted>" in result.output
-    assert "--header=Authorization: <redacted>" in result.output
+    assert payload["status"] == "error"
+    assert "Sensitive custom headers require the native backend" in payload["error"]["message"]
 
 
 def test_file_dry_run_json_shows_aria2_policy_options() -> None:
@@ -2476,10 +2626,6 @@ def test_site_dry_run_json_accepts_wget2_policy_flags(
             "--no-cache",
             "--compression",
             "br",
-            "--method",
-            "POST",
-            "--body-data",
-            "payload",
             "--cookies-from-browser",
             "safari",
             "--https-only",
@@ -2523,8 +2669,6 @@ def test_site_dry_run_json_accepts_wget2_policy_flags(
             "--gnupg-homedir",
             "gnupg",
             "--verify-save-failed",
-            "--max-files",
-            "25",
             "--max-total-size",
             "10M",
             "--max-runtime",
@@ -2588,7 +2732,7 @@ def test_site_dry_run_json_accepts_wget2_policy_flags(
     assert "--force-html" in result.output
     assert "--force-css" in result.output
     assert "--force-metalink" in result.output
-    assert "--warc-file=archive.warc.gz" in result.output
+    assert "--warc-file=archive" in result.output
     assert "--warc-compression" in result.output
     assert "--warc-cdx" in result.output
     assert "--warc-max-size=1G" in result.output
@@ -2597,8 +2741,6 @@ def test_site_dry_run_json_accepts_wget2_policy_flags(
     assert "--referer=https://referrer.example/" in result.output
     assert "--no-cache" in result.output
     assert "--compression=br" in result.output
-    assert "--method=POST" in result.output
-    assert "--body-data=<redacted>" in result.output
     assert '"browser_cookies": true' in result.output
     assert "--https-only" in result.output
     assert "--https-enforce=hard" in result.output
@@ -2629,7 +2771,7 @@ def test_site_dry_run_json_accepts_wget2_policy_flags(
     assert "--signature-extensions=asc,sig" in result.output
     assert "--gnupg-homedir=gnupg" in result.output
     assert "--verify-save-failed" in result.output
-    assert '"max_files": 25' in result.output
+    assert '"max_files": null' in result.output
     assert '"max_total_size": "10M"' in result.output
     assert '"max_runtime": 60.0' in result.output
     assert "--quota=10M" in result.output
@@ -2696,6 +2838,25 @@ def test_site_from_file_mode_builds_input_parser_plan(
     assert "--force-sitemap" in result.output
     assert "--base=https://example.com/" in result.output
     assert '"input_file_only": true' in result.output
+
+
+def test_site_from_file_without_base_accepts_local_parser_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
+    input_file = tmp_path / "urls.txt"
+    input_file.write_text("https://example.com/file.zip\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["site", "from-file", str(input_file), "--backend", "wget2", "--dry-run", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["summary"]["input_file_only"] is True
+    assert f"--input-file={input_file}" in payload["args"]
 
 
 def test_get_routes_media_to_video_dry_run() -> None:
@@ -2840,6 +3001,16 @@ def test_get_reports_invalid_backend_without_traceback() -> None:
 
     assert result.exit_code == 1
     assert "--backend for file downloads must be auto, native, aria2, or wget2" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_get_invalid_url_json_is_one_machine_error_document() -> None:
+    result = runner.invoke(app, ["get", "not-a-url", "--dry-run", "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["status"] == "error"
+    assert payload["error"]["type"] == "ValidationError"
     assert "Traceback" not in result.output
 
 
@@ -3232,7 +3403,7 @@ def test_video_download_summary_hides_intermediate_stream_files(
     assert "Technical files hidden: 2 stream file(s) merged." in result.output
 
 
-def test_video_download_without_saved_path_retries_without_archive(
+def test_video_download_without_saved_path_preserves_archive_semantics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     expected_hook = object()
@@ -3252,11 +3423,8 @@ def test_video_download_without_saved_path_retries_without_archive(
             )
 
     class FakeReporter:
-        instances = 0
-
         def __init__(self, _console, **_kwargs):
-            type(self).instances += 1
-            self.saved_paths = [] if type(self).instances == 1 else ["/tmp/Example Video.mkv"]
+            self.saved_paths = []
 
         def __enter__(self):
             return self
@@ -3271,44 +3439,26 @@ def test_video_download_without_saved_path_retries_without_archive(
     result = runner.invoke(app, ["video", "https://example.com/watch?v=1"])
 
     assert result.exit_code == 0
-    assert calls == [True, False]
-    assert "Archive mismatch" in result.output
-    assert "Re-downloading once" in result.output
-    assert "Download complete" in result.output
-    assert "No new file was downloaded" not in result.output
+    assert calls == [True]
+    assert "No new file was downloaded" in result.output
+    assert "already be recorded in the download archive" in result.output
 
 
-def test_archive_retry_notice_is_ascii_in_plain_mode() -> None:
-    previous_console = cli.console
-    try:
-        configure_visuals(plain=True, env={})
-        output = StringIO()
-        cli.console = cli.themed_console(file=output, force_terminal=True)
+def test_media_archive_is_private_before_backend_execution(tmp_path: Path) -> None:
+    archive = tmp_path / "download-archive.txt"
+    archive.write_text("history\n", encoding="utf-8")
+    archive.chmod(0o666)
+    options = VideoDownloadOptions(
+        url="https://example.com/watch?v=1",
+        output_dir=tmp_path,
+        archive=True,
+        archive_file=archive,
+    )
 
-        cli._maybe_print_archive_retry(SimpleNamespace(quiet=False))
+    cli._prepare_media_archive(options)
 
-        assert output.getvalue().isascii()
-        assert "Archive mismatch - saved file missing." in output.getvalue()
-    finally:
-        cli.console = previous_console
-        configure_visuals(
-            theme=AtlasThemeName.auto,
-            plain=False,
-            unicode=True,
-            color=True,
-            motion=True,
-            env={},
-        )
-
-
-def test_archive_retry_notice_does_not_contaminate_json_output() -> None:
-    output = StringIO()
-
-    with cli.console.capture() as capture:
-        cli._maybe_print_archive_retry(SimpleNamespace(quiet=False, json_output=True))
-    output.write(capture.get())
-
-    assert output.getvalue() == ""
+    assert archive.read_text(encoding="utf-8") == "history\n"
+    assert archive.stat().st_mode & 0o777 == 0o600
 
 
 def test_video_overwrite_disables_archive_for_redownload(
@@ -3399,7 +3549,7 @@ def test_audio_download_prints_summary_without_network(monkeypatch: pytest.Monke
     assert "Audio saved" in result.output
 
 
-def test_audio_download_without_saved_path_retries_without_archive(
+def test_audio_download_without_saved_path_preserves_archive_semantics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     expected_hook = object()
@@ -3438,10 +3588,9 @@ def test_audio_download_without_saved_path_retries_without_archive(
     result = runner.invoke(app, ["audio", "https://example.com/watch?v=1"])
 
     assert result.exit_code == 0
-    assert calls == [True, False]
-    assert "Archive mismatch" in result.output
-    assert "Re-downloading once" in result.output
-    assert "Audio saved" in result.output
+    assert calls == [True]
+    assert "No new file was downloaded" in result.output
+    assert "--no-archive" in result.output
 
 
 def test_playlist_video_dry_run_uses_playlist_mode() -> None:
@@ -3777,6 +3926,34 @@ def test_formats_rejects_conflicting_filters() -> None:
     assert "Traceback" not in result.output
 
 
+def test_formats_json_error_is_one_machine_readable_document() -> None:
+    result = runner.invoke(
+        app,
+        [
+            "formats",
+            "https://example.com/watch?v=1",
+            "--video-only",
+            "--audio-only",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["status"] == "error"
+    assert payload["error"]["type"] == "AtlasError"
+
+
+def test_file_json_validation_error_is_one_machine_readable_document() -> None:
+    result = runner.invoke(app, ["file", "relative/path", "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["status"] == "error"
+    assert payload["error"]["type"] == "ValidationError"
+    assert "absolute HTTP or HTTPS" in payload["error"]["message"]
+
+
 def test_formats_verbose_conflict_keeps_the_original_error() -> None:
     result = runner.invoke(
         app,
@@ -3883,6 +4060,140 @@ def test_error_renderer_uses_high_contrast_semantic_styles() -> None:
         )
 
 
+def test_verbose_error_trace_omits_secret_values() -> None:
+    secret = "sentinel-secret"
+
+    with cli.console.capture() as capture:
+        try:
+            raise AtlasError(f"request failed Authorization: Bearer {secret}")
+        except AtlasError as exc:
+            cli._handle_error(exc, verbose=True)
+
+    output = capture.get()
+    assert secret not in output
+    assert "<redacted>" in output
+    assert "Trace (values omitted):" in output
+
+
+def test_machine_json_is_unstyled_and_unwrapped_on_narrow_tty() -> None:
+    output = StringIO()
+    previous_console = cli.console
+    try:
+        cli.console = Console(
+            file=output,
+            force_terminal=True,
+            color_system="standard",
+            width=10,
+        )
+        cli._print_json({"message": "literal [markup] text that must not wrap"})
+    finally:
+        cli.console = previous_console
+
+    rendered = output.getvalue()
+    assert "\x1b[" not in rendered
+    assert json.loads(rendered)["message"] == "literal [markup] text that must not wrap"
+
+
+def test_file_json_progress_emits_only_parseable_ndjson(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = StringIO()
+    previous_console = cli.console
+    destination = tmp_path / "archive.bin"
+
+    class FakeEngine:
+        def plan(self, _options: FileDownloadOptions) -> SimpleNamespace:
+            return SimpleNamespace(backend="native", output=destination)
+
+    class FakeAdapter:
+        def run(self, options: FileDownloadOptions, progress_callback=None) -> DownloadResult:
+            assert progress_callback is not None
+            progress_callback(
+                ProgressEvent(
+                    engine=EngineKind.native,
+                    status="starting",
+                    phase=ProgressPhase.download,
+                    filename=destination.name,
+                    url=options.url,
+                )
+            )
+            progress_callback(
+                ProgressEvent(
+                    engine=EngineKind.native,
+                    status="done",
+                    phase=ProgressPhase.done,
+                    filename=str(destination),
+                    url=options.url,
+                )
+            )
+            return DownloadResult(
+                status=DownloadStatus.success,
+                url=options.url,
+                message=f"Saved to {destination}",
+            )
+
+    monkeypatch.setattr("atlas.cli.FileDownloadEngine", FakeEngine)
+    monkeypatch.setattr("atlas.cli.DirectFileAdapter", FakeAdapter)
+    try:
+        cli.console = Console(
+            file=output,
+            force_terminal=True,
+            color_system="standard",
+            width=20,
+        )
+        paths = cli._run_file_download(
+            AtlasSettings(output_dir=tmp_path, archive_file=tmp_path / "archive.txt"),
+            FileDownloadOptions(
+                url="https://example.com/archive.bin",
+                output_dir=tmp_path,
+                progress_mode=cli.ProgressMode.json,
+            ),
+        )
+    finally:
+        cli.console = previous_console
+
+    lines = output.getvalue().splitlines()
+    assert paths == [destination]
+    assert [json.loads(line)["status"] for line in lines] == ["starting", "done"]
+    assert all("\x1b[" not in line for line in lines)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        [
+            "file",
+            "https://example.com/archive.zip",
+            "--backend",
+            "native",
+            "--dry-run",
+            "--progress",
+            "json",
+        ],
+        [
+            "site",
+            "https://example.com/docs/",
+            "--backend",
+            "wget2",
+            "--dry-run",
+            "--progress",
+            "json",
+        ],
+    ],
+)
+def test_single_command_dry_run_progress_json_is_one_ndjson_event(args: list[str]) -> None:
+    result = runner.invoke(app, args)
+
+    assert result.exit_code == 0
+    payloads = [json.loads(line) for line in result.output.splitlines() if line]
+    assert len(payloads) == 1
+    assert payloads[0]["event_type"] == "dry_run"
+    assert payloads[0]["status"] == "done"
+    assert payloads[0]["exit_code"] == 0
+    assert "Dry Run Plan" not in result.output
+
+
 def test_batch_dry_run_summary(tmp_path: Path) -> None:
     batch_file = tmp_path / "urls.txt"
     batch_file.write_text("# skip\nhttps://example.com/watch?v=1\n", encoding="utf-8")
@@ -3892,6 +4203,235 @@ def test_batch_dry_run_summary(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert "Succeeded" in result.output
     assert "Skipped" in result.output
+
+
+def test_batch_dry_run_json_progress_is_pure_ndjson(tmp_path: Path) -> None:
+    batch_file = tmp_path / "urls.txt"
+    batch_file.write_text("https://example.com/archive.zip\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["batch", str(batch_file), "--kind", "file", "--dry-run", "--progress", "json"],
+    )
+
+    assert result.exit_code == 0
+    lines = result.output.splitlines()
+    assert lines
+    payloads = [json.loads(line) for line in lines]
+    assert payloads[-1]["event_type"] == "batch_summary"
+    assert payloads[-1]["status"] == "done"
+    assert payloads[-1]["exit_code"] == 0
+    assert all("\x1b[" not in line for line in lines)
+
+
+def test_batch_planning_failure_json_progress_emits_terminal_error(tmp_path: Path) -> None:
+    batch_file = tmp_path / "urls.txt"
+    batch_file.write_text("https://example.com/archive.zip\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            str(batch_file),
+            "--kind",
+            "file",
+            "--backend",
+            "bogus",
+            "--dry-run",
+            "--progress",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    events = [json.loads(line) for line in result.output.splitlines()]
+    assert [event["status"] for event in events] == ["error", "error"]
+    assert events[-1]["event_type"] == "batch_summary"
+    assert events[-1]["phase"] == "error"
+    assert events[-1]["exit_code"] == 1
+
+
+def test_batch_runtime_json_progress_suppresses_human_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch_file = tmp_path / "urls.txt"
+    url = "https://example.com/archive.zip"
+    batch_file.write_text(f"{url}\n", encoding="utf-8")
+
+    def fake_shared(*_args: object, **kwargs: object) -> BatchSummary:
+        reporter = kwargs["reporter"]
+        reporter.hook(
+            ProgressEvent(
+                engine=EngineKind.aria2,
+                status="done",
+                phase=ProgressPhase.done,
+                line_no=1,
+                url=url,
+            )
+        )
+        return BatchSummary(
+            kind=BatchKind.file,
+            total=1,
+            succeeded=1,
+            results=[
+                BatchItemResult(
+                    entry=BatchEntry(line_no=1, url=url),
+                    status=DownloadStatus.success,
+                    message="Saved",
+                )
+            ],
+        )
+
+    monkeypatch.setattr("atlas.cli._try_run_aria2_batch_queue", fake_shared)
+
+    result = runner.invoke(
+        app,
+        ["batch", str(batch_file), "--kind", "file", "--progress", "json"],
+    )
+
+    assert result.exit_code == 0
+    lines = result.output.splitlines()
+    payloads = [json.loads(line) for line in lines]
+    assert [payload["status"] for payload in payloads] == ["done", "done"]
+    assert payloads[-1]["event_type"] == "batch_summary"
+    assert payloads[-1]["exit_code"] == 0
+    assert "Batch file" not in result.output
+
+
+def test_file_json_progress_failure_is_pure_ndjson(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "archive.bin"
+
+    class FakeEngine:
+        def plan(self, _options: FileDownloadOptions) -> SimpleNamespace:
+            return SimpleNamespace(backend="native", output=destination)
+
+    class FailingAdapter:
+        def run(self, _options: FileDownloadOptions, progress_callback=None) -> DownloadResult:
+            _ = progress_callback
+            raise AtlasError("backend exploded")
+
+    monkeypatch.setattr("atlas.cli.FileDownloadEngine", FakeEngine)
+    monkeypatch.setattr("atlas.cli.DirectFileAdapter", FailingAdapter)
+
+    result = runner.invoke(
+        app,
+        ["file", "https://example.com/archive.bin", "--progress", "json"],
+    )
+
+    assert result.exit_code == 1
+    lines = result.output.splitlines()
+    assert len(lines) == 1
+    payload = json.loads(lines[0])
+    assert payload["status"] == "error"
+    assert payload["message"] == "backend exploded"
+
+
+def test_batch_adaptive_missing_input_json_has_no_traceback(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "batch",
+            str(tmp_path / "missing.txt"),
+            "--adaptive",
+            "--json",
+            "--output-dir",
+            str(tmp_path / "out"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["status"] == "error"
+    assert "Traceback" not in result.output
+
+
+def test_batch_rejects_invalid_artifact_root_before_execution(tmp_path: Path) -> None:
+    batch_file = tmp_path / "urls.txt"
+    batch_file.write_text("https://example.com/archive.zip\n", encoding="utf-8")
+    invalid_output = tmp_path / "not-a-directory"
+    invalid_output.write_text("occupied", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["batch", str(batch_file), "--json", "--output-dir", str(invalid_output)],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["status"] == "error"
+    assert "artifact folder" in payload["error"]["message"]
+
+
+def test_batch_artifact_failure_preserves_machine_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch_file = tmp_path / "urls.txt"
+    url = "https://example.com/archive.zip"
+    batch_file.write_text(f"{url}\n", encoding="utf-8")
+    summary = BatchSummary(
+        kind=BatchKind.file,
+        total=1,
+        succeeded=1,
+        results=[
+            BatchItemResult(
+                entry=BatchEntry(line_no=1, url=url),
+                status=DownloadStatus.success,
+                message="Saved",
+            )
+        ],
+    )
+    monkeypatch.setattr("atlas.cli._try_run_aria2_batch_queue", lambda *_a, **_kw: summary)
+
+    def fail_artifacts(*_args: object, **_kwargs: object) -> dict[str, Path]:
+        raise AtlasError("artifact write failed")
+
+    monkeypatch.setattr("atlas.cli._write_batch_artifacts", fail_artifacts)
+
+    result = runner.invoke(
+        app,
+        ["batch", str(batch_file), "--json", "--output-dir", str(tmp_path / "out")],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["status"] == "error"
+    assert payload["summary"]["succeeded"] == 1
+
+
+def test_batch_cancellation_uses_nonzero_exit_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch_file = tmp_path / "urls.txt"
+    url = "https://example.com/archive.zip"
+    batch_file.write_text(f"{url}\n", encoding="utf-8")
+    summary = BatchSummary(
+        kind=BatchKind.file,
+        total=1,
+        skipped=1,
+        canceled=1,
+        results=[
+            BatchItemResult(
+                entry=BatchEntry(line_no=1, url=url),
+                status=DownloadStatus.canceled,
+                message="canceled by operator",
+            )
+        ],
+    )
+    monkeypatch.setattr("atlas.cli._try_run_aria2_batch_queue", lambda *_a, **_kw: summary)
+
+    result = runner.invoke(
+        app,
+        ["batch", str(batch_file), "--json", "--output-dir", str(tmp_path / "out")],
+    )
+
+    assert result.exit_code == 130
+    assert json.loads(result.output)["canceled"] == 1
 
 
 def test_batch_continues_after_failure_and_counts_summary(
@@ -4360,6 +4900,8 @@ def test_batch_artifacts_write_summary_manifest_and_retry(tmp_path: Path) -> Non
     assert skipped == ["https://example.com/unknown"]
     assert canceled == []
     assert retry_manifest["retry_failed_only"] == failed
+    assert Path(retry_manifest["export_failed_urls"]) == paths["retry"]
+    assert Path(retry_manifest["export_failed_urls"]).exists()
     assert retry_manifest["retry_checksum_failures_only"] == ["https://example.com/bad.iso"]
     assert retry_manifest["retry_skipped_unknowns_only"] == ["https://example.com/unknown"]
     assert retry_manifest["retry_canceled_only"] == []
@@ -5339,13 +5881,13 @@ def test_mirror_artifacts_write_stable_session_files(tmp_path: Path) -> None:
     retry_manifest = json.loads(paths["retry_manifest"].read_text(encoding="utf-8"))
     assert manifest["smart_session"]["session_type"] == "site_session"
     assert manifest["artifacts"]["retry"].endswith("retry.atlas.json")
-    assert summary["failed"] == 1
-    assert paths["failed"].read_text(encoding="utf-8").splitlines() == [
-        "https://example.com/docs/missing.html"
-    ]
+    assert summary["failed"] == 0
+    assert summary["failed_resource_count"] == 1
+    assert summary["failed_resource_urls"] == ["https://example.com/docs/missing.html"]
+    assert paths["failed"].read_text(encoding="utf-8").splitlines() == [options.url]
     assert paths["skipped"].read_text(encoding="utf-8") == ""
     assert paths["canceled"].read_text(encoding="utf-8") == ""
-    assert retry_manifest["retry_failed_only"] == ["https://example.com/docs/missing.html"]
+    assert retry_manifest["retry_failed_only"] == [options.url]
     assert retry_manifest["retry_canceled_only"] == []
 
 
@@ -5363,6 +5905,48 @@ def test_failed_mirror_artifacts_retry_seed_without_stats(tmp_path: Path) -> Non
     assert paths["failed"].read_text(encoding="utf-8").splitlines() == [options.url]
     retry_manifest = json.loads(paths["retry_manifest"].read_text(encoding="utf-8"))
     assert retry_manifest["retry_failed_only"] == [options.url]
+
+
+def test_canceled_mirror_artifacts_publish_canceled_retry_seed(tmp_path: Path) -> None:
+    options = SiteDownloadOptions(url="https://example.com/docs/", output_dir=tmp_path)
+    result = DownloadResult(
+        status=DownloadStatus.canceled,
+        url=options.url,
+        message="canceled by operator",
+        ydl_opts={"backend": "wget2"},
+    )
+
+    paths = _write_mirror_artifacts(options, result, backend="wget2")
+
+    assert paths["canceled"].read_text(encoding="utf-8").splitlines() == [options.url]
+    retry_manifest = json.loads(paths["retry_manifest"].read_text(encoding="utf-8"))
+    assert retry_manifest["retry_canceled_only"] == [options.url]
+    assert retry_manifest["retry_failed_only"] == []
+
+
+def test_skipped_mirror_artifacts_publish_consistent_skipped_retry_seed(
+    tmp_path: Path,
+) -> None:
+    options = SiteDownloadOptions(url="https://example.com/docs/", output_dir=tmp_path)
+    result = DownloadResult(
+        status=DownloadStatus.skipped,
+        url=options.url,
+        message="no remote changes",
+        ydl_opts={"backend": "wget2"},
+    )
+
+    paths = _write_mirror_artifacts(options, result, backend="wget2")
+
+    summary = json.loads(paths["latest_summary"].read_text(encoding="utf-8"))
+    retry_manifest = json.loads(paths["retry_manifest"].read_text(encoding="utf-8"))
+    assert summary["total"] == 1
+    assert summary["succeeded"] == 0
+    assert summary["failed"] == 0
+    assert summary["skipped"] == 1
+    assert summary["canceled"] == 0
+    assert paths["skipped"].read_text(encoding="utf-8").splitlines() == [options.url]
+    assert retry_manifest["retry_skipped_unknowns_only"] == [options.url]
+    assert retry_manifest["skipped_urls"] == [options.url]
 
 
 def test_batch_live_progress_marks_pre_backend_failures(
@@ -5474,6 +6058,49 @@ def test_batch_progress_callback_adds_adaptive_scheduler_metadata() -> None:
     assert event.per_host_concurrency == 2
     assert event.selected_backend == "native"
     assert "reclassified unknown to large" in (event.scheduler_decision or "")
+
+
+def test_batch_adaptive_updates_do_not_depend_on_reporter() -> None:
+    from atlas.cli import _adaptive_batch_runtime_scheduler, _batch_progress_callback
+
+    url = "https://example.com/unknown.bin"
+    plan = AdaptiveDownloadPlan(
+        enabled=True,
+        politeness=AdaptivePoliteness.normal,
+        queue_concurrency=8,
+        per_host_concurrency=2,
+        per_file_segments=1,
+        strategy="unknown sizes",
+        work_items=[
+            WorkItem(
+                url=url,
+                host="example.com",
+                size_class=FileSizeClass.unknown,
+                bucket=WorkBucket.unknown,
+            )
+        ],
+    )
+    scheduler = _adaptive_batch_runtime_scheduler(plan)
+    scheduler.current_concurrency = 8
+    callback = _batch_progress_callback(
+        None,
+        BatchEntry(line_no=1, url=url),
+        adaptive_plan=plan,
+        adaptive_scheduler=scheduler,
+        adaptive_items_by_url={url: plan.work_items[0]},
+    )
+    assert callback is not None
+
+    callback(
+        ProgressEvent(
+            engine=EngineKind.native,
+            status="downloading",
+            phase=ProgressPhase.download,
+            total_bytes=700 * 1024 * 1024,
+        )
+    )
+
+    assert scheduler.current_concurrency == 2
 
 
 def test_batch_site_plan_passes_process_control_to_mirror_adapter(

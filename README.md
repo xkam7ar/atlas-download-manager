@@ -52,48 +52,43 @@ Atlas requires Python 3.12 or newer. Media workflows also need `ffmpeg` and
 Atlas installs `yt-dlp` and `mutagen` with its Python package so extraction and
 audio artwork embedding are ready by default.
 
-### Guided installer
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/xkam7ar/atlas/main/install.sh | bash
-```
-
-The installer supports macOS plus apt-, dnf-, and pacman-based Linux. It shows
-one complete plan, asks once, installs every missing runtime tool, installs Atlas,
-runs setup and Doctor, and can open the menu. Missing Homebrew is included in
-the approved plan on macOS; pacman hosts use Linuxbrew only for `wget2`.
-
-> [!TIP]
-> Inspect before executing:
->
-> ```bash
-> curl -fsSL https://raw.githubusercontent.com/xkam7ar/atlas/main/install.sh -o /tmp/atlas-install.sh
-> less /tmp/atlas-install.sh
-> bash /tmp/atlas-install.sh --no-install --no-menu --yes
-> ```
-
-### Install with uv
-
-From GitHub:
-
-```bash
-uv tool install git+https://github.com/xkam7ar/atlas.git
-atlas setup --full --install
-```
-
-From this checkout:
+### Install this checkout
 
 ```bash
 uv tool install . --force
 atlas setup --no-install
 ```
 
+To preview the local guided installer without changing the machine:
+
+```bash
+bash install.sh --no-install --no-menu --yes
+```
+
+> [!IMPORTANT]
+> This snapshot is pre-release. The documented `xkam7ar/atlas` GitHub
+> repository, raw installer URL, version tag, and Homebrew tap are not public
+> yet, so remote install commands are intentionally not presented as usable.
+> The unqualified PyPI and Homebrew names `atlas` already belong to unrelated
+> projects; choose and verify a collision-free distribution identity before
+> publishing.
+
+### Planned remote installation
+
+After the repository is published, the intended uv-tool path is:
+
+```bash
+uv tool install git+https://github.com/xkam7ar/atlas.git
+atlas setup --full --install
+```
+
 ### Homebrew packaging status
 
 The checked-in Homebrew formula is a release template. It must receive a real
-release checksum and generated Python resource blocks before publication to a
-tap. See [Installation](docs/installation.md#homebrew-release-packaging) for the
-release contract.
+release URL, checksum, generated Python resource blocks, and a collision-safe
+formula strategy before publication to a tap. See
+[Installation](docs/installation.md#homebrew-release-packaging) for the release
+contract.
 
 ## First run
 

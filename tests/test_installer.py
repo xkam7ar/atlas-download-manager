@@ -92,6 +92,30 @@ def test_installer_plan_only_includes_macos_homebrew_bootstrap(tmp_path: Path) -
     assert not (tmp_path / "commands.log").exists()
 
 
+def test_installer_plan_only_does_not_execute_discovered_atlas(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _executable(bin_dir / "id", "#!/bin/sh\necho 1000\n")
+    _executable(
+        bin_dir / "atlas",
+        '#!/bin/sh\necho "atlas $*" >> "$ATLAS_TEST_LOG"\nexit 0\n',
+    )
+    env = _installer_env(tmp_path, bin_dir)
+
+    result = subprocess.run(
+        ["/bin/sh", str(INSTALLER), "--minimal", "--no-install", "--no-menu"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode == 0
+    assert "Atlas already installed" in result.stdout
+    assert "Plan only; no changes made." in result.stdout
+    assert not (tmp_path / "commands.log").exists()
+
+
 def test_installer_bootstraps_uv_with_official_installer(tmp_path: Path) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()

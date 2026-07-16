@@ -4,15 +4,30 @@ from __future__ import annotations
 
 import ssl
 import tempfile
+import zlib
+from base64 import b64encode
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
+from http.cookiejar import MozillaCookieJar
 from pathlib import Path
 from shutil import which
 from subprocess import TimeoutExpired
+from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import unquote, urlsplit
+from urllib.request import (
+    HTTPCookieProcessor,
+    HTTPRedirectHandler,
+    HTTPSHandler,
+    ProxyHandler,
+    Request,
+    build_opener,
+    urlopen,
+)
 
 from atlas.models import ScanErrorCode
+from atlas.redaction import is_sensitive_header, text_contains_secret
 from atlas.runner import run_args
 
 
@@ -62,6 +77,26 @@ class FetchError(RuntimeError):
     def __init__(self, failure: FetchFailure) -> None:
         self.failure = failure
         super().__init__(failure.message)
+
+
+class _ValidatingRedirectHandler(HTTPRedirectHandler):
+    """Validate every redirect target before urllib is allowed to contact it."""
+
+    def __init__(self, validator: Callable[[str], None]) -> None:
+        super().__init__()
+        self._validator = validator
+
+    def redirect_request(
+        self,
+        req: Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> Request | None:
+        self._validator(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 class FetchClient:
@@ -133,21 +168,31 @@ class FetchClient:
         headers = _request_headers(options)
         if extra_headers:
             headers.update(extra_headers)
-        request = Request(url, headers=headers, method=method.upper())
+        request = redirect_safe_request(url, headers=headers, method=method.upper())
         try:
-            with urlopen(
+            with open_request(
                 request,
                 timeout=options.timeout,
                 context=_ssl_context(options),
+                proxy=options.proxy,
             ) as response:
                 raw_body = response.read(body_limit + 1) if body_limit > 0 else b""
+                response_headers = dict(response.headers.items())
+                body = raw_body[:body_limit] if body_limit > 0 else b""
+                body, decoding_truncated = _decode_response_body(
+                    body,
+                    response_headers,
+                    body_limit=body_limit,
+                )
                 return FetchResponse(
                     url=url,
                     final_url=response.geturl(),
                     status_code=getattr(response, "status", 200),
-                    headers=dict(response.headers.items()),
-                    body=raw_body[:body_limit] if body_limit > 0 else b"",
-                    body_truncated=body_limit > 0 and len(raw_body) > body_limit,
+                    headers=response_headers,
+                    body=body,
+                    body_truncated=(
+                        body_limit > 0 and (len(raw_body) > body_limit or decoding_truncated)
+                    ),
                 )
         except HTTPError as exc:
             raise FetchError(
@@ -225,6 +270,135 @@ def _request_headers(options: FetchOptions) -> dict[str, str]:
     return headers
 
 
+def redirect_safe_request(
+    url: str,
+    *,
+    headers: dict[str, str],
+    method: str,
+    data: bytes | None = None,
+) -> Request:
+    """Build a request whose private headers apply only to the first hop."""
+
+    def initial_hop_only(name: str, value: str) -> bool:
+        return (
+            is_sensitive_header(name)
+            or name.strip().casefold() == "referer"
+            or text_contains_secret(value)
+        )
+
+    ordinary = {name: value for name, value in headers.items() if not initial_hop_only(name, value)}
+    request = Request(url, data=data, headers=ordinary, method=method)
+    for name, value in headers.items():
+        if initial_hop_only(name, value):
+            request.add_unredirected_header(name, value)
+    return request
+
+
+def open_request(
+    request: Request,
+    *,
+    timeout: float,
+    context: ssl.SSLContext | None = None,
+    proxy: str | None = None,
+    cookie_file: Path | None = None,
+    redirect_validator: Callable[[str], None] | None = None,
+) -> Any:
+    """Open one request with an explicit proxy when configured."""
+
+    handlers: list[Any] = []
+    if proxy:
+        parsed_proxy = urlsplit(proxy if "://" in proxy else f"http://{proxy}")
+        if not parsed_proxy.hostname:
+            raise ValueError("Explicit proxy must include a hostname")
+        proxy_host = parsed_proxy.hostname
+        if ":" in proxy_host and not proxy_host.startswith("["):
+            proxy_host = f"[{proxy_host}]"
+        if parsed_proxy.port is not None:
+            proxy_host = f"{proxy_host}:{parsed_proxy.port}"
+        request.set_proxy(proxy_host, parsed_proxy.scheme or "http")
+        if parsed_proxy.username is not None:
+            credential = f"{unquote(parsed_proxy.username)}:{unquote(parsed_proxy.password or '')}"
+            request.add_unredirected_header(
+                "Proxy-Authorization",
+                f"Basic {b64encode(credential.encode('utf-8')).decode('ascii')}",
+            )
+        # The Request is already bound to the configured proxy.  An empty
+        # handler prevents environment proxies and NO_PROXY from changing that
+        # explicit choice.
+        handlers.append(ProxyHandler({}))
+    if cookie_file is not None:
+        cookie_jar = MozillaCookieJar(str(cookie_file))
+        cookie_jar.load(ignore_discard=True, ignore_expires=True)
+        handlers.append(HTTPCookieProcessor(cookie_jar))
+    if redirect_validator is not None:
+        handlers.append(_ValidatingRedirectHandler(redirect_validator))
+    if handlers:
+        handlers.append(HTTPSHandler(context=context))
+        opener = build_opener(*handlers)
+        return opener.open(request, timeout=timeout)
+    return urlopen(request, timeout=timeout, context=context)
+
+
+def _decode_response_body(
+    body: bytes,
+    headers: dict[str, str],
+    *,
+    body_limit: int,
+) -> tuple[bytes, bool]:
+    """Decode common HTTP content encodings without exceeding the scan body limit."""
+
+    if not body or body_limit <= 0:
+        return body, False
+    content_encoding = next(
+        (value for name, value in headers.items() if name.casefold() == "content-encoding"),
+        "",
+    )
+    encodings = [value.strip().casefold() for value in content_encoding.split(",")]
+    encodings = [value for value in encodings if value and value != "identity"]
+    if len(encodings) != 1:
+        return body, False
+    encoding = encodings[0]
+    if encoding in {"gzip", "x-gzip"}:
+        try:
+            return _decompress_response_body(
+                body,
+                body_limit=body_limit,
+                wbits=16 + zlib.MAX_WBITS,
+            )
+        except zlib.error:
+            return body, False
+    if encoding == "deflate":
+        try:
+            return _decompress_response_body(body, body_limit=body_limit, wbits=zlib.MAX_WBITS)
+        except zlib.error:
+            try:
+                return _decompress_response_body(
+                    body,
+                    body_limit=body_limit,
+                    wbits=-zlib.MAX_WBITS,
+                )
+            except zlib.error:
+                return body, False
+    return body, False
+
+
+def _decompress_response_body(
+    body: bytes,
+    *,
+    body_limit: int,
+    wbits: int,
+) -> tuple[bytes, bool]:
+    decompressor = zlib.decompressobj(wbits)
+    decoded = decompressor.decompress(body, body_limit + 1)
+    remaining = body_limit + 1 - len(decoded)
+    if remaining > 0:
+        decoded += decompressor.flush(remaining)
+    truncated = (
+        len(decoded) > body_limit or bool(decompressor.unconsumed_tail) or not decompressor.eof
+    )
+    return decoded[:body_limit], truncated
+
+
 def _normalize_response_headers(headers: dict[str, str]) -> dict[str, str]:
     normalized: dict[str, str] = {}
     for raw_name, value in headers.items():
@@ -282,7 +456,6 @@ def _fetch_with_curl(
             "--silent",
             "--show-error",
             "--location",
-            "--compressed",
             "--max-time",
             str(max(1, int(options.timeout))),
             "--user-agent",
@@ -332,14 +505,21 @@ def _fetch_with_curl(
             if header_path.exists()
             else {}
         )
+        body = raw_body[:body_limit] if body_limit > 0 else b""
+        body, decoding_truncated = _decode_response_body(
+            body,
+            response_headers,
+            body_limit=body_limit,
+        )
         return FetchResponse(
             url=url,
             final_url=final_url,
             status_code=status_code,
             headers=response_headers,
-            body=raw_body[:body_limit] if body_limit > 0 else b"",
+            body=body,
             body_truncated=(
-                body_limit > 0 and (result.returncode == 63 or len(raw_body) > body_limit)
+                body_limit > 0
+                and (result.returncode == 63 or len(raw_body) > body_limit or decoding_truncated)
             ),
         )
 

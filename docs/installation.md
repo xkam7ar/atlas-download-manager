@@ -20,28 +20,32 @@ plain `atlas doctor` creates/checks those paths and uses temporary write probes.
 
 | Method | Availability | What it changes |
 | --- | --- | --- |
-| Guided installer | Recommended for macOS and supported Linux | Shows one plan, then installs approved runtime tools and Atlas. |
-| `uv tool` | Available anywhere supported by Python and uv | Installs Atlas only; system runtime tools remain explicit. |
+| Local guided installer | Preview-only until public release | `--no-install` shows the complete plan; its Atlas install source is not public yet. |
+| `uv tool` | Tested on macOS and Linux | Installs Atlas only; system runtime tools remain explicit. |
 | Local checkout | Contributor path | Installs the current working tree. |
-| Homebrew tap | Release packaging target | Available only after a complete formula is published to the tap. |
+| Remote installer / GitHub uv tool | Pre-release target | Unavailable until the documented repository and tag are public. |
+| Homebrew tap | Pre-release packaging target | Unavailable until a complete, collision-safe formula is published to the tap. |
+
+Windows is not in the current CI or guided-installer support matrix. A Python
+installation may work, but it is best-effort and must not be advertised as
+supported until native Windows CLI, path, cancellation, and downloader smoke
+tests are added.
 
 ## Guided installer
 
-Use the guided bootstrap installer:
+From this checkout, inspect and preview the guided bootstrap installer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xkam7ar/atlas/main/install.sh | bash
+less install.sh
+bash install.sh --no-install --no-menu --yes
 ```
 
 > [!IMPORTANT]
-> The one-line command downloads a mutable script and executes it immediately.
-> For a reviewable path, download it first, inspect it, then run the local copy:
->
-> ```bash
-> curl -fsSL https://raw.githubusercontent.com/xkam7ar/atlas/main/install.sh -o /tmp/atlas-install.sh
-> less /tmp/atlas-install.sh
-> bash /tmp/atlas-install.sh --no-install --no-menu --yes
-> ```
+> This repository snapshot is pre-release. The documented GitHub repository,
+> raw installer URL, release tag, and tap are not currently public. Do not use
+> `pip install atlas` or `brew install atlas`: those names resolve to unrelated
+> projects. A collision-free distribution identity and public release must be
+> established before remote install instructions can become active.
 
 The installer detects the host and missing executables, shows every bootstrap,
 package-manager, Atlas, and verification command, then asks once. `--yes`
@@ -86,7 +90,8 @@ present and `atlas doctor` succeeds.
 
 ## Homebrew release packaging
 
-Once the tap contains a release-complete formula, the install path is:
+Once the tap contains a release-complete and collision-safe formula, the
+intended install path is:
 
 ```bash
 brew install xkam7ar/tap/atlas
@@ -104,16 +109,20 @@ brew install ffmpeg aria2 wget2 wget
 > the tap, replace the release SHA, and run `brew update-python-resources atlas`
 > before publishing so Python dependencies are declared as Homebrew resources.
 > It is release-ready only after the tap has a tagged tarball SHA and generated
-> Python resource blocks.
+> Python resource blocks. Homebrew core already has an unrelated `atlas`
+> executable, so the tap formula also needs an explicit conflict/naming plan.
 
 ## Manual and developer fallback
 
-`uv tool` is the best Python-only fallback:
+`uv tool` is the best Python-only path from this checkout:
 
 ```bash
-uv tool install git+https://github.com/xkam7ar/atlas.git
+uv tool install . --force
 atlas setup
 ```
+
+After a public repository exists, the corresponding remote command is intended
+to be `uv tool install git+https://github.com/xkam7ar/atlas.git`.
 
 `uv tool install` does not install system tools such as `ffmpeg`, `aria2c`,
 `wget2`, or `wget`. Initialize Atlas paths/configuration and preview the full
@@ -204,7 +213,8 @@ atlas update --json
 
 `atlas update` detects Homebrew, uv-tool, source-checkout, or unknown installs
 and shows the matching update command. Unknown installs are not modified
-automatically.
+automatically. The remote commands below are release targets and will not work
+until the repository and tap are published.
 
 Detected update plans:
 
@@ -227,6 +237,11 @@ Atlas setup must be explicit and reversible:
 - create config/output paths before reporting setup success
 - run `atlas doctor` before a guided installer declares success
 - keep the interactive menu as the first post-install human experience
+
+The current implementation has no Atlas uninstall or automatic rollback
+command. “Reversible” here means that mutations are previewed and limited to
+ordinary package-manager/tool installs and Atlas-owned paths; release readiness
+still requires documented uninstall and failed-install cleanup procedures.
 
 ## Related
 

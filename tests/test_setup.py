@@ -14,6 +14,7 @@ from atlas.setup import (
     apply_setup_plan,
     build_setup_plan,
     build_update_plan,
+    detect_install_method,
     detect_setup_environment,
     install_hint_for_tool,
     selected_tools,
@@ -111,6 +112,36 @@ def test_apply_setup_plan_creates_output_and_config_without_install(
     assert "default_output_dir" in config_file.read_text(encoding="utf-8")
     assert result.commands_run == ()
     assert commands == []
+
+
+def test_apply_setup_plan_refuses_dangling_config_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_file = tmp_path / "config" / "config.toml"
+    config_file.parent.mkdir()
+    victim = tmp_path / "victim.toml"
+    config_file.symlink_to(victim)
+    monkeypatch.setattr("atlas.setup.config_path", lambda: config_file)
+    settings = AtlasSettings(
+        output_dir=tmp_path / "downloads",
+        archive_file=tmp_path / "archive.txt",
+    )
+    env = SetupEnvironment(
+        os_name="macOS",
+        architecture="arm64",
+        shell="zsh",
+        package_manager=None,
+        package_manager_path=None,
+        install_method="unknown",
+        atlas_executable=None,
+    )
+    plan = build_setup_plan(settings, env=env, which=lambda _name: None)
+
+    with pytest.raises(FileExistsError):
+        apply_setup_plan(plan, settings, install=False)
+
+    assert not victim.exists()
 
 
 def test_apply_setup_plan_runs_install_commands_when_requested(
@@ -415,3 +446,38 @@ def test_update_plan_uses_install_method_specific_commands(
         "--ff-only",
     )
     assert build_update_plan(install_method="unknown").can_update is False
+
+
+def test_detect_install_method_resolves_uv_tool_launcher_symlink(tmp_path: Path) -> None:
+    tool_executable = tmp_path / ".local" / "share" / "uv" / "tools" / "atlas" / "bin" / "atlas"
+    tool_executable.parent.mkdir(parents=True)
+    tool_executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    launcher = tmp_path / ".local" / "bin" / "atlas"
+    launcher.parent.mkdir(parents=True)
+    launcher.symlink_to(tool_executable)
+
+    assert (
+        detect_install_method(
+            which=lambda name: str(launcher) if name == "atlas" else None,
+        )
+        == "uv-tool"
+    )
+
+
+def test_detect_install_method_distinguishes_tap_receipt_from_core_formula(
+    tmp_path: Path,
+) -> None:
+    version = tmp_path / "Cellar" / "atlas" / "0.1.0"
+    executable = version / "libexec" / "bin" / "atlas"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    receipt = version / "INSTALL_RECEIPT.json"
+    receipt.write_text('{"source":{"tap":"homebrew/core"}}', encoding="utf-8")
+
+    def which(name: str) -> str | None:
+        return str(executable) if name == "atlas" else None
+
+    assert detect_install_method(which=which) != "homebrew"
+
+    receipt.write_text('{"source":{"tap":"xkam7ar/tap"}}', encoding="utf-8")
+    assert detect_install_method(which=which) == "homebrew"

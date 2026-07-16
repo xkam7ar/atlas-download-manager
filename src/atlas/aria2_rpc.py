@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import socket
@@ -16,7 +17,7 @@ from pathlib import Path
 from typing import Protocol
 from urllib.error import URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 from atlas.adaptive import AdaptiveScheduler
 from atlas.errors import EngineError
@@ -27,6 +28,8 @@ from atlas.models import (
     ProgressEvent,
     ProgressPhase,
 )
+from atlas.network import open_request, redirect_safe_request
+from atlas.private_files import prepare_private_file
 from atlas.urls import is_metalink_url
 
 ProgressCallback = Callable[[ProgressEvent], None]
@@ -61,6 +64,7 @@ TokenFactory = Callable[[], str]
 SleepFn = Callable[[float], None]
 ClockFn = Callable[[], float]
 _BACKOFF_STATUS_PATTERN = re.compile(r"\b(403|429|503)\b")
+_MAX_METALINK_BYTES = 4 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -91,6 +95,10 @@ class Aria2RpcClient:
         self._endpoint = endpoint
         self._timeout = timeout
         self._next_id = 0
+        # The RPC secret and queued download URLs must never be handed to an
+        # ambient HTTP(S)_PROXY.  This client only talks to the loopback aria2
+        # process, so bypass proxies explicitly rather than relying on NO_PROXY.
+        self._opener = build_opener(ProxyHandler({}))
 
     def call(self, method: str, params: Sequence[object]) -> object:
         self._next_id += 1
@@ -107,7 +115,7 @@ class Aria2RpcClient:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urlopen(request, timeout=self._timeout) as response:
+        with self._opener.open(request, timeout=self._timeout) as response:
             raw = response.read().decode("utf-8")
         decoded = json.loads(raw)
         error = decoded.get("error")
@@ -321,7 +329,6 @@ class Aria2RpcSession:
                         item.options,
                         adaptive_scheduler,
                     )
-                    _emit(item.progress_callback, event)
                     if rpc_status == "complete":
                         results[index] = _queued_success_result(item, gids, status)
                         pending.remove(index)
@@ -335,6 +342,8 @@ class Aria2RpcSession:
                         )
                         pending.remove(index)
                         completed_this_tick = True
+                    else:
+                        _emit(item.progress_callback, event)
                 if pending and not completed_this_tick:
                     self._sleep(self.progress_interval)
             return [
@@ -375,6 +384,13 @@ class Aria2RpcSession:
         if self._process is not None:
             return
         self._last_adaptive_options = None
+        if self.save_session is not None:
+            try:
+                prepare_private_file(self.save_session)
+            except OSError as exc:
+                raise Aria2RpcStartupError(
+                    f"Could not prepare private aria2 session file {self.save_session}: {exc}"
+                ) from exc
         port = self._port_factory()
         secret = self._token_factory()
         endpoint = f"http://127.0.0.1:{port}/jsonrpc"
@@ -392,13 +408,18 @@ class Aria2RpcSession:
         self._process = process
         self._secret = secret
         self._endpoint = endpoint
-        self._client = self._rpc_client_factory(endpoint, self.request_timeout)
-        self._wait_until_ready()
+        try:
+            self._client = self._rpc_client_factory(endpoint, self.request_timeout)
+            self._wait_until_ready()
+        except BaseException:
+            self.close()
+            raise
 
     def close(self) -> None:
         process = self._process
         if process is None:
             return
+        session_hardening_error: OSError | None = None
         try:
             if process.poll() is None:
                 if self.save_session:
@@ -416,11 +437,21 @@ class Aria2RpcSession:
                         process.kill()
                         process.wait(timeout=2.0)
         finally:
+            if self.save_session is not None and os.path.lexists(self.save_session):
+                try:
+                    prepare_private_file(self.save_session)
+                except OSError as exc:
+                    session_hardening_error = exc
             self._process = None
             self._client = None
             self._secret = None
             self._endpoint = None
             self._last_adaptive_options = None
+        if session_hardening_error is not None:
+            raise Aria2RpcError(
+                f"Could not harden private aria2 session file {self.save_session}: "
+                f"{session_hardening_error}"
+            ) from session_hardening_error
 
     def _command(self, *, port: int, secret: str) -> list[str]:
         command = self.redacted_command(
@@ -798,14 +829,32 @@ def _emit_queue_error(
 
 def _fetch_metalink(options: FileDownloadOptions) -> bytes:
     headers = {"User-Agent": options.user_agent or "atlas/0.1"}
+    if options.referer:
+        headers["Referer"] = options.referer
     for header in options.headers:
         name, _separator, value = header.partition(":")
         headers[name.strip()] = value.strip()
-    request = Request(options.url, headers=headers)
-    with urlopen(request, timeout=options.timeout) as response:
-        data = response.read()
+    request = redirect_safe_request(options.url, headers=headers, method="GET")
+    response_cm = (
+        open_request(request, timeout=options.timeout, proxy=options.proxy)
+        if options.proxy
+        else urlopen(request, timeout=options.timeout)
+    )
+    with response_cm as response:
+        declared_length = response.headers.get("Content-Length")
+        if (
+            declared_length
+            and declared_length.isdigit()
+            and int(declared_length) > _MAX_METALINK_BYTES
+        ):
+            raise EngineError(
+                f"Metalink manifest exceeds the {_MAX_METALINK_BYTES}-byte safety limit"
+            )
+        data = response.read(_MAX_METALINK_BYTES + 1)
     if not isinstance(data, bytes):
         raise EngineError("Metalink response was not bytes")
+    if len(data) > _MAX_METALINK_BYTES:
+        raise EngineError(f"Metalink manifest exceeds the {_MAX_METALINK_BYTES}-byte safety limit")
     return data
 
 

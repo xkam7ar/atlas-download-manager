@@ -44,9 +44,9 @@ Atlas supports four practical mirror bounds:
 
 ```bash
 atlas site URL --depth 2
-atlas site URL --max-files 500 --adaptive --explain
 atlas site URL --max-total-size 5G
 atlas site URL --max-runtime 1800
+atlas dir URL --max-files 500
 ```
 
 `--depth` maps to Wget2/Wget recursion depth and bounds exact-index folder
@@ -58,10 +58,11 @@ across exact-index discovery/transfer. Interactive operator cancellation uses
 exact-index work at file/progress boundaries without dumping backend shutdown
 noise into the UI.
 
-`--max-files` is exact for complete CopyParty index lists and is a scan-time
-guard when ordinary recursive scan counts are available. Backend-only
-Wget2/Wget mirrors do not expose a hard file-count kill switch, so use
-`--adaptive --explain` for file-count preflight.
+`--max-files` is exact for complete, signature-recognized CopyParty index lists.
+Atlas rejects it for conventional recursive Wget/Wget2 mirrors because those
+backends do not expose a reliable file-count kill switch. Use byte/runtime
+limits for conventional recursion and `--adaptive --explain` only as an
+informational preflight.
 
 ## Filters And HTML Policy
 
@@ -98,12 +99,13 @@ Use waits and retry policy for predictable recursive behavior:
 
 ```bash
 atlas site URL --wait 0.5 --random-wait --timeout 60 --tries 5
-atlas dir URL --wait 0.5 --random-wait --continue
+atlas dir URL --wait 0.5 --continue
 ```
 
 Adaptive mirrors add scan-based safety notes and queue/per-host planning.
 Wget2/Wget remain the recursive workers; complete signature-recognized
 CopyParty text/HTML indexes use the bounded `native-exact-index` worker. That
 exact worker currently downloads one native file at a time; adaptive queue and
-per-host fields describe discovery/session planning, and recursive `--wait` or
-`--random-wait` settings do not pace the exact native loop.
+per-host fields describe discovery/session planning, and recursive `--wait`
+does not pace the exact native loop. `atlas dir` does not expose
+`--random-wait`.

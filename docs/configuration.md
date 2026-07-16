@@ -1,17 +1,19 @@
 # Configuration
 
-`atlas` uses `pydantic-settings`, TOML, environment variables, and host-native
-paths from `platformdirs`.
+`atlas` uses `pydantic-settings`, TOML, `ATLAS_` environment variables, and
+host-native paths from `platformdirs`.
 
 The TOML file is loaded by `pydantic-settings` through
 `TomlConfigSettingsSource`, not by a separate ad hoc parser. Source priority is:
 
 1. Explicit initialization values
-2. Environment variables
+2. `ATLAS_` environment variables
 3. TOML config file
-4. Dotenv
-5. File secrets
-6. Defaults
+4. Defaults
+
+Pydantic's dotenv and file-secret source hooks remain in the source tuple, but
+Atlas does not configure an `env_file` or `secrets_dir`; normal CLI execution
+therefore does not load `.env` or file-secret directories implicitly.
 
 ## Platform paths
 
@@ -87,7 +89,6 @@ site_backend = "auto"
 dir_backend = "auto"
 site_depth = 2
 dir_depth = 2
-site_max_files = 500
 site_max_total_size = "5G"
 site_max_runtime = 1800
 site_wait = 1.0
@@ -191,7 +192,7 @@ embed_metadata = true
 | `site_reject_regex` | `site_reject_regex` | unset |
 | `site_filter_mime_type` | `site_filter_mime_type` | unset |
 | `site_ignore_case` | `site_ignore_case` | `false` |
-| `site_max_files` | `site_max_files` | unset |
+| `site_max_files` | `site_max_files` | unset; exact directory indexes only—conventional recursion rejects a configured value |
 | `site_max_total_size` | `site_max_total_size` | unset |
 | `site_max_runtime` | `site_max_runtime` | unset |
 | `site_max_threads` | `site_max_threads` | `5` |

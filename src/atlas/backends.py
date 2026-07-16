@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import time
 import unicodedata
+from base64 import b64encode
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from email.utils import formatdate, parsedate_to_datetime
@@ -20,7 +21,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import urlopen
 
 from atlas.aria2_rpc import Aria2RpcSession, Aria2RpcStartupError
 from atlas.errors import DependencyMissingError, EngineError
@@ -39,10 +40,16 @@ from atlas.models import (
     SiteDownloadOptions,
     WorkItem,
 )
+from atlas.network import open_request, redirect_safe_request
 from atlas.paths import safe_filename
-from atlas.private_files import replace_private_text
+from atlas.private_files import (
+    ensure_private_directory,
+    prepare_private_file,
+    publish_private_file,
+    replace_private_text,
+)
 from atlas.progress_events import progress_event_from_aria2_line, progress_event_from_wget2_line
-from atlas.redaction import redact_text, redact_url
+from atlas.redaction import is_sensitive_header, redact_text, redact_url, text_contains_secret
 from atlas.runner import ProcessCanceled, ProcessControl, run_args_stream
 from atlas.setup import install_hint_for_tool
 from atlas.urls import is_metalink_url
@@ -72,6 +79,24 @@ class FileDownloadEngine:
 
     def plan(self, options: FileDownloadOptions) -> BackendPlan:
         backend = self._resolve_backend(options, dry_run=options.dry_run)
+        if backend != FileBackendChoice.native and (options.body_data or options.body_file):
+            raise EngineError(
+                "Request bodies require the native backend because recursive redirecting "
+                "downloaders can resend private body data to another origin."
+            )
+        if backend != FileBackendChoice.native and (
+            _sensitive_custom_headers(options.headers)
+            or (options.referer is not None and text_contains_secret(options.referer))
+        ):
+            raise EngineError(
+                "Sensitive custom headers require the native backend so credentials can be "
+                "stripped on cross-origin redirects."
+            )
+        if backend == FileBackendChoice.aria2 and options.http_user:
+            raise EngineError(
+                "HTTP username/password authentication requires the native or wget2 backend; "
+                "aria2 can forward generated credentials across origins during redirects."
+            )
         output = _safe_output_path(
             options.output_dir,
             options.filename or filename_from_url(options.url),
@@ -282,6 +307,7 @@ class FileDownloadEngine:
         executable = shutil.which("aria2c") or "aria2c"
         args = [
             executable,
+            "--no-conf=true",
             "--dir",
             str(output.parent),
             f"--continue={'true' if options.continue_download else 'false'}",
@@ -785,6 +811,20 @@ class FileDownloadEngine:
                 elif not probe or not getattr(probe, "probed", False):
                     _require_native_resume_support(plan.output, probe)
 
+        descriptor, raw_staging_path = tempfile.mkstemp(
+            prefix=f".{plan.output.name}.atlas-part-",
+            dir=plan.output.parent,
+        )
+        os.close(descriptor)
+        staging_path = Path(raw_staging_path)
+        download_path = staging_path
+        if resume_from:
+            try:
+                shutil.copyfile(plan.output, staging_path)
+            except OSError as exc:
+                staging_path.unlink(missing_ok=True)
+                raise EngineError(f"Could not stage existing partial file: {exc}") from exc
+
         body = _request_body(options.body_data, options.body_file)
         started = time.monotonic()
         rate_limiter = _NativeRateLimiter.from_limit(options.rate_limit)
@@ -807,6 +847,13 @@ class FileDownloadEngine:
         completed = 0
         try:
             context = _native_ssl_context(options)
+            redirect_validator: Callable[[str], None] | None = None
+            if required_url_scope is not None:
+
+                def validate_redirect(redirect_url: str) -> None:
+                    _exact_directory_relative_url_path(required_url_scope, redirect_url)
+
+                redirect_validator = validate_redirect
             attempt_resume = resume_from > 0
             while True:
                 _require_native_deadline(deadline)
@@ -823,14 +870,36 @@ class FileDownloadEngine:
                     assert resume_validator is not None
                     headers["If-Range"] = resume_validator[1]
                     headers["Accept-Encoding"] = "identity"
-                request = Request(options.url, data=body, headers=headers, method=options.method)
+                request = redirect_safe_request(
+                    options.url,
+                    data=body,
+                    headers=headers,
+                    method=options.method,
+                )
                 request_timeout = _native_request_timeout(options.timeout, deadline)
                 try:
-                    response_cm = (
-                        urlopen(request, timeout=request_timeout)
-                        if context is None
-                        else urlopen(request, timeout=request_timeout, context=context)
-                    )
+                    if required_url_scope is not None or options.load_cookies is not None:
+                        response_cm = open_request(
+                            request,
+                            timeout=request_timeout,
+                            context=context,
+                            proxy=options.proxy,
+                            cookie_file=options.load_cookies,
+                            redirect_validator=redirect_validator,
+                        )
+                    elif options.proxy:
+                        response_cm = open_request(
+                            request,
+                            timeout=request_timeout,
+                            context=context,
+                            proxy=options.proxy,
+                        )
+                    else:
+                        response_cm = (
+                            urlopen(request, timeout=request_timeout)
+                            if context is None
+                            else urlopen(request, timeout=request_timeout, context=context)
+                        )
                 except HTTPError as exc:
                     if attempt_resume and exc.code in {412, 416}:
                         attempt_resume = False
@@ -892,7 +961,7 @@ class FileDownloadEngine:
                         max_output_bytes=max_output_bytes,
                     )
                     completed = effective_offset
-                    with plan.output.open(open_mode) as fh:
+                    with download_path.open(open_mode) as fh:
                         while True:
                             chunk = _read_native_chunk(
                                 response,
@@ -929,7 +998,7 @@ class FileDownloadEngine:
                                     )
                                 )
                     _assert_native_download_complete(
-                        plan.output,
+                        download_path,
                         completed=completed,
                         total=total,
                     )
@@ -938,6 +1007,7 @@ class FileDownloadEngine:
                     break
         except HTTPError as exc:
             if exc.code == 304 and options.timestamping:
+                staging_path.unlink(missing_ok=True)
                 _write_http_metadata(
                     plan.output,
                     url=options.url,
@@ -958,9 +1028,19 @@ class FileDownloadEngine:
                     url=options.url,
                     message=f"Local file is current: {plan.output}",
                 )
+            staging_path.unlink(missing_ok=True)
             raise EngineError(str(exc)) from exc
-        if options.use_server_timestamps:
-            _apply_server_timestamp(plan.output, remote_last_modified)
+        except BaseException:
+            staging_path.unlink(missing_ok=True)
+            raise
+        try:
+            if options.use_server_timestamps:
+                _apply_server_timestamp(download_path, remote_last_modified)
+            verify_checksum(download_path, options.checksum)
+            os.replace(staging_path, plan.output)
+        except BaseException:
+            staging_path.unlink(missing_ok=True)
+            raise
         _write_http_metadata(
             plan.output,
             url=options.url,
@@ -984,7 +1064,6 @@ class FileDownloadEngine:
                 message="verifying checksum" if options.checksum else "finalizing file",
             ),
         )
-        verify_checksum(plan.output, options.checksum)
         downloaded = plan.output.stat().st_size if plan.output.exists() else completed
         _emit(
             progress_callback,
@@ -1029,7 +1108,29 @@ class SiteMirrorEngine:
                 output=options.output_dir,
                 warnings=["Supported directory index; downloading its bounded exact file list."],
             )
+        if options.max_files is not None:
+            raise EngineError(
+                "max-files cannot be guaranteed by recursive Wget/Wget2 execution; use a "
+                "supported exact directory index or enforce a byte/runtime quota instead."
+            )
+        if _sensitive_custom_headers(options.headers) or (
+            options.referer is not None and text_contains_secret(options.referer)
+        ):
+            raise EngineError(
+                "Sensitive custom headers are unsafe with recursive Wget redirects; use a "
+                "non-sensitive header or an origin-scoped authenticated workflow."
+            )
+        if options.body_data or options.body_file or options.post_data or options.post_file:
+            raise EngineError(
+                "Recursive site mirroring does not accept request bodies because Wget can "
+                "resend private body data to another origin during redirects."
+            )
         backend = self._resolve_backend(options.backend, dry_run=options.dry_run)
+        if backend == SiteBackendChoice.wget and options.http_user:
+            raise EngineError(
+                "HTTP username/password authentication is unsafe with GNU Wget because it can "
+                "forward generated credentials across origins during redirects; use wget2."
+            )
         executable = shutil.which(backend.value) or backend.value
         is_wget2 = backend == SiteBackendChoice.wget2
         warnings = _mirror_safety_warnings(options)
@@ -1188,7 +1289,7 @@ class SiteMirrorEngine:
         if options.spider:
             args.append("--spider")
         if options.warc_file:
-            args.append(f"--warc-file={options.warc_file}")
+            args.append(f"--warc-file={_warc_prefix_path(options.warc_file)}")
         _append_bool_arg(
             args,
             options.warc_compression,
@@ -1257,6 +1358,8 @@ class SiteMirrorEngine:
         runtime_deadline = _mirror_runtime_deadline(options, execution_started)
         with tempfile.TemporaryDirectory(prefix="atlas-wget2-") as runtime_tmp:
             runtime_options = options
+            public_warc_prefix: Path | None = None
+            runtime_warc_prefix: Path | None = None
             if options.browser_cookies:
                 if options.load_cookies:
                     raise EngineError(
@@ -1267,6 +1370,14 @@ class SiteMirrorEngine:
                     Path(runtime_tmp),
                 )
                 runtime_options = options.model_copy(update={"load_cookies": cookies_path})
+            if runtime_options.warc_file is not None:
+                public_warc_prefix = _warc_prefix_path(runtime_options.warc_file)
+                _preflight_warc_outputs(public_warc_prefix, overwrite=runtime_options.overwrite)
+                warc_runtime_dir = ensure_private_directory(Path(runtime_tmp) / "warc")
+                runtime_warc_prefix = warc_runtime_dir / "archive"
+                runtime_options = runtime_options.model_copy(
+                    update={"warc_file": runtime_warc_prefix}
+                )
             if (
                 isinstance(runtime_options, DirectoryMirrorOptions)
                 and runtime_options.exact_directory_index
@@ -1277,8 +1388,21 @@ class SiteMirrorEngine:
                     control=control,
                     deadline=runtime_deadline,
                 )
+            if runtime_options.save_cookies is not None:
+                try:
+                    prepare_private_file(runtime_options.save_cookies)
+                except OSError as exc:
+                    raise EngineError(
+                        f"Could not prepare private cookie jar "
+                        f"{runtime_options.save_cookies}: {exc}"
+                    ) from exc
             plan = self.plan(runtime_options, stats_dir=Path(runtime_tmp))
             plan.output.mkdir(parents=True, exist_ok=True)
+            unsafe_link = _first_symlink_under(plan.output)
+            if unsafe_link is not None:
+                raise MirrorDownloadError(
+                    f"Refusing conventional mirror output containing a symbolic link: {unsafe_link}"
+                )
             payload_before = _mirror_payload_snapshot(plan.output)
             engine_kind = EngineKind.wget if plan.backend == "wget" else EngineKind.wget2
             mirror_kind = _mirror_hub_kind(runtime_options)
@@ -1306,6 +1430,7 @@ class SiteMirrorEngine:
                     event = event.model_copy(update={"engine": EngineKind.wget})
                 _emit(progress_callback, event)
 
+            published_warc_outputs: list[Path] = []
             try:
                 stream_kwargs: dict[str, Any] = {
                     "on_line": on_line,
@@ -1316,7 +1441,14 @@ class SiteMirrorEngine:
                 }
                 if control is not None:
                     stream_kwargs["control"] = control
-                result = run_args_stream(plan.args, **stream_kwargs)
+                try:
+                    result = run_args_stream(plan.args, **stream_kwargs)
+                finally:
+                    if runtime_warc_prefix is not None and public_warc_prefix is not None:
+                        published_warc_outputs = _publish_warc_outputs(
+                            runtime_warc_prefix,
+                            public_warc_prefix,
+                        )
             except ProcessCanceled as exc:
                 stats = parse_wget2_stats_files(plan.stats_files or {})
                 message = _wget2_error_message(f"Mirror canceled: {exc.reason}", stats)
@@ -1353,6 +1485,11 @@ class SiteMirrorEngine:
                 )
                 raise MirrorDownloadError(message, stats=stats) from exc
             stats = parse_wget2_stats_files(plan.stats_files or {})
+            if runtime_warc_prefix is not None and not published_warc_outputs:
+                raise MirrorDownloadError(
+                    f"{plan.backend} exited successfully but produced no requested WARC output",
+                    stats=stats,
+                )
             if result.returncode != 0:
                 base_message = (
                     result.stderr or result.stdout
@@ -1371,6 +1508,35 @@ class SiteMirrorEngine:
                     ),
                 )
                 raise MirrorDownloadError(message, stats=stats)
+            failed_requests = _wget2_failed_urls(
+                stats,
+                ignore_missing_robots=runtime_options.robots,
+            )
+            if failed_requests:
+                message = _wget2_error_message(
+                    f"{plan.backend} completed with failed requests",
+                    stats,
+                )
+                _emit(
+                    progress_callback,
+                    ProgressEvent(
+                        engine=engine_kind,
+                        status="error",
+                        phase=ProgressPhase.error,
+                        kind=mirror_kind,
+                        filename=str(plan.output),
+                        url=runtime_options.url,
+                        message=message,
+                    ),
+                )
+                raise MirrorDownloadError(message, stats=stats)
+            unsafe_link = _first_symlink_under(plan.output)
+            if unsafe_link is not None:
+                raise MirrorDownloadError(
+                    f"{plan.backend} produced or encountered an unsafe symbolic link under "
+                    f"the mirror output: {unsafe_link}",
+                    stats=stats,
+                )
             payload_after = _mirror_payload_snapshot(plan.output)
             payload_required = not runtime_options.spider
             if payload_required and not payload_after:
@@ -1425,6 +1591,7 @@ class SiteMirrorEngine:
                     "warnings": plan.warnings,
                     "no_change": no_change,
                     "payload_required": payload_required,
+                    "warc_outputs": [str(path) for path in published_warc_outputs],
                 },
             )
 
@@ -1524,8 +1691,6 @@ class SiteMirrorEngine:
         for item, destination in destinations:
             safe_item_url = redact_url(item.url)
             command = ["native-exact-index", safe_item_url]
-            if control is not None:
-                control.raise_if_canceled(command)
             timeout = options.timeout if options.timeout and options.timeout > 0 else 30.0
             if deadline is not None:
                 remaining = _mirror_runtime_remaining(options, deadline)
@@ -1603,6 +1768,8 @@ class SiteMirrorEngine:
                     control.raise_if_canceled(_command)
 
             try:
+                if control is not None:
+                    control.raise_if_canceled(command)
                 result = file_engine.download(
                     file_options,
                     progress_callback=exact_progress,
@@ -1975,6 +2142,22 @@ def _mirror_payload_snapshot(root: Path) -> dict[str, tuple[int, int]]:
     return snapshot
 
 
+def _first_symlink_under(root: Path) -> Path | None:
+    """Return the first symlink in a conventional mirror tree without following it."""
+
+    if root.is_symlink():
+        return root
+    if not root.exists():
+        return None
+    for current, directories, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        for name in (*directories, *files):
+            candidate = current_path / name
+            if candidate.is_symlink():
+                return candidate
+    return None
+
+
 def _wget2_error_message(base_message: str, stats: Mapping[str, Any]) -> str:
     details = _wget2_error_details(stats)
     if not details:
@@ -2001,7 +2184,11 @@ def _wget2_error_details(stats: Mapping[str, Any]) -> str:
     return "; ".join(parts)
 
 
-def _wget2_failed_urls(stats: Mapping[str, Any]) -> list[str]:
+def _wget2_failed_urls(
+    stats: Mapping[str, Any],
+    *,
+    ignore_missing_robots: bool = False,
+) -> list[str]:
     failed: list[str] = []
     for row in _stats_rows(stats.get("site")):
         status = _int_or_none(_row_lookup(row, "status", "Status"))
@@ -2009,6 +2196,12 @@ def _wget2_failed_urls(stats: Mapping[str, Any]) -> list[str]:
             continue
         url = _row_lookup(row, "url", "URL")
         if url:
+            if (
+                ignore_missing_robots
+                and status in {404, 410}
+                and urlparse(str(url)).path == "/robots.txt"
+            ):
+                continue
             failed.append(f"{status} {url}")
     return failed
 
@@ -2073,9 +2266,83 @@ def can_attempt_verified_curl_fallback(
         return False
     if options.method != "GET" or options.body_data or options.body_file:
         return False
+    if _sensitive_custom_headers(options.headers):
+        return False
+    if options.referer is not None and text_contains_secret(options.referer):
+        return False
     if output.exists() and not options.overwrite and not options.continue_download:
         return False
     return not options.secure_protocol
+
+
+def _sensitive_custom_headers(headers: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(
+        header
+        for header in headers
+        if is_sensitive_header(header.partition(":")[0].strip())
+        or text_contains_secret(header.partition(":")[2].strip())
+    )
+
+
+def _warc_prefix_path(path: Path) -> Path:
+    """Return the prefix Wget expects, accepting user-facing WARC filenames."""
+
+    name = path.name
+    lowered = name.casefold()
+    for suffix in (".warc.gz", ".warc"):
+        if lowered.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    if not name:
+        raise EngineError("WARC output must include a filename before its extension")
+    return path.with_name(name)
+
+
+def _warc_suffix_for_prefix(path: Path, prefix: Path) -> str | None:
+    if path.parent != prefix.parent or not path.name.startswith(prefix.name):
+        return None
+    suffix = path.name[len(prefix.name) :]
+    if suffix in {".warc", ".warc.gz", ".cdx"}:
+        return suffix
+    if re.fullmatch(r"-(?:\d{5}|meta)\.warc(?:\.gz)?", suffix):
+        return suffix
+    return None
+
+
+def _existing_warc_outputs(prefix: Path) -> list[Path]:
+    if not prefix.parent.exists():
+        return []
+    return sorted(
+        (
+            candidate
+            for candidate in prefix.parent.glob(f"{prefix.name}*")
+            if _warc_suffix_for_prefix(candidate, prefix) is not None and os.path.lexists(candidate)
+        ),
+        key=lambda candidate: candidate.name,
+    )
+
+
+def _preflight_warc_outputs(prefix: Path, *, overwrite: bool) -> None:
+    for candidate in _existing_warc_outputs(prefix):
+        if candidate.is_symlink() or not candidate.is_file():
+            raise EngineError(f"Refusing unsafe WARC output path: {candidate}")
+        if not overwrite:
+            raise EngineError(f"WARC output already exists: {candidate}")
+
+
+def _publish_warc_outputs(runtime_prefix: Path, public_prefix: Path) -> list[Path]:
+    published: list[Path] = []
+    for source in _existing_warc_outputs(runtime_prefix):
+        suffix = _warc_suffix_for_prefix(source, runtime_prefix)
+        assert suffix is not None
+        destination = public_prefix.with_name(f"{public_prefix.name}{suffix}")
+        try:
+            published.append(publish_private_file(source, destination))
+        except OSError as exc:
+            raise MirrorDownloadError(
+                f"Could not publish private WARC output {destination}: {exc}"
+            ) from exc
+    return published
 
 
 def _curl_fallback_progress_callback(
@@ -2263,6 +2530,9 @@ def _native_request_headers(
     elif options.compression:
         headers["Accept-Encoding"] = options.compression
     headers.update(_headers_from_user_options(options.headers))
+    if options.http_user:
+        credential = f"{options.http_user}:{options.http_password or ''}"
+        headers["Authorization"] = f"Basic {b64encode(credential.encode('utf-8')).decode('ascii')}"
     if options.timestamping and path.exists() and not resume_from:
         etag = metadata.get("etag") or str(getattr(probe, "etag", "") or "")
         last_modified = metadata.get("last_modified") or str(
@@ -2641,10 +2911,6 @@ def _mirror_safety_warnings(options: SiteDownloadOptions) -> list[str]:
         warnings.append("host spanning is enabled; this can expand the mirror scope")
     if options.depth >= 5:
         warnings.append("high recursive depth can create a large mirror")
-    if options.max_files is not None:
-        warnings.append(
-            "max-files is enforced during Atlas scan planning when scan counts are available"
-        )
     if options.max_runtime is not None:
         warnings.append(f"mirror subprocess runtime is capped at {options.max_runtime:g} seconds")
     return warnings

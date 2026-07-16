@@ -158,6 +158,58 @@ def test_scan_site_builds_smart_manifest(monkeypatch: pytest.MonkeyPatch) -> Non
     assert external_item.error == "external link skipped by default"
 
 
+def test_scan_site_recognizes_file_only_autoindex_before_media_recommendation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    html = b"""
+    <html><head><title>Index of /video/</title></head><body><pre>
+      <a href="clip-one.mp4">clip one</a> 2026-07-01 10:00 1.5 MiB
+      <a href="clip-two.mp4">clip two</a> 2026-07-01 10:01 2.0 MiB
+    </pre></body></html>
+    """
+    monkeypatch.setattr(
+        "atlas.adaptive.FetchClient.get",
+        lambda *_args, **_kwargs: _fetch_response("https://example.com/video/", html),
+    )
+    monkeypatch.setattr("atlas.adaptive._robots_hints", lambda _url, *, timeout: (None, []))
+
+    scan = scan_site("https://example.com/video/")
+
+    assert scan.scan_type == "directory-style HTML index"
+    assert scan.scan_counts["media"] == 2
+    assert scan.scan_recommended_mode == "Recursive directory mirror with HTML preservation"
+    assert "bounded recursive mirror" in (scan.scan_recommended_strategy or "")
+    assert [item.filename for item in scan.discovered_work_items] == ["clip one", "clip two"]
+
+
+def test_scan_site_does_not_call_navigation_heavy_landing_page_a_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    folders = b"".join(
+        f'<a href="mirror-{index}/">mirror {index}</a>'.encode() for index in range(2)
+    )
+    pages = b"".join(f'<a href="page-{index}.html">page {index}</a>'.encode() for index in range(8))
+    monkeypatch.setattr(
+        "atlas.adaptive.FetchClient.get",
+        lambda *_args, **_kwargs: _fetch_response(
+            "https://example.com/",
+            b"<html><head><title>Mirror service</title></head><body>"
+            + folders
+            + pages
+            + b"</body></html>",
+        ),
+    )
+    monkeypatch.setattr("atlas.adaptive._robots_hints", lambda _url, *, timeout: (None, []))
+
+    scan = scan_site("https://example.com/")
+
+    assert scan.scan_counts["folders"] == 2
+    assert scan.scan_counts["html"] == 8
+    assert scan.scan_type == "HTML page"
+    assert scan.scan_recommended_mode == "Offline website copy with page requisites"
+    assert "offline website copy" in (scan.scan_recommended_strategy or "")
+
+
 def test_scan_site_tls_failure_is_not_empty_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

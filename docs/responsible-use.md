@@ -33,7 +33,8 @@ Do not use `atlas` for:
 
 ## Cookies
 
-Cookies are supported only through normal yt-dlp mechanisms:
+Cookies are supported only through normal user-authorized downloader
+mechanisms:
 
 ```text
 --cookies-from-browser safari|chrome|firefox|brave|edge
@@ -41,7 +42,9 @@ Cookies are supported only through normal yt-dlp mechanisms:
 ```
 
 Cookies should represent your own authorized browser session. `atlas` does not
-steal credentials or attempt to break access restrictions.
+steal credentials or attempt to break access restrictions. Media uses yt-dlp;
+site mirroring exports a temporary Netscape jar and requires Wget2 when browser
+cookies are requested.
 
 ## Privacy and local data
 
@@ -57,6 +60,12 @@ custom headers can contain credentials.
 - Delete session artifacts when their recovery value no longer outweighs their
   sensitivity.
 - Use `--json` output only with consumers that protect the resulting data.
+
+Human output, plans, and saved backend command previews redact recognized
+credentials. Recovery artifacts may retain the original URL—including a signed
+query string—because an altered URL cannot be retried. Atlas writes those files
+atomically with owner-only permissions, but they are operational secrets, not
+sanitized shareable reports.
 
 Atlas cannot control copies retained by your shell, terminal recorder, CI logs,
 download destination, backups, or remote servers. Redact those surfaces as part
@@ -79,6 +88,13 @@ hotlink protection, and courteous transfer behavior:
 These controls are not a license to evade a service's rules. Keep requests
 bounded, respect robots/terms where applicable, and prefer archive/resume modes
 over repeated downloads.
+
+For direct native downloads, Basic authorization, cookies, sensitive headers,
+and referrers are limited to the initial origin and are stripped before a
+cross-origin redirect. Atlas rejects sensitive custom headers and request
+bodies for recursive site mirrors because Wget may replay them across a
+redirect; GNU Wget is also rejected for site Basic authentication. These
+failures are intentional credential-boundary protections.
 
 Atlas does not implement browser automation to defeat bot challenges, fake
 browser fingerprinting from installed browsers, stolen-cookie/session workflows,

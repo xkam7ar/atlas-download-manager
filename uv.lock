@@ -110,7 +110,7 @@ requires-dist = [
     { name = "questionary", marker = "extra == 'interactive'", specifier = ">=2.0" },
     { name = "rich", specifier = ">=13.7" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.8" },
-    { name = "typer", specifier = ">=0.12" },
+    { name = "typer", specifier = ">=0.15.4" },
     { name = "yt-dlp", specifier = ">=2025.1.1" },
 ]
 provides-extras = ["interactive", "dev"]

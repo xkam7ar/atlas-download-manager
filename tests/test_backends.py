@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import stat
 import subprocess
 from pathlib import Path
 from urllib.error import URLError
@@ -13,6 +15,7 @@ from atlas.backends import (
     SiteMirrorEngine,
     _curl_file_args,
     _exact_directory_relative_url_path,
+    _wget2_failed_urls,
     _write_http_metadata,
     filename_from_url,
     parse_wget2_stats_files,
@@ -122,6 +125,56 @@ def test_file_engine_rejects_symlink_output(tmp_path: Path) -> None:
         FileDownloadEngine().plan(options)
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "file:///etc/passwd",
+        "relative/path",
+        "data:text/plain,hello",
+        "https://user:password@example.com/file.bin",
+    ],
+)
+def test_http_download_models_reject_non_http_or_credentialed_urls(
+    tmp_path: Path,
+    url: str,
+) -> None:
+    with pytest.raises(ValueError, match="URL"):
+        FileDownloadOptions(url=url, output_dir=tmp_path)
+    with pytest.raises(ValueError, match="URL"):
+        SiteDownloadOptions(url=url, output_dir=tmp_path)
+
+
+def test_http_download_models_accept_ipv6_https_url(tmp_path: Path) -> None:
+    url = "https://[2001:db8::1]:8443/files/archive.bin"
+
+    assert FileDownloadOptions(url=url, output_dir=tmp_path).url == url
+    assert SiteDownloadOptions(url=url, output_dir=tmp_path).url == url
+
+
+def test_site_parser_input_mode_accepts_local_input_path(tmp_path: Path) -> None:
+    source = tmp_path / "urls.txt"
+
+    options = SiteDownloadOptions(
+        url=str(source),
+        output_dir=tmp_path,
+        input_file=source,
+        input_file_only=True,
+    )
+
+    assert options.url == str(source)
+
+
+def test_site_parser_input_mode_still_validates_explicit_base(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="HTTP or HTTPS"):
+        SiteDownloadOptions(
+            url="relative/path",
+            output_dir=tmp_path,
+            input_file=tmp_path / "urls.txt",
+            input_file_only=True,
+            base="file:///etc/",
+        )
+
+
 def test_file_engine_sanitizes_explicit_filename(tmp_path: Path) -> None:
     options = FileDownloadOptions(
         url="https://example.com/download",
@@ -191,8 +244,7 @@ def test_file_engine_builds_wget2_plan(tmp_path: Path, monkeypatch) -> None:
         referer="https://referrer.example/",
         cache=False,
         compression="br",
-        method="POST",
-        body_data="payload",
+        method="GET",
         load_cookies=tmp_path / "cookies.txt",
         proxy="http://127.0.0.1:8080",
         http_user="alice",
@@ -221,8 +273,6 @@ def test_file_engine_builds_wget2_plan(tmp_path: Path, monkeypatch) -> None:
     assert "--referer=https://referrer.example/" in plan.args
     assert "--no-cache" in plan.args
     assert "--compression=br" in plan.args
-    assert "--method=POST" in plan.args
-    assert "--body-data=payload" in plan.args
     assert f"--load-cookies={tmp_path / 'cookies.txt'}" in plan.args
     assert "--http-proxy=http://127.0.0.1:8080" in plan.args
     assert "--https-proxy=http://127.0.0.1:8080" in plan.args
@@ -271,6 +321,7 @@ def test_file_engine_subprocess_aria2_args_include_policy_options(
 
     args = FileDownloadEngine()._aria2_args(options, tmp_path / "archive.zip")
 
+    assert "--no-conf=true" in args
     assert "--lowest-speed-limit=32K" in args
     assert "--max-tries=5" in args
     assert "--retry-wait=2.5" in args
@@ -772,6 +823,42 @@ def test_native_file_engine_retries_transient_network_failure(
     assert (tmp_path / "archive.bin").read_bytes() == b"ok"
 
 
+def test_native_file_engine_uses_explicit_proxy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_open_request(request, *, timeout, context, proxy):
+        seen.update(request=request, timeout=timeout, context=context, proxy=proxy)
+        return _FakeResponse(b"ok", headers={"Content-Length": "2"})
+
+    monkeypatch.setattr("atlas.backends.open_request", fake_open_request)
+    monkeypatch.setattr(
+        "atlas.backends.urlopen",
+        lambda *_args, **_kwargs: pytest.fail("explicit proxy must not use bare urlopen"),
+    )
+    options = FileDownloadOptions(
+        url="http://unresolvable.invalid/archive.bin",
+        output_dir=tmp_path,
+        backend=FileBackendChoice.native,
+        filename="archive.bin",
+        proxy="http://proxy.example:8080",
+        headers=("Authorization: Bearer secret", "X-Api-Key: secret"),
+    )
+
+    result = FileDownloadEngine().download(options)
+
+    assert result.status == DownloadStatus.success
+    assert seen["proxy"] == "http://proxy.example:8080"
+    request = seen["request"]
+    assert request.full_url == options.url
+    assert "Authorization" not in request.headers
+    assert request.unredirected_hdrs["Authorization"] == "Bearer secret"
+    assert request.unredirected_hdrs["X-api-key"] == "secret"
+    assert (tmp_path / "archive.bin").read_bytes() == b"ok"
+
+
 def test_native_file_engine_deadline_stops_slow_chunk_before_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -801,7 +888,7 @@ def test_native_file_engine_deadline_stops_slow_chunk_before_write(
     with pytest.raises(EngineError, match="mirror max runtime"):
         FileDownloadEngine().download(options, deadline=1.0)
 
-    assert (tmp_path / "archive.bin").read_bytes() == b""
+    assert not (tmp_path / "archive.bin").exists()
 
 
 def test_native_rate_limit_cannot_sleep_past_deadline(
@@ -1254,6 +1341,31 @@ def test_native_download_rejects_size_mismatch(
         FileDownloadEngine().download(options)
 
 
+def test_native_checksum_mismatch_never_publishes_unverified_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "atlas.backends.urlopen",
+        lambda request, *, timeout: _FakeResponse(
+            b"attacker-controlled",
+            headers={"Content-Length": "19"},
+        ),
+    )
+    options = FileDownloadOptions(
+        url="https://example.com/payload.bin",
+        output_dir=tmp_path,
+        backend=FileBackendChoice.native,
+        checksum="sha256:" + "0" * 64,
+    )
+
+    with pytest.raises(EngineError, match="Checksum mismatch"):
+        FileDownloadEngine().download(options)
+
+    assert not (tmp_path / "payload.bin").exists()
+    assert not list(tmp_path.glob(".payload.bin.atlas-part-*"))
+
+
 def test_file_engine_rejects_known_download_larger_than_free_space(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1318,6 +1430,131 @@ def test_site_engine_builds_wget2_plan(tmp_path: Path, monkeypatch) -> None:
     assert "--clobber" not in plan.args
     assert "--mirror" not in plan.args
     assert "--no-if-modified-since" not in plan.args
+
+
+def test_redirecting_backends_reject_sensitive_custom_headers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
+    file_options = FileDownloadOptions(
+        url="https://example.com/archive.zip",
+        output_dir=tmp_path,
+        backend=FileBackendChoice.aria2,
+        headers=("X-Auth: SECURITY_SENTINEL",),
+    )
+    site_options = SiteDownloadOptions(
+        url="https://example.com/docs/",
+        output_dir=tmp_path,
+        backend=SiteBackendChoice.wget2,
+        headers=("Authentication: SECURITY_SENTINEL",),
+    )
+
+    with pytest.raises(EngineError, match="Sensitive custom headers require the native"):
+        FileDownloadEngine().plan(file_options)
+    with pytest.raises(EngineError, match="unsafe with recursive Wget redirects"):
+        SiteMirrorEngine().plan(site_options)
+
+
+def test_redirecting_backends_reject_secret_header_values_and_unsafe_basic_auth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
+
+    with pytest.raises(EngineError, match="Sensitive custom headers require the native"):
+        FileDownloadEngine().plan(
+            FileDownloadOptions(
+                url="https://example.com/archive.zip",
+                output_dir=tmp_path,
+                backend=FileBackendChoice.wget2,
+                headers=("X-Callback: https://api.example/?token=SECURITY_SENTINEL",),
+            )
+        )
+    with pytest.raises(EngineError, match="aria2 can forward generated credentials"):
+        FileDownloadEngine().plan(
+            FileDownloadOptions(
+                url="https://example.com/archive.zip",
+                output_dir=tmp_path,
+                backend=FileBackendChoice.aria2,
+                http_user="alice",
+                http_password="secret",
+            )
+        )
+    with pytest.raises(EngineError, match="Request bodies require the native backend"):
+        FileDownloadEngine().plan(
+            FileDownloadOptions(
+                url="https://example.com/submit",
+                output_dir=tmp_path,
+                backend=FileBackendChoice.wget2,
+                method="POST",
+                body_data="private arbitrary payload",
+            )
+        )
+    with pytest.raises(EngineError, match="unsafe with GNU Wget"):
+        SiteMirrorEngine().plan(
+            SiteDownloadOptions(
+                url="https://example.com/docs/",
+                output_dir=tmp_path,
+                backend=SiteBackendChoice.wget,
+                http_user="alice",
+                http_password="secret",
+            )
+        )
+    with pytest.raises(EngineError, match="does not accept request bodies"):
+        SiteMirrorEngine().plan(
+            SiteDownloadOptions(
+                url="https://example.com/docs/",
+                output_dir=tmp_path,
+                backend=SiteBackendChoice.wget2,
+                method="POST",
+                post_data="private arbitrary payload",
+            )
+        )
+
+
+def test_conventional_site_plan_rejects_unenforceable_max_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
+
+    with pytest.raises(EngineError, match="cannot be guaranteed"):
+        SiteMirrorEngine().plan(
+            SiteDownloadOptions(
+                url="https://example.com/docs/",
+                output_dir=tmp_path,
+                backend=SiteBackendChoice.wget2,
+                max_files=10,
+            )
+        )
+
+
+def test_native_basic_auth_is_initial_hop_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_urlopen(request, **_kwargs):
+        seen["request"] = request
+        return _FakeResponse(b"ok", headers={"Content-Length": "2"})
+
+    monkeypatch.setattr("atlas.backends.urlopen", fake_urlopen)
+    result = FileDownloadEngine().download(
+        FileDownloadOptions(
+            url="https://example.com/archive.zip",
+            output_dir=tmp_path,
+            backend=FileBackendChoice.native,
+            http_user="alice",
+            http_password="secret",
+        )
+    )
+
+    assert result.status == DownloadStatus.success
+    request = seen["request"]
+    assert "Authorization" not in request.headers
+    assert request.unredirected_hdrs["Authorization"] == "Basic YWxpY2U6c2VjcmV0"
 
 
 def test_site_engine_builds_wget2_overwrite_plan(tmp_path: Path, monkeypatch) -> None:
@@ -1584,8 +1821,8 @@ def test_directory_engine_rejects_exact_index_redirect_outside_scope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "atlas.backends.urlopen",
-        lambda _request, *, timeout: _FakeResponse(
+        "atlas.backends.open_request",
+        lambda _request, **_kwargs: _FakeResponse(
             b"evil",
             headers={"Content-Length": "4"},
             url="https://evil.example/root/archive.bin",
@@ -1616,8 +1853,8 @@ def test_directory_engine_rejects_double_encoded_redirect_escape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "atlas.backends.urlopen",
-        lambda _request, *, timeout: _FakeResponse(
+        "atlas.backends.open_request",
+        lambda _request, **_kwargs: _FakeResponse(
             b"evil",
             headers={"Content-Length": "4"},
             url="https://files.example/root/%252e%252e/secret.bin",
@@ -1685,8 +1922,8 @@ def test_directory_engine_hard_caps_stale_exact_index_size(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "atlas.backends.urlopen",
-        lambda _request, *, timeout: _FakeResponse(
+        "atlas.backends.open_request",
+        lambda _request, **_kwargs: _FakeResponse(
             b"x" * 2048,
             headers={"Content-Length": "512"},
         ),
@@ -1710,7 +1947,7 @@ def test_directory_engine_hard_caps_stale_exact_index_size(
     with pytest.raises(MirrorDownloadError, match="1024-byte output limit"):
         SiteMirrorEngine().mirror(options)
 
-    assert output.stat().st_size <= 1024
+    assert not output.exists()
 
 
 def test_directory_engine_refuses_unbounded_exact_index_when_size_limit_set(
@@ -1829,9 +2066,7 @@ def test_site_engine_builds_wget2_policy_plan(tmp_path: Path, monkeypatch) -> No
         referer="https://referrer.example/",
         cache=False,
         compression="br",
-        method="POST",
-        body_data="payload",
-        post_data="legacy=1",
+        method="GET",
         cookies=False,
         load_cookies=tmp_path / "cookies.txt",
         save_cookies=tmp_path / "saved-cookies.txt",
@@ -1879,7 +2114,6 @@ def test_site_engine_builds_wget2_policy_plan(tmp_path: Path, monkeypatch) -> No
         signature_extensions="asc,sig",
         gnupg_homedir=tmp_path / "gnupg",
         verify_save_failed=True,
-        max_files=25,
         max_total_size="10M",
         max_runtime=45,
         quota="10M",
@@ -1945,7 +2179,7 @@ def test_site_engine_builds_wget2_policy_plan(tmp_path: Path, monkeypatch) -> No
     assert "--force-atom" in plan.args
     assert "--force-rss" in plan.args
     assert "--force-metalink" in plan.args
-    assert f"--warc-file={tmp_path / 'archive.warc.gz'}" in plan.args
+    assert f"--warc-file={tmp_path / 'archive'}" in plan.args
     assert "--warc-compression" in plan.args
     assert "--warc-cdx" in plan.args
     assert "--warc-max-size=1G" in plan.args
@@ -1955,9 +2189,6 @@ def test_site_engine_builds_wget2_policy_plan(tmp_path: Path, monkeypatch) -> No
     assert "--referer=https://referrer.example/" in plan.args
     assert "--no-cache" in plan.args
     assert "--compression=br" in plan.args
-    assert "--method=POST" in plan.args
-    assert "--body-data=payload" in plan.args
-    assert "--post-data=legacy=1" in plan.args
     assert "--no-cookies" in plan.args
     assert f"--load-cookies={tmp_path / 'cookies.txt'}" in plan.args
     assert f"--save-cookies={tmp_path / 'saved-cookies.txt'}" in plan.args
@@ -2007,7 +2238,6 @@ def test_site_engine_builds_wget2_policy_plan(tmp_path: Path, monkeypatch) -> No
     assert "--verify-save-failed" in plan.args
     assert "--quota=10M" in plan.args
     assert "--limit-rate=1M" in plan.args
-    assert any("max-files" in warning for warning in plan.warnings)
     assert any("runtime is capped" in warning for warning in plan.warnings)
     assert "--retry-connrefused" in plan.args
     assert "--start-pos=1024" in plan.args
@@ -2171,6 +2401,36 @@ def test_fresh_mirror_rejects_success_without_payload(
 
     with pytest.raises(EngineError, match="no downloaded payload"):
         SiteMirrorEngine().mirror(options)
+
+
+def test_conventional_mirror_refuses_existing_descendant_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "mirror"
+    output.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (output / "redirected-subtree").symlink_to(outside, target_is_directory=True)
+    started = False
+
+    def unexpected_run(*_args: object, **_kwargs: object) -> SubprocessResult:
+        nonlocal started
+        started = True
+        raise AssertionError("mirror subprocess should not start")
+
+    monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.setattr("atlas.backends.run_args_stream", unexpected_run)
+    options = DirectoryMirrorOptions(
+        url="https://example.com/docs/",
+        output_dir=output,
+        backend=SiteBackendChoice.wget2,
+    )
+
+    with pytest.raises(MirrorDownloadError, match="containing a symbolic link"):
+        SiteMirrorEngine().mirror(options)
+
+    assert not started
 
 
 def test_mirror_spider_does_not_require_payload(
@@ -2354,6 +2614,69 @@ def test_site_engine_emits_wget_events(tmp_path: Path, monkeypatch) -> None:
     ]
 
 
+def test_site_engine_publishes_warc_atomically_and_privately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "mirror"
+
+    def fake_run_args_stream(args, *, on_line, timeout):
+        _ = on_line, timeout
+        prefix_arg = next(arg for arg in args if arg.startswith("--warc-file="))
+        runtime_prefix = Path(prefix_arg.partition("=")[2])
+        runtime_warc = runtime_prefix.with_name(f"{runtime_prefix.name}.warc.gz")
+        runtime_warc.write_bytes(b"private WARC")
+        runtime_warc.chmod(0o666)
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "index.html").write_text("downloaded", encoding="utf-8")
+        return SubprocessResult(args=list(args), returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.setattr("atlas.backends.run_args_stream", fake_run_args_stream)
+    requested = tmp_path / "capture.warc.gz"
+
+    result = SiteMirrorEngine().mirror(
+        SiteDownloadOptions(
+            url="https://example.com/docs/",
+            output_dir=output,
+            backend=SiteBackendChoice.wget,
+            warc_file=requested,
+        )
+    )
+
+    assert result.status == DownloadStatus.success
+    assert requested.read_bytes() == b"private WARC"
+    assert stat.S_IMODE(requested.stat().st_mode) == 0o600
+    assert not (tmp_path / "capture.warc.gz.warc.gz").exists()
+    assert result.ydl_opts is not None
+    assert result.ydl_opts["warc_outputs"] == [str(requested)]
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks are unavailable")
+def test_site_engine_refuses_warc_symlink_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "outside"
+    target.write_bytes(b"preserve")
+    requested = tmp_path / "capture.warc.gz"
+    requested.symlink_to(target)
+    monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
+
+    with pytest.raises(EngineError, match="unsafe WARC output"):
+        SiteMirrorEngine().mirror(
+            SiteDownloadOptions(
+                url="https://example.com/docs/",
+                output_dir=tmp_path / "mirror",
+                backend=SiteBackendChoice.wget,
+                warc_file=requested,
+                overwrite=True,
+            )
+        )
+
+    assert target.read_bytes() == b"preserve"
+
+
 def test_site_engine_parses_wget2_stats(tmp_path: Path, monkeypatch) -> None:
     def fake_run_args_stream(args, *, on_line, timeout):
         _ = timeout
@@ -2420,6 +2743,42 @@ def test_site_engine_reports_wget2_stats_on_error(tmp_path: Path, monkeypatch) -
     assert raised.value.stats["summary"]["site"]["failures"] == 1
 
 
+def test_site_engine_rejects_zero_exit_with_failed_wget2_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_args_stream(args, *, on_line, timeout):
+        _ = on_line, timeout
+        (tmp_path / "index.html").write_text("downloaded", encoding="utf-8")
+        for arg in args:
+            if arg.startswith("--stats-site=csv:"):
+                Path(arg.split(":", 1)[1]).write_text(
+                    "ID,ParentID,URL,Status,Link,Method,Size,SizeDecompressed,"
+                    "TransferTime,ResponseTime,Encoding,Verification,Last-Modified,"
+                    "Content-Type\n"
+                    "1,0,https://example.com/docs/,200,1,1,32,32,1,1,0,0,0,text/html\n"
+                    "2,1,https://example.com/docs/missing.css,404,1,1,0,0,1,1,0,0,0,"
+                    "text/html\n",
+                    encoding="utf-8",
+                )
+        return SubprocessResult(args=list(args), returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.setattr("atlas.backends.run_args_stream", fake_run_args_stream)
+    options = SiteDownloadOptions(
+        url="https://example.com/docs/",
+        output_dir=tmp_path,
+        backend=SiteBackendChoice.wget2,
+    )
+    events: list[ProgressEvent] = []
+
+    with pytest.raises(MirrorDownloadError, match="completed with failed requests") as raised:
+        SiteMirrorEngine().mirror(options, progress_callback=events.append)
+
+    assert [event.status for event in events] == ["starting", "error"]
+    assert raised.value.stats["summary"]["site"]["failures"] == 1
+
+
 def test_site_engine_exports_browser_cookies_for_wget2(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2455,6 +2814,35 @@ def test_site_engine_exports_browser_cookies_for_wget2(
 
     assert result.status == DownloadStatus.success
     assert any(arg.endswith("/browser-cookies.txt") for arg in captured_args)
+
+
+def test_site_engine_prepares_saved_cookie_jar_as_private(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cookie_jar = tmp_path / "saved-cookies.txt"
+    cookie_jar.write_text("old", encoding="utf-8")
+    cookie_jar.chmod(0o666)
+
+    def fake_run_args_stream(args, *, on_line, timeout):
+        _ = on_line, timeout
+        assert f"--save-cookies={cookie_jar}" in args
+        assert cookie_jar.stat().st_mode & 0o777 == 0o600
+        (tmp_path / "index.html").write_text("downloaded", encoding="utf-8")
+        return SubprocessResult(args=list(args), returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.setattr("atlas.backends.run_args_stream", fake_run_args_stream)
+    options = SiteDownloadOptions(
+        url="https://example.com/docs/",
+        output_dir=tmp_path,
+        backend=SiteBackendChoice.wget2,
+        save_cookies=cookie_jar,
+    )
+
+    result = SiteMirrorEngine().mirror(options)
+
+    assert result.status == DownloadStatus.success
 
 
 def test_site_engine_rejects_browser_and_explicit_cookie_file(
@@ -2553,6 +2941,21 @@ def test_parse_wget2_stats_files_summarizes_headered_site_stats(tmp_path: Path) 
         "response_time_ms": 324,
         "mime_types": {"text/html": 2, "application/pdf": 1},
     }
+
+
+def test_wget2_failed_urls_can_ignore_an_absent_robots_policy_file() -> None:
+    stats = {
+        "site": {
+            "rows": [
+                {"status": 404, "url": "https://example.com/robots.txt"},
+                {"status": 404, "url": "https://example.com/missing.css"},
+            ]
+        }
+    }
+
+    assert _wget2_failed_urls(stats, ignore_missing_robots=True) == [
+        "404 https://example.com/missing.css"
+    ]
 
 
 def test_parse_wget2_stats_files_summarizes_dns_tls_and_ocsp(tmp_path: Path) -> None:

@@ -42,6 +42,7 @@ from atlas.menu import (
     _files_mirrors_choices,
     _launcher_header_panel,
     _main_choices,
+    _mapping_diff_fields,
     _media_choices,
     _menu_footer,
     _menu_shortcut_fields,
@@ -61,6 +62,7 @@ from atlas.menu import (
     _reveal_path,
     _runtime_tool_statuses,
     _scan_directory_roots,
+    _scan_looks_like_directory_index,
     _session_choices,
     _settings_choices,
     _tool_choices,
@@ -149,11 +151,13 @@ class FakePrompts(PromptUI):
         selects: list[object | None],
         multi_selects: list[list[object] | None] | None = None,
         texts: list[str | None] | None = None,
+        secrets: list[str | None] | None = None,
         confirms: list[bool | None] | None = None,
     ) -> None:
         self.selects = selects
         self.multi_selects = multi_selects or []
         self.texts = texts or []
+        self.secrets = secrets or []
         self.confirms = confirms or []
         self.seen_selects: list[tuple[str, list[str]]] = []
         self.seen_multi_selects: list[tuple[str, list[str]]] = []
@@ -170,6 +174,9 @@ class FakePrompts(PromptUI):
     def text(self, _message: str, *, default: str = "") -> str | None:
         _ = default
         return self.texts.pop(0)
+
+    def secret(self, _message: str) -> str | None:
+        return self.secrets.pop(0)
 
     def confirm(self, _message: str, *, default: bool = False) -> bool | None:
         _ = default
@@ -329,6 +336,7 @@ class FakeQuestionary:
         self.select_kwargs: list[dict[str, object]] = []
         self.checkbox_kwargs: list[dict[str, object]] = []
         self.text_kwargs: list[dict[str, object]] = []
+        self.password_kwargs: list[dict[str, object]] = []
         self.confirm_kwargs: list[dict[str, object]] = []
         self.text_answer = text_answer
 
@@ -350,6 +358,11 @@ class FakeQuestionary:
     def text(self, message: str, **kwargs) -> FakeQuestionaryPrompt:
         self.calls.append(("text", message, []))
         self.text_kwargs.append(kwargs)
+        return FakeQuestionaryPrompt(self.text_answer)
+
+    def password(self, message: str, **kwargs) -> FakeQuestionaryPrompt:
+        self.calls.append(("password", message, []))
+        self.password_kwargs.append(kwargs)
         return FakeQuestionaryPrompt(self.text_answer)
 
     def confirm(self, message: str, **kwargs) -> FakeQuestionaryPrompt:
@@ -401,6 +414,11 @@ def test_can_auto_launch_menu_requires_tty_and_no_automation() -> None:
         stdin=FakeStream(True),
         stdout=FakeStream(True),
         env={"CI": "1"},
+    )
+    assert can_auto_launch_menu(
+        stdin=FakeStream(True),
+        stdout=FakeStream(True),
+        env={"CI": "false", "GITHUB_ACTIONS": "0"},
     )
     assert not can_auto_launch_menu(
         stdin=FakeStream(True),
@@ -838,6 +856,38 @@ def test_questionary_text_keeps_blank_distinct_from_cancel(
     assert QuestionaryPromptUI().text("Optional value") is None
 
 
+def test_questionary_secret_uses_hidden_password_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_questionary = FakeQuestionary(text_answer=" secret with spaces ")
+    monkeypatch.setattr(
+        "atlas.menu.importlib.import_module",
+        lambda _name: fake_questionary,
+    )
+
+    answer = QuestionaryPromptUI().secret("HTTP password")
+
+    assert answer == " secret with spaces "
+    assert fake_questionary.calls == [("password", "HTTP password", [])]
+    assert fake_questionary.password_kwargs == [{"qmark": "", "style": None, "instruction": " "}]
+
+
+def test_option_diff_never_renders_secret_values() -> None:
+    fields = _mapping_diff_fields(
+        {"http_password": None, "headers": []},
+        {
+            "http_password": "supersecret",
+            "headers": ["Authorization: bearer-secret"],
+        },
+    )
+
+    rendered = " ".join(f"{field.label} {field.value}" for field in fields)
+    assert "supersecret" not in rendered
+    assert "bearer-secret" not in rendered
+    assert "Http Password unset -> set" in rendered
+    assert "Headers unset -> set" in rendered
+
+
 def test_export_failed_session_blank_output_uses_stdout(tmp_path: Path) -> None:
     actions = FakeActions(tmp_path)
     prompts = FakePrompts(
@@ -1212,7 +1262,7 @@ def test_menu_audio_profile_can_select_best_source(
     assert first_options.codec == AudioCodec.best
 
 
-def test_menu_audio_mp3_profile_uses_ffmpeg_without_extra_confirmation(
+def test_menu_audio_mp3_profile_confirms_ffmpeg_conversion(
     settings: AtlasSettings,
     tmp_path: Path,
 ) -> None:
@@ -1226,6 +1276,7 @@ def test_menu_audio_mp3_profile_uses_ffmpeg_without_extra_confirmation(
             MainMenuChoice.quit,
         ],
         texts=[url],
+        confirms=[True],
     )
     actions = FakeActions(tmp_path)
     actions.media_infos[url] = MediaInfo(
@@ -1251,9 +1302,31 @@ def test_menu_audio_mp3_profile_uses_ffmpeg_without_extra_confirmation(
     assert isinstance(first_options, AudioDownloadOptions)
     assert first_options.format == "251"
     assert first_options.codec == AudioCodec.mp3
-    assert prompts.seen_confirms == []
-    assert "conversion" not in output.getvalue()
-    assert "Convert with ffmpeg?" not in output.getvalue()
+    assert prompts.seen_confirms == ["Continue with this profile?"]
+
+
+def test_menu_blank_file_url_reprompts_without_crashing(
+    settings: AtlasSettings,
+    tmp_path: Path,
+) -> None:
+    valid_url = "https://example.com/archive.zip"
+    prompts = FakePrompts(
+        selects=[
+            MainMenuChoice.file,
+            PlanMenuChoice.dry_run,
+            PlanMenuChoice.back,
+            MainMenuChoice.quit,
+        ],
+        texts=["   ", valid_url],
+    )
+    actions = FakeActions(tmp_path)
+    output = StringIO()
+
+    run_interactive_menu(settings, actions, prompts=prompts, console=Console(file=output))
+
+    assert "URL cannot be blank" in output.getvalue()
+    assert actions.planned
+    assert actions.planned[0][0].url == valid_url
 
 
 def test_menu_smart_download_uses_auto_hub_route(
@@ -1321,6 +1394,27 @@ def test_smart_download_scan_trigger_is_limited_to_page_like_urls() -> None:
     assert _url_should_scan_before_auto_plan("https://example.com/index")
     assert not _url_should_scan_before_auto_plan("https://example.com/archive.zip")
     assert not _url_should_scan_before_auto_plan("ftp://example.com/directory.html")
+
+
+def test_file_only_autoindex_opens_directory_explorer() -> None:
+    index = DirectoryIndex(
+        source_url="https://example.com/video/",
+        host="example.com",
+        entries=(
+            DirectoryEntry(
+                name="clip.mp4",
+                url="https://example.com/video/clip.mp4",
+                kind="file",
+            ),
+        ),
+        parser_name="autoindex-html",
+    )
+    scan = WorkItem(
+        url=index.source_url,
+        scan_type="directory-style HTML index",
+    )
+
+    assert _scan_looks_like_directory_index(scan, index) is True
 
 
 def test_downloadable_links_from_directory_scan_excludes_page_chrome() -> None:
@@ -3859,10 +3953,9 @@ def test_menu_site_customize_sets_wget2_options(
                 "public_suffixes.dat",
                 str(tmp_path / "netrc"),
                 "alice",
-                "secret",
                 "proxy-user",
-                "proxy-secret",
             ],
+            secrets=["secret", "proxy-secret"],
             confirms=[True],
         ),
         options,
@@ -3877,6 +3970,8 @@ def test_menu_site_customize_sets_wget2_options(
     assert options.netrc is True
     assert options.proxy is False
     assert options.http_user == "alice"
+    assert options.http_password == "secret"
+    assert options.proxy_password == "proxy-secret"
 
     options = _apply_customize_overlay(
         FakePrompts(

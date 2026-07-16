@@ -11,9 +11,10 @@ from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 from html import unescape
 from typing import Literal
-from urllib.parse import quote, unquote, urljoin, urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urljoin, urlparse, urlsplit, urlunsplit
 
 from atlas.models import HubKind, WorkItem
+from atlas.redaction import sanitize_terminal_text
 
 DirectoryEntryKind = Literal["directory", "file", "html", "unknown"]
 
@@ -86,28 +87,39 @@ _TAG_RE = re.compile(r"<[^>]+>")
 _DATE_PATTERNS = (
     "%Y-%m-%d %H:%M",
     "%Y-%m-%d %H:%M:%S",
+    "%Y-%b-%d %H:%M",
+    "%Y-%b-%d %H:%M:%S",
     "%d-%b-%Y %H:%M",
     "%d-%b-%Y %H:%M:%S",
     "%d-%b-%y %H:%M",
 )
 _DATE_RE = re.compile(
-    r"("
+    r"(?<!\d)("
     r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?"
     r"|"
+    r"\d{4}-[A-Za-z]{3}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?"
+    r"|"
     r"\d{2}-[A-Za-z]{3}-\d{2,4}\s+\d{2}:\d{2}(?::\d{2})?"
-    r")"
+    r")(?!\d)"
 )
 _SIZE_RE = re.compile(
     r"^(?P<value>(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)"
     r"(?P<unit>[KMGTPE]?)(?:i?B?)?$",
     re.I,
 )
+_SPLIT_SIZE_UNIT_RE = re.compile(r"^[KMGTPE]?(?:i?B)$", re.IGNORECASE)
+_AUTOINDEX_HEADING_RE = re.compile(
+    r"<(?:title|h1)\b[^>]*>\s*(?:index\s+of|directory\s+listing\s+for)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_AUTOINDEX_TABLE_RE = re.compile(
+    r"<table\b[^>]*\bid\s*=\s*(?:\"list\"|'list'|list(?:\s|>))",
+    re.IGNORECASE,
+)
 _HTML_SUFFIXES = (".html", ".htm", ".xhtml", ".shtml")
+_DIRECTORY_QUERY_KEYS = frozenset({"dir", "directory", "folder"})
 _MAX_DIRECTORY_ENTRIES = 2_000
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-_ANSI_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
-_TERMINAL_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-_BIDI_CONTROL_RE = re.compile(r"[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 _CHARSET_RE = re.compile(
     r"(?:^|;)\s*charset\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^;\s]+))",
     re.IGNORECASE,
@@ -164,7 +176,12 @@ def http_url_origin(url: str) -> tuple[str, str, int] | None:
         return None
     scheme = parsed.scheme.casefold()
     host = parsed.hostname
-    if scheme not in {"http", "https"} or not host:
+    if (
+        scheme not in {"http", "https"}
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
         return None
     try:
         normalized_host = (
@@ -265,23 +282,45 @@ def url_within_directory_scope(seed_url: str, candidate_url: str) -> bool:
 
 
 def _canonical_scope_path(path: str) -> str | None:
-    decoded = path or "/"
-    for _ in range(8):
-        next_value = unquote(decoded)
-        if next_value == decoded:
-            break
-        decoded = next_value
-    else:
-        # Excessive nested encoding is ambiguous across proxies and origin servers.
-        # Refuse it instead of guessing how many decoding passes the server applies.
-        if re.search(r"%[0-9A-Fa-f]{2}", decoded):
-            return None
-    decoded = decoded.replace("\\", "/")
-    trailing_slash = decoded.endswith("/")
-    normalized = posixpath.normpath(f"/{decoded.lstrip('/')}")
+    parts = safe_http_url_path_parts(path)
+    if parts is None:
+        return None
+    trailing_slash = (path or "/").endswith("/")
+    normalized = posixpath.normpath(f"/{'/'.join(parts)}")
     if trailing_slash and normalized != "/":
         normalized = f"{normalized}/"
     return normalized
+
+
+def safe_http_url_path_parts(path: str) -> tuple[str, ...] | None:
+    """Decode URL path components while rejecting ambiguous filesystem separators."""
+
+    parts: list[str] = []
+    for raw_part in (path or "/").split("/"):
+        if not raw_part:
+            continue
+        if re.search(r"%(?![0-9A-Fa-f]{2})", raw_part):
+            return None
+        part = raw_part
+        for _ in range(8):
+            if re.search(r"%[0-9A-Fa-f]{2}", part) is None:
+                break
+            decoded = unquote(part)
+            if decoded == part:
+                break
+            part = decoded
+        else:
+            if re.search(r"%[0-9A-Fa-f]{2}", part):
+                return None
+        if (
+            part in {".", ".."}
+            or "/" in part
+            or "\\" in part
+            or any(ord(char) < 32 or ord(char) == 127 for char in part)
+        ):
+            return None
+        parts.append(part)
+    return tuple(parts)
 
 
 def _directory_scope(path: str) -> str:
@@ -322,6 +361,7 @@ def parse_directory_index(
     if _looks_like_copyparty_text(text):
         return _parse_copyparty_text(base_url, text, depth=depth)
     copyparty_html = _looks_like_copyparty_html(text)
+    autoindex_html = _looks_like_autoindex_html(text)
     if media_type and "html" not in media_type:
         if media_type.startswith("text/"):
             raise UnsupportedDirectoryIndexError(
@@ -370,9 +410,10 @@ def parse_directory_index(
             parent=parent,
             visible_size=visible_size,
         )
+        display_label = _directory_query_name(url) or label
         entries.append(
             DirectoryEntry(
-                name=_display_name(label, url, kind=kind, parent=parent),
+                name=_display_name(display_label, url, kind=kind, parent=parent),
                 url=url,
                 kind=kind,
                 parent=parent,
@@ -387,7 +428,9 @@ def parse_directory_index(
         source_url=base_url,
         host=_host(base_url),
         entries=tuple(entries),
-        parser_name="copyparty-html" if copyparty_html else "html",
+        parser_name=(
+            "copyparty-html" if copyparty_html else "autoindex-html" if autoindex_html else "html"
+        ),
         complete=not truncated,
         truncated_reason="entry-limit" if truncated else None,
     )
@@ -402,6 +445,11 @@ def _looks_like_copyparty_text(text: str) -> bool:
 def _looks_like_copyparty_html(text: str) -> bool:
     sample = text[:16_384].lower()
     return 'id="ht_brw"' in sample and "/.cpr/w/" in sample
+
+
+def _looks_like_autoindex_html(text: str) -> bool:
+    sample = text[:65_536]
+    return bool(_AUTOINDEX_HEADING_RE.search(sample) or _AUTOINDEX_TABLE_RE.search(sample))
 
 
 def _is_copyparty_html_control(base_url: str, url: str, *, label: str) -> bool:
@@ -524,9 +572,10 @@ def directory_index_from_work_item(scan: WorkItem) -> DirectoryIndex:
         kind = _kind_from_work_item(item)
         parent = "parent directory entry" in item.classification_notes
         skipped_reason = item.error or _entry_skip_reason(base_url, url, parent=parent)
+        display_name = item.filename or _directory_query_name(url) or _name_from_url(url)
         entries.append(
             DirectoryEntry(
-                name=_display_name(_name_from_url(url), url, kind=kind, parent=parent),
+                name=_display_name(display_name, url, kind=kind, parent=parent),
                 url=url,
                 kind=kind,
                 parent=parent,
@@ -588,10 +637,7 @@ def _clean_label(value: str) -> str:
 def safe_directory_display_name(value: str) -> str:
     """Remove terminal control sequences while preserving ordinary Unicode names."""
 
-    without_osc = _ANSI_OSC_RE.sub("", value)
-    without_ansi = _ANSI_ESCAPE_RE.sub("", without_osc)
-    without_controls = _TERMINAL_CONTROL_RE.sub("", without_ansi)
-    return _BIDI_CONTROL_RE.sub("", without_controls)
+    return sanitize_terminal_text(value)
 
 
 def _entry_tail(text: str, start: int, fallback: str) -> str:
@@ -613,11 +659,20 @@ def _is_autoindex_sort_link(base_url: str, url: str, *, href: str, label: str) -
     parsed = urlparse(url)
     if parsed.path != base.path:
         return False
-    normalized_label = label.strip().lower()
+    normalized_label = label.strip().casefold()
     query = parsed.query.upper()
-    return normalized_label in {"name", "last modified", "size", "description"} and (
-        "C=" in query and "O=" in query
-    )
+    sort_labels = {
+        "name",
+        "file name",
+        "last modified",
+        "date",
+        "size",
+        "file size",
+        "description",
+        "↑",
+        "↓",
+    }
+    return normalized_label in sort_labels and "C=" in query and "O=" in query
 
 
 def _display_name(
@@ -650,11 +705,17 @@ def _name_from_url(url: str) -> str:
 
 def _is_parent_entry(href: str, label: str) -> bool:
     normalized = unescape(href).strip().casefold()
-    return (
-        normalized in {"..", "../"}
-        or normalized.startswith("../")
-        or "parent directory" in label.strip().lower()
-    )
+    return normalized in {"..", "../"} or "parent directory" in label.strip().lower()
+
+
+def _directory_query_name(url: str) -> str | None:
+    for key, value in reversed(parse_qsl(urlparse(url).query, keep_blank_values=False)):
+        if key.casefold() not in _DIRECTORY_QUERY_KEYS:
+            continue
+        normalized = safe_directory_display_name(value).strip().replace("\\", "/").rstrip("/")
+        if normalized:
+            return normalized.rsplit("/", 1)[-1]
+    return None
 
 
 def _entry_kind(
@@ -666,6 +727,8 @@ def _entry_kind(
     visible_size: int | None = None,
 ) -> DirectoryEntryKind:
     if parent:
+        return "directory"
+    if _directory_query_name(url) is not None:
         return "directory"
     path = urlparse(url).path
     if href.endswith("/") or path.endswith("/") or label.endswith("/"):
@@ -726,12 +789,18 @@ def _parse_http_datetime(value: str | None) -> datetime | None:
 
 def _parse_visible_size(tail: str) -> int | None:
     tokens = [token.strip() for token in " ".join(tail.split()).split()]
-    for token in reversed(tokens):
+    for index in range(len(tokens) - 1, -1, -1):
+        token = tokens[index]
         cleaned = token.strip("()[]")
         if cleaned == "-":
             return None
         if ":" in cleaned or "-" in cleaned:
             continue
+        if index > 0 and _SPLIT_SIZE_UNIT_RE.match(cleaned):
+            combined = f"{tokens[index - 1].strip('()[]')}{cleaned}"
+            parsed = _size_token_to_bytes(combined)
+            if parsed is not None:
+                return parsed
         parsed = _size_token_to_bytes(cleaned)
         if parsed is not None:
             return parsed

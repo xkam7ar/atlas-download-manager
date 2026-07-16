@@ -137,5 +137,7 @@ failed items and can target a more specific status.
 > [!IMPORTANT]
 > URLs can contain temporary credentials or signatures. Avoid pasting sensitive
 > URLs into shared shells, screenshots, tickets, or chat. Atlas redacts known
-> secrets in its logs and artifacts, but it cannot remove them from your shell
-> history or from third-party tools outside its process.
+> secrets in human output, plans, and backend-command previews. Owner-only
+> retry artifacts can retain the original URL so recovery remains possible;
+> they are sensitive and must not be shared. Atlas also cannot remove secrets
+> from shell history or third-party tools outside its process.

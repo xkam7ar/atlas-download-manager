@@ -50,20 +50,13 @@ Linux. When missing and needed, its official bootstrap command appears in the
 complete installer plan. Approving that plan authorizes the bootstrap; Atlas
 never runs it before showing it.
 
-Run normally and approve the displayed plan:
+In this pre-release checkout, inspect the local installer plan:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xkam7ar/atlas/main/install.sh | bash
-```
-
-To inspect the installer without changing the system:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/xkam7ar/atlas/main/install.sh | bash -s -- --no-install --no-menu --yes
+bash install.sh --no-install --no-menu --yes
 ```
 
 `--no-install` prints the bootstrap and package commands without creating files
-or changing the system.
 
 ## Installer finds an old atlas command
 
@@ -104,10 +97,12 @@ atlas doctor
 
 ## Homebrew formula is not available
 
-Before the public tap is published, the bootstrap installer may report that
-`xkam7ar/tap/atlas` is not available from the current machine. In that case it
-falls back to `uv tool install git+https://github.com/xkam7ar/atlas.git`. When
-`uv` is missing, the same approved plan uses uv's official standalone installer.
+Before the public repository and tap are published, both
+`xkam7ar/tap/atlas` and the bootstrap installer's GitHub fallback are
+unavailable. Install this checkout with `uv tool install . --force`; use the
+installer only in `--no-install` mode to review its future plan. Do not replace
+the tap-qualified command with `brew install atlas`, which installs an unrelated
+database tool.
 
 The checked-in Homebrew formula under `packaging/homebrew/atlas.rb` is a release
 template. The tap formula must have the release tarball SHA and generated Python
@@ -285,16 +280,18 @@ What to do:
 
 ```bash
 atlas site URL --adaptive --explain --json
-atlas site URL --same-host-only --depth 1 --max-files 500
+atlas site URL --same-host-only --depth 1 --max-total-size 5G --max-runtime 1800
+atlas dir URL --same-host-only --depth 1 --max-files 500
 atlas dir URL --accept zip,pdf --max-total-size 5G --max-runtime 1800
 ```
 
-For ordinary recursive mirrors, `--max-files` is a scan-time guard,
-`--max-total-size` maps to Wget2 quota, and `--max-runtime` surrounds the mirror
-process. For a signature-recognized CopyParty index, Atlas builds an exact file
-list: file count is exact, all sizes must be known when a total-size bound is
-requested, and runtime covers discovery plus transfer. If the scan is too
-broad, narrow scope with `--same-host-only`, `--no-parent`, `--depth`,
+For ordinary recursive mirrors, Atlas rejects `--max-files` because Wget/Wget2
+cannot guarantee a hard file-count stop. `--max-total-size` maps to Wget2 quota,
+and `--max-runtime` surrounds the mirror process. For a signature-recognized
+CopyParty directory index, Atlas builds an exact file list: file count is exact,
+all sizes must be known when a total-size bound is requested, and runtime covers
+discovery plus transfer. If the scan is too broad, narrow scope with
+`--same-host-only`, `--no-parent`, `--depth`,
 `--accept`, `--reject`, include/exclude path patterns, or a more specific seed
 folder.
 

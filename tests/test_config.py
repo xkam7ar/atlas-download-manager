@@ -242,6 +242,17 @@ def test_load_config_reports_invalid_toml_as_config_error(tmp_path: Path) -> Non
         load_config(cfg)
 
 
+def test_load_config_rejects_unknown_safety_bound_keys(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        'site_max_file = 10\nsite_max_total_sze = "1M"\nsite_max_runtme = 30\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="site_max_file"):
+        load_config(cfg)
+
+
 def test_load_config_accepts_display_aliases(tmp_path: Path) -> None:
     cfg = tmp_path / "config.toml"
     out = tmp_path / "out"

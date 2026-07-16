@@ -90,7 +90,7 @@ from atlas.optimizer import HubExecutionPlan
 from atlas.passthrough import BackendTool
 from atlas.paths import config_path
 from atlas.private_files import ensure_private_directory, write_private_text
-from atlas.redaction import redact_text
+from atlas.redaction import is_sensitive_key, redact_text
 from atlas.setup import RuntimeTool, SetupMode, selected_tools
 from atlas.theme import (
     ATLAS_ACTIVE_STYLE,
@@ -385,6 +385,9 @@ class PromptUI(Protocol):
     def text(self, message: str, *, default: str = "") -> str | None:
         """Return user-entered text, or None when cancelled."""
 
+    def secret(self, message: str) -> str | None:
+        """Return hidden user-entered text, or None when cancelled."""
+
     def confirm(self, message: str, *, default: bool = False) -> bool | None:
         """Return confirmation answer, or None when cancelled."""
 
@@ -581,6 +584,18 @@ class QuestionaryPromptUI:
             return None
         return str(answer).strip()
 
+    def secret(self, message: str) -> str | None:
+        answer = _ask_questionary_prompt(
+            self._questionary.password,
+            message,
+            qmark="",
+            style=self._style,
+            instruction=" ",
+        )
+        if answer is None:
+            return None
+        return str(answer)
+
     def confirm(self, message: str, *, default: bool = False) -> bool | None:
         answer = _ask_questionary_prompt(
             self._questionary.confirm,
@@ -646,7 +661,8 @@ def is_automation_environment(env: Mapping[str, str] | None = None) -> bool:
         "CODEBUILD_BUILD_ID",
         "JENKINS_URL",
     )
-    return any(values.get(key) for key in automation_keys)
+    false_like = {"", "0", "false", "no", "off"}
+    return any(values.get(key, "").strip().lower() not in false_like for key in automation_keys)
 
 
 def run_interactive_menu(
@@ -1483,6 +1499,10 @@ def _media_flow(
         url = prompts.text("URL")
         if url is None:
             return FlowResult.back
+        if not url.strip():
+            console.print(Text("URL cannot be blank.", style=ATLAS_ERROR_STYLE))
+            continue
+        url = url.strip()
         options: MenuDownloadOptions
         effective_kind = kind
         playlist = False
@@ -1537,6 +1557,10 @@ def _direct_flow(
         url = prompts.text("URL")
         if url is None:
             return FlowResult.back
+        if not url.strip():
+            console.print(Text("URL cannot be blank.", style=ATLAS_ERROR_STYLE))
+            continue
+        url = url.strip()
         if kind in {HubKind.auto, HubKind.dir} and _url_should_scan_before_auto_plan(url):
             return _url_scan_action_flow(settings, actions, prompts, console, url)
         options: MenuDownloadOptions
@@ -1562,6 +1586,10 @@ def _playlist_flow(
         url = prompts.text("Playlist URL")
         if url is None:
             return FlowResult.back
+        if not url.strip():
+            console.print(Text("Playlist URL cannot be blank.", style=ATLAS_ERROR_STYLE))
+            continue
+        url = url.strip()
         kind = cast(
             BatchKind | None,
             prompts.select(
@@ -1620,7 +1648,7 @@ def _prepare_media_options(
         )
     except AtlasError as exc:
         console.print(f"[{ATLAS_ERROR_STYLE}]Media probe failed[/{ATLAS_ERROR_STYLE}]")
-        console.print(str(exc))
+        console.print(Text(redact_text(str(exc))))
         return None
     resolver = MediaCapabilityResolver.from_info(media)
     if not resolver.catalog.formats:
@@ -1638,7 +1666,7 @@ def _prepare_media_options(
     if selected is None:
         return None
     choice, selected_kind = selected
-    if choice.requires_transcode and selected_kind != HubKind.audio:
+    if choice.requires_transcode:
         _print_media_choice_warnings(console, choice)
         confirmed = prompts.confirm("Continue with this profile?", default=False)
         if not confirmed:
@@ -1998,7 +2026,11 @@ def _build_plan_with_status(
 def _with_menu_status[T](console: Console, message: str, operation: Callable[[], T]) -> T:
     if not console.is_terminal or not visual_options().motion:
         return operation()
-    with console.status(f"[{ATLAS_ACTIVE_STYLE}]{message}[/{ATLAS_ACTIVE_STYLE}]", spinner="dots"):
+    spinner = "dots" if visual_options().unicode else "line"
+    with console.status(
+        f"[{ATLAS_ACTIVE_STYLE}]{message}[/{ATLAS_ACTIVE_STYLE}]",
+        spinner=spinner,
+    ):
         return operation()
 
 
@@ -2775,10 +2807,16 @@ def _mapping_diff_fields(
         after_value = after_data.get(key)
         if before_value == after_value:
             continue
+        if is_sensitive_key(key) or key in {"body_data", "headers", "post_data"}:
+            before_label = "unset" if before_value in (None, "", (), []) else "set"
+            after_label = "unset" if after_value in (None, "", (), []) else "set"
+        else:
+            before_label = redact_text(_option_value_label(before_value))
+            after_label = redact_text(_option_value_label(after_value))
         fields.append(
             ViewField(
                 _option_label(key),
-                f"{_option_value_label(before_value)} -> {_option_value_label(after_value)}",
+                f"{before_label} -> {after_label}",
                 "warning",
             )
         )
@@ -3479,7 +3517,11 @@ def _file_http_policy_overlay(
             "load_cookies": _optional_path_prompt(prompts, "Load cookies", options.load_cookies),
             "proxy": _optional_text(prompts, "Proxy", options.proxy),
             "http_user": _optional_text(prompts, "HTTP user", options.http_user),
-            "http_password": _optional_text(prompts, "HTTP password", options.http_password),
+            "http_password": _optional_secret(
+                prompts,
+                "HTTP password",
+                options.http_password,
+            ),
             "check_certificate": (
                 options.check_certificate if check_certificate is None else check_certificate
             ),
@@ -3773,9 +3815,17 @@ def _site_cookies_overlay(prompts: PromptUI, options: SiteDownloadOptions) -> Si
             "netrc_file": _optional_path_prompt(prompts, "Netrc file", options.netrc_file),
             "proxy": _optional_bool_prompt(prompts, "Use proxy", options.proxy),
             "http_user": _optional_text(prompts, "HTTP user", options.http_user),
-            "http_password": _optional_text(prompts, "HTTP password", options.http_password),
+            "http_password": _optional_secret(
+                prompts,
+                "HTTP password",
+                options.http_password,
+            ),
             "proxy_user": _optional_text(prompts, "Proxy user", options.proxy_user),
-            "proxy_password": _optional_text(prompts, "Proxy password", options.proxy_password),
+            "proxy_password": _optional_secret(
+                prompts,
+                "Proxy password",
+                options.proxy_password,
+            ),
         }
     )
 
@@ -4122,6 +4172,13 @@ def _optional_text(prompts: PromptUI, message: str, current: str | None) -> str 
     if value is None:
         return current
     return value or None
+
+
+def _optional_secret(prompts: PromptUI, message: str, current: str | None) -> str | None:
+    value = prompts.secret(message)
+    if value is None or value == "":
+        return current
+    return value
 
 
 def _list_prompt(prompts: PromptUI, message: str, current: list[str]) -> list[str]:
@@ -5247,11 +5304,11 @@ def _directory_explorer_flow(
 
 
 def _scan_looks_like_directory_index(scan: WorkItem, directory_index: DirectoryIndex) -> bool:
-    if not _directory_folders(directory_index):
-        return False
     scan_type = (scan.scan_type or "").lower()
     if "directory" in scan_type or "index" in scan_type:
-        return True
+        return bool(_directory_folders(directory_index) or directory_index.files)
+    if not _directory_folders(directory_index):
+        return False
     return _url_should_scan_before_auto_plan(scan.final_url or scan.url)
 
 

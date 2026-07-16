@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from io import StringIO
 from time import monotonic, sleep
 
@@ -16,6 +17,7 @@ from atlas.progress import (
     RichProgressReporter,
     WorkPanelContext,
     _bar_text,
+    _batch_stats,
     _event_matches_operator_panel,
     _live_refresh_due,
     _make_progress,
@@ -23,9 +25,11 @@ from atlas.progress import (
     _normalize_operator_key,
     _phase_label,
     _phase_state_row,
+    _phase_style_for_event,
     _phase_timeline,
     _pulse_bar,
     _pulse_bar_text,
+    _render_batch_operator_hint,
     _semantic_event_row,
     _smoothed_progress_event,
     _status_label,
@@ -88,6 +92,140 @@ def test_smoothed_progress_event_blends_speed_and_eta() -> None:
 
     assert smoothed.speed_bytes_per_sec == 170.0
     assert smoothed.eta_seconds == 79.0
+
+
+def test_smoothed_progress_event_does_not_cross_item_or_phase_boundaries() -> None:
+    previous = ProgressEvent(
+        engine=EngineKind.aria2,
+        status="downloading",
+        phase=ProgressPhase.download,
+        item_id="one",
+        speed_bytes_per_sec=100.0,
+        eta_seconds=100.0,
+    )
+    next_item = ProgressEvent(
+        engine=EngineKind.aria2,
+        status="downloading",
+        phase=ProgressPhase.download,
+        item_id="two",
+        speed_bytes_per_sec=300.0,
+        eta_seconds=40.0,
+    )
+    next_phase = next_item.model_copy(update={"item_id": "one", "phase": ProgressPhase.verify})
+
+    assert _smoothed_progress_event(next_item, previous) == next_item
+    assert _smoothed_progress_event(next_phase, previous) == next_phase
+
+
+def test_progress_reporter_history_is_bounded_and_keeps_phase_transitions() -> None:
+    reporter = RichProgressReporter(Console(file=StringIO()), mode=ProgressMode.compact)
+    reporter.hook(
+        ProgressEvent(
+            engine=EngineKind.native,
+            status="running",
+            phase=ProgressPhase.probe,
+        )
+    )
+
+    for downloaded in range(10_000):
+        reporter.hook(
+            ProgressEvent(
+                engine=EngineKind.native,
+                status="downloading",
+                phase=ProgressPhase.download,
+                downloaded_bytes=downloaded,
+                total_bytes=10_000,
+            )
+        )
+
+    assert len(reporter._events) <= 256
+    assert {event.phase for event in reporter._events} == {
+        ProgressPhase.probe,
+        ProgressPhase.download,
+    }
+    assert reporter._events[-1].downloaded_bytes == 9_999
+
+
+def test_canceled_batch_event_is_warning_and_not_counted_as_queued() -> None:
+    event = ProgressEvent(
+        engine=EngineKind.native,
+        status="canceled",
+        phase=ProgressPhase.done,
+        line_no=1,
+    )
+
+    assert _phase_style_for_event(event) == ATLAS_WARNING_STYLE
+    assert _batch_stats([event], total=1) == {
+        "total": 1,
+        "done": 0,
+        "failed": 0,
+        "active": 0,
+        "queued": 0,
+        "skipped": 0,
+        "canceled": 1,
+    }
+
+
+def test_batch_operator_hint_uses_ascii_keys_without_unicode() -> None:
+    try:
+        configure_visuals(unicode=False, env={})
+        rendered = _render_batch_operator_hint().plain
+
+        assert "up/down move" in rendered
+        assert "↑" not in rendered
+        assert "↓" not in rendered
+    finally:
+        reset_visuals()
+
+
+def test_json_progress_is_one_unstyled_unwrapped_line_on_tty() -> None:
+    output = StringIO()
+    terminal = Console(
+        file=output,
+        force_terminal=True,
+        color_system="standard",
+        width=12,
+    )
+    reporter = RichProgressReporter(terminal, mode=ProgressMode.json, kind=HubKind.file)
+    reporter.hook(
+        ProgressEvent(
+            engine=EngineKind.native,
+            status="downloading",
+            filename="long-file-name.bin",
+            message="literal [markup] text that must not wrap",
+        )
+    )
+
+    lines = output.getvalue().splitlines()
+    assert len(lines) == 1
+    assert "\x1b[" not in lines[0]
+    assert json.loads(lines[0])["message"] == "literal [markup] text that must not wrap"
+
+
+def test_json_progress_redacts_nested_secrets_and_signed_urls() -> None:
+    output = StringIO()
+    reporter = RichProgressReporter(
+        Console(file=output, force_terminal=True),
+        mode=ProgressMode.json,
+        kind=HubKind.file,
+    )
+    secret = "TOPSECRET"
+
+    reporter.hook(
+        ProgressEvent(
+            engine=EngineKind.native,
+            status="error",
+            url=f"https://example.com/file?token={secret}",
+            message=f"Authorization: Bearer {secret}",
+            backend_files=[{"cookie": secret, "uri": f"https://example.com/?sig={secret}"}],
+        )
+    )
+
+    rendered = output.getvalue()
+    payload = json.loads(rendered)
+    assert secret not in rendered
+    assert payload["backend_files"][0]["cookie"] == "<redacted>"
+    assert "token=<redacted>" in payload["url"]
 
 
 def test_live_refresh_policy_caps_render_frequency() -> None:
@@ -792,6 +930,81 @@ def test_file_progress_only_shows_transfer_phases_that_apply() -> None:
     assert "Extract" not in rendered
     assert "metadata" not in rendered
     assert "Thumbnail" not in rendered
+
+
+def test_human_file_progress_redacts_signed_urls_and_secret_messages() -> None:
+    reporter = FileProgressReporter(
+        Console(file=StringIO(), force_terminal=True),
+        work_context=WorkPanelContext(kind=HubKind.file),
+    )
+    reporter.handle_event(
+        ProgressEvent(
+            engine=EngineKind.native,
+            status="error",
+            phase=ProgressPhase.error,
+            kind=HubKind.file,
+            url="https://cdn.example/file?token=SECURITY_SENTINEL",
+            message="token=SECURITY_SENTINEL",
+        )
+    )
+
+    output = StringIO()
+    _render_console(output, width=80).print(reporter._render())
+    rendered = output.getvalue()
+
+    assert "SECURITY_SENTINEL" not in rendered
+
+
+def test_human_file_progress_strips_terminal_control_sequences() -> None:
+    output = StringIO()
+    reporter = FileProgressReporter(
+        _render_console(output),
+        mode=ProgressMode.compact,
+        title="fallback",
+    )
+
+    with reporter:
+        reporter.handle_event(
+            ProgressEvent(
+                engine=EngineKind.native,
+                status="downloading",
+                phase=ProgressPhase.download,
+                kind=HubKind.file,
+                title="evil\x1b[2J\x1b]0;owned\x07name\u202etxt",
+                downloaded_bytes=1,
+                total_bytes=2,
+            )
+        )
+
+    rendered = output.getvalue()
+    assert "\x1b[2J" not in rendered
+    assert "\x1b]0;owned" not in rendered
+    assert "\u202e" not in rendered
+    assert "evilnametxt" in rendered
+
+
+def test_no_unicode_progress_uses_only_ascii_spinner_and_bar() -> None:
+    output = StringIO()
+    configure_visuals(color=False, unicode=False, motion=True, env={})
+    progress = _make_progress(
+        Console(file=output, force_terminal=True, color_system=None, width=80),
+        label="",
+    )
+
+    with progress:
+        progress.add_task(
+            "download",
+            phase="Downloading",
+            title="file.bin",
+            bytes_label="1 / 2 B",
+            speed_label="1 B/s",
+            eta_label="1s",
+            completed=1,
+            total=2,
+        )
+        progress.refresh()
+
+    assert output.getvalue().isascii()
 
 
 def test_create_batch_progress_hook_preserves_batch_context() -> None:

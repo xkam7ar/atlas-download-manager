@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from atlas.errors import EngineError
+from atlas.redaction import redact_command_args
 from atlas.runner import ProcessControl, SubprocessResult, run_args, run_args_stream
 from atlas.setup import install_hint_for_tool
 
@@ -59,8 +60,8 @@ def plan_backend_command(
 def plan_as_dict(plan: BackendCommandPlan) -> dict[str, Any]:
     return {
         "tool": plan.tool.value,
-        "command": plan.command,
-        "args": plan.user_args,
+        "command": redact_command_args(plan.command),
+        "args": redact_command_args(plan.user_args),
         "cwd": str(plan.cwd),
         "safety": list(plan.safety),
     }
@@ -83,8 +84,9 @@ def run_backend_command(
             on_line=callback,
             timeout=timeout,
             control=control,
+            cwd=plan.cwd,
         )
-    return run_args(plan.command, timeout=timeout, control=control)
+    return run_args(plan.command, timeout=timeout, control=control, cwd=plan.cwd)
 
 
 def _backend_executable(tool: BackendTool) -> list[str]:

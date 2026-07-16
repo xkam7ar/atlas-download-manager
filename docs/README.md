@@ -63,6 +63,8 @@ normative contracts, visual system, and engineering decisions.
 | [UI and UX guidelines](ui-ux.md) | Human-facing visual language, interaction patterns, accessibility, and screen states. |
 | [Development guide](development.md) | Local setup, tests, change workflow, documentation ownership, and releases. |
 | [Downloader research](download-research.md) | Historical backend research and the decisions derived from it. |
+| [Repository audit (2026-07-15)](repository-audit-2026-07-15.md) | Thirty-pass audit scope, fixes, verification evidence, and remaining release blockers. |
+| [Open-directory field audit (2026-07-15)](open-directory-audit-2026-07-15.md) | Fifty-directory detection and browser cross-check evidence. |
 
 > [!NOTE]
 > Architecture explains how the system is shaped. System contracts define what

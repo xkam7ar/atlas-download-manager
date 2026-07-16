@@ -1247,6 +1247,12 @@ Plain mode should also use ASCII panel/table borders and explicit text statuses:
 progress modes must never include human UI, ANSI color, alternate-screen escape
 sequences, or explanatory prose.
 
+Every server-, filename-, metadata-, and backend-derived string must be treated
+as untrusted terminal input. Before rendering, Atlas strips ANSI CSI/OSC
+sequences, C0/C1 controls, and bidirectional override/isolate controls. Rich
+escaping alone is not a terminal-injection boundary. `--no-unicode` also uses
+ASCII spinner/bar frames, not merely ASCII labels around Unicode animation.
+
 Plain or `--no-unicode` shortcut overlays must replace glyph keys such as
 `↑/↓` with text such as `up/down`; the action label and status text must still
 be present so the overlay is usable without color or Unicode.

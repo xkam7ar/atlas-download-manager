@@ -22,8 +22,13 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --locked --group dev
       - run: uv run ruff check .
+      - run: uv run ruff format --check .
       - run: uv run mypy src/atlas
-      - run: uv run pytest -m "not integration"
+      - run: >-
+          uv run pytest -m "not integration"
+          -W error::ResourceWarning
+          -W error::pytest.PytestUnraisableExceptionWarning
+          -W error::pytest.PytestUnhandledThreadExceptionWarning
 
   package:
     needs: test
@@ -34,8 +39,10 @@ jobs:
         with:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@v6
+      - run: uv lock --check
       - run: uv sync --locked --group dev
       - run: uv build --out-dir dist
+      - run: uv run --with twine python -m twine check dist/*
       - name: Verify source package contents
         run: |
           python - <<'PY'
@@ -78,7 +85,11 @@ jobs:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --locked --group dev
-      - run: uv run pytest -m "not integration"
+      - run: >-
+          uv run pytest -m "not integration"
+          -W error::ResourceWarning
+          -W error::pytest.PytestUnraisableExceptionWarning
+          -W error::pytest.PytestUnhandledThreadExceptionWarning
       - run: uv run atlas --plain --help
       - run: uv run atlas --version
       - run: zsh -n install.sh

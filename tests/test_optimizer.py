@@ -429,8 +429,8 @@ def test_directory_scan_limits_apply_after_file_filters(
         url=request.url,
         final_url=request.url,
         kind=HubKind.site,
-        scan_type="directory-style HTML index",
-        scan_counts={"same_host": 12},
+        scan_type="directory-style text index",
+        scan_counts={"same_host": 12, "complete": 1},
         scan_estimated_bytes=10 * 1024 * 1024,
         discovered_work_items=[
             *[
@@ -465,6 +465,64 @@ def test_directory_scan_limits_apply_after_file_filters(
     plan = DownloadOptimizer(settings).optimize_options(route, options)
 
     assert plan.options.adaptive_plan is not None
+    assert plan.options.exact_directory_index is True
+
+
+def test_directory_execution_uses_same_origin_final_scan_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = AtlasSettings(output_dir=tmp_path, archive_file=tmp_path / "archive.txt")
+    request = HubRequest(
+        url="https://files.example/root",
+        output_dir=tmp_path,
+        requested_kind=HubKind.dir,
+    )
+    route = EngineRouter(settings).route(request)
+    monkeypatch.setattr(
+        "atlas.optimizer.scan_site",
+        lambda *_args, **_kwargs: WorkItem(
+            url=request.url,
+            final_url="https://files.example/root/",
+            kind=HubKind.site,
+            scan_type="directory-style HTML index",
+        ),
+    )
+
+    plan = DownloadOptimizer(settings).optimize_options(
+        route,
+        DirectoryMirrorOptions(url=request.url, output_dir=tmp_path),
+    )
+
+    assert plan.options.url == "https://files.example/root/"
+
+
+def test_directory_rejects_cross_origin_seed_redirect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = AtlasSettings(output_dir=tmp_path, archive_file=tmp_path / "archive.txt")
+    request = HubRequest(
+        url="https://files.example/root/",
+        output_dir=tmp_path,
+        requested_kind=HubKind.dir,
+    )
+    route = EngineRouter(settings).route(request)
+    monkeypatch.setattr(
+        "atlas.optimizer.scan_site",
+        lambda *_args, **_kwargs: WorkItem(
+            url=request.url,
+            final_url="https://cdn.example/root/",
+            kind=HubKind.site,
+            scan_type="directory-style HTML index",
+        ),
+    )
+
+    with pytest.raises(AtlasError, match="redirected outside the requested origin"):
+        DownloadOptimizer(settings).optimize_options(
+            route,
+            DirectoryMirrorOptions(url=request.url, output_dir=tmp_path),
+        )
 
 
 def test_optimizer_rejects_adaptive_mirror_over_max_files(

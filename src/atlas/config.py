@@ -28,13 +28,33 @@ from atlas.models import (
 from atlas.paths import archive_path, config_path, default_output_dir
 from atlas.redaction import is_sensitive_key, text_contains_secret
 
+_DOCUMENTED_TOML_ALIASES = {
+    "default_output_dir": "output_dir",
+    "default_video_container": "video_container",
+    "default_audio_codec": "audio_codec",
+    "use_aria2": "aria2",
+}
+
+
+class _AtlasTomlSettingsSource(TomlConfigSettingsSource):
+    """Normalize Atlas's documented TOML names across supported settings releases."""
+
+    def __call__(self) -> dict[str, Any]:
+        values = dict(super().__call__())
+        for documented_name, field_name in _DOCUMENTED_TOML_ALIASES.items():
+            if documented_name not in values:
+                continue
+            values.setdefault(field_name, values[documented_name])
+            del values[documented_name]
+        return values
+
 
 class AtlasSettings(BaseSettings):
     """Runtime settings loaded from defaults, optional TOML, and environment."""
 
     model_config = SettingsConfigDict(
         env_prefix="ATLAS_",
-        extra="ignore",
+        extra="forbid",
         populate_by_name=True,
         toml_file=config_path(),
     )
@@ -190,7 +210,7 @@ class AtlasSettings(BaseSettings):
         return (
             init_settings,
             env_settings,
-            TomlConfigSettingsSource(settings_cls),
+            _AtlasTomlSettingsSource(settings_cls),
             dotenv_settings,
             file_secret_settings,
         )

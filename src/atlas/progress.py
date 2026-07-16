@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -17,7 +18,9 @@ from rich.panel import Panel
 from rich.progress import (
     BarColumn,
     Progress,
+    ProgressColumn,
     SpinnerColumn,
+    Task,
     TaskID,
     TextColumn,
 )
@@ -27,6 +30,7 @@ from rich.text import Text
 from atlas.batch import BatchOperatorController, BatchOperatorResult
 from atlas.models import BatchEntry, EngineKind, HubKind, ProgressEvent, ProgressMode, ProgressPhase
 from atlas.progress_events import progress_event_from_ytdlp, progress_event_from_ytdlp_postprocessor
+from atlas.redaction import redact_structure, redact_text, sanitize_terminal_text
 from atlas.theme import (
     ATLAS_ACTIVE_STYLE,
     ATLAS_ERROR_STYLE,
@@ -58,6 +62,7 @@ ProgressEventHandler = Callable[[ProgressEvent], None]
 OperatorKeySource = Callable[[], str | None]
 
 _PROGRESS_SMOOTHING_ALPHA = 0.35
+_PROGRESS_HISTORY_LIMIT = 256
 _ACTIVITY_FRAMES = ("|", "/", "-", "\\")
 _SEMANTIC_BAR_WIDTH = 20
 _FULL_BATCH_TABLE_MIN_WIDTH = 110
@@ -246,6 +251,18 @@ def resolve_progress_mode(
     return ProgressMode.compact
 
 
+def _write_ndjson_event(console: Console, event: ProgressEvent) -> None:
+    """Write one unstyled, unwrapped JSON event for machine consumers."""
+
+    payload = redact_structure(event.model_dump(mode="json", exclude_none=True))
+    console.print(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        markup=False,
+        highlight=False,
+        soft_wrap=True,
+    )
+
+
 def should_use_alternate_screen(
     mode: ProgressMode,
     *,
@@ -269,11 +286,13 @@ def _default_operator_key_source(console: Console) -> OperatorKeySource | None:
 def _make_progress(console: Console, *, label: str) -> Progress:
     columns: list[Any] = []
     if visual_options().motion:
-        columns.append(SpinnerColumn("dots", style=ATLAS_ACTIVE_STYLE, finished_text=""))
+        spinner = "dots" if visual_options().unicode else "line"
+        columns.append(SpinnerColumn(spinner, style=ATLAS_ACTIVE_STYLE, finished_text=""))
+    bar_column: ProgressColumn = BarColumn() if visual_options().unicode else _AsciiBarColumn()
     columns.extend(
         [
             TextColumn(f"{label} {{task.fields[phase]}} {{task.fields[title]}}"),
-            BarColumn(),
+            bar_column,
             TextColumn("{task.fields[bytes_label]}", justify="right"),
             TextColumn("{task.fields[speed_label]}", justify="right"),
             TextColumn("{task.fields[eta_label]}", justify="right"),
@@ -287,6 +306,21 @@ def _make_progress(console: Console, *, label: str) -> Progress:
         transient=False,
         expand=True,
     )
+
+
+class _AsciiBarColumn(ProgressColumn):
+    """Small progress bar for terminals where Unicode glyphs are disabled."""
+
+    def render(self, task: Task) -> Text:
+        width = 12
+        if task.total is None or task.total <= 0:
+            return Text(f"[{'-' * width}]", style=ATLAS_PROGRESS_WAITING_STYLE)
+        ratio = min(1.0, max(0.0, task.completed / task.total))
+        complete = int(ratio * width)
+        return Text(
+            f"[{'#' * complete}{'-' * (width - complete)}]",
+            style=ATLAS_PROGRESS_ACTIVE_STYLE,
+        )
 
 
 def _make_live(
@@ -538,6 +572,17 @@ def _smoothed_progress_event(
 ) -> ProgressEvent:
     if previous is None or not _event_is_running(event) or not _event_is_running(previous):
         return event
+    if event.engine != previous.engine or event.phase != previous.phase:
+        return event
+    for attribute in ("item_id", "url"):
+        current_identity = getattr(event, attribute)
+        previous_identity = getattr(previous, attribute)
+        if (
+            current_identity is not None
+            and previous_identity is not None
+            and current_identity != previous_identity
+        ):
+            return event
     updates: dict[str, float] = {}
     if event.speed_bytes_per_sec is not None and previous.speed_bytes_per_sec is not None:
         updates["speed_bytes_per_sec"] = _smooth_value(
@@ -551,6 +596,34 @@ def _smoothed_progress_event(
 
 def _smooth_value(previous: float, current: float) -> float:
     return previous + (current - previous) * _PROGRESS_SMOOTHING_ALPHA
+
+
+def _append_bounded_progress_event(
+    events: list[ProgressEvent],
+    event: ProgressEvent,
+) -> None:
+    """Retain recent samples plus the latest transition for every phase."""
+
+    events.append(event)
+    if len(events) <= _PROGRESS_HISTORY_LIMIT:
+        return
+    latest_phase_indexes: dict[ProgressPhase, int] = {}
+    for index, candidate in enumerate(events):
+        latest_phase_indexes[candidate.phase] = index
+    recent_count = max(1, _PROGRESS_HISTORY_LIMIT - len(latest_phase_indexes))
+    recent_start = max(0, len(events) - recent_count)
+    retained_indexes = set(range(recent_start, len(events)))
+    retained_indexes.update(latest_phase_indexes.values())
+    events[:] = [candidate for index, candidate in enumerate(events) if index in retained_indexes]
+
+
+def _redacted_progress_event(event: ProgressEvent) -> ProgressEvent:
+    updates = {
+        field: sanitize_terminal_text(redact_text(value))
+        for field in ("url", "filename", "title", "message")
+        if isinstance((value := getattr(event, field)), str)
+    }
+    return event.model_copy(update=updates) if updates else event
 
 
 class RichProgressReporter:
@@ -612,10 +685,11 @@ class RichProgressReporter:
             self._progress.__exit__(exc_type, exc, traceback)
 
     def hook(self, event: ProgressEvent) -> None:
+        event = _redacted_progress_event(event)
         if event.kind is None and self.kind is not None:
             event = event.model_copy(update={"kind": self.kind})
         if self.mode == ProgressMode.json:
-            self.console.print(event.model_dump_json(exclude_none=True))
+            _write_ndjson_event(self.console, event)
             if event.filename and _event_is_done(event) and event.filename not in self.saved_paths:
                 self.saved_paths.append(event.filename)
             return
@@ -624,7 +698,7 @@ class RichProgressReporter:
                 self.saved_paths.append(event.filename)
             return
         event = _smoothed_progress_event(event, self._events[-1] if self._events else None)
-        self._events.append(event)
+        _append_bounded_progress_event(self._events, event)
         title = _event_title(event)
         snapshot = _progress_snapshot(event)
         phase = _event_phase(event)
@@ -919,9 +993,10 @@ class BatchProgressReporter:
         return hook
 
     def hook(self, event: ProgressEvent) -> None:
+        event = _redacted_progress_event(event)
         line_no = event.line_no or 0
         if self.mode == ProgressMode.json:
-            self.console.print(event.model_dump_json(exclude_none=True))
+            _write_ndjson_event(self.console, event)
         if line_no <= 0:
             return
         with self._lock:
@@ -1626,13 +1701,14 @@ class FileProgressReporter:
             self._progress.__exit__(exc_type, exc, traceback)
 
     def handle_event(self, event: ProgressEvent) -> None:
+        event = _redacted_progress_event(event)
         if self.mode == ProgressMode.json:
-            self.console.print(event.model_dump_json(exclude_none=True))
+            _write_ndjson_event(self.console, event)
             return
         if self.mode == ProgressMode.none:
             return
         event = _smoothed_progress_event(event, self._events[-1] if self._events else None)
-        self._events.append(event)
+        _append_bounded_progress_event(self._events, event)
         title = _compact_title(_event_title(event))
         snapshot = _progress_snapshot(event)
         if self._task_id is None:
@@ -1974,6 +2050,8 @@ def _phase_label(event: ProgressEvent, *, full: bool) -> str:
 def _phase_style_for_event(event: ProgressEvent) -> str:
     if _event_is_error(event) or event.phase == ProgressPhase.error:
         return ATLAS_ERROR_STYLE
+    if event.status in {"canceled", "skipped"}:
+        return ATLAS_WARNING_STYLE
     if _event_is_done(event) or event.phase == ProgressPhase.done:
         return ATLAS_SUCCESS_STYLE
     if _event_is_warning(event):
@@ -1990,6 +2068,8 @@ def _status_label(event: ProgressEvent) -> str:
         return f"[{ATLAS_PROGRESS_WAITING_STYLE}]queued[/{ATLAS_PROGRESS_WAITING_STYLE}]"
     if event.status == "skipped":
         return f"[{ATLAS_WARNING_STYLE}]skipped[/{ATLAS_WARNING_STYLE}]"
+    if event.status == "canceled":
+        return f"[{ATLAS_WARNING_STYLE}]canceled[/{ATLAS_WARNING_STYLE}]"
     if _event_is_warning(event):
         return f"[{ATLAS_WARNING_STYLE}]{_activity_frame()} {event.status}[/{ATLAS_WARNING_STYLE}]"
     if _event_is_running(event):
@@ -2085,7 +2165,8 @@ def _render_batch_operator_hint(
     for key in keys:
         action = keymap.action_for_key(key)
         if action is not None:
-            parts.append(f"{key} {action.label.lower()}")
+            display_key = key if visual_options().unicode or key != "↑/↓" else "up/down"
+            parts.append(f"{display_key} {action.label.lower()}")
     text = Text("Shortcuts  ", style=ATLAS_MUTED_STYLE)
     separator = visual_separator()
     text.append(separator.join(parts), style=ATLAS_MUTED_STYLE)
@@ -2615,7 +2696,8 @@ def _batch_stats(events: list[ProgressEvent], *, total: int | None) -> dict[str,
     failed = sum(1 for event in latest if _event_is_error(event))
     active = sum(1 for event in latest if _event_is_running(event))
     skipped = sum(1 for event in latest if event.status == "skipped")
-    queued = max(0, explicit_total - done - failed - active - skipped)
+    canceled = sum(1 for event in latest if event.status == "canceled")
+    queued = max(0, explicit_total - done - failed - active - skipped - canceled)
     return {
         "total": explicit_total,
         "done": done,
@@ -2623,6 +2705,7 @@ def _batch_stats(events: list[ProgressEvent], *, total: int | None) -> dict[str,
         "active": active,
         "queued": queued,
         "skipped": skipped,
+        "canceled": canceled,
     }
 
 

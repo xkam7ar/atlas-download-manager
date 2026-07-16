@@ -8,6 +8,7 @@ import importlib.util
 import os
 import ssl
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from shutil import which
@@ -148,9 +149,14 @@ def _writable_dir(path: Path, *, mutate: bool = True) -> tuple[bool, str]:
         return ok, str(path) if ok else f"parent is not writable: {parent}"
     try:
         path.mkdir(parents=True, exist_ok=True)
-        probe = path / ".atlas-write-test"
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink(missing_ok=True)
+        descriptor, raw_probe = tempfile.mkstemp(prefix=".atlas-write-test-", dir=path)
+        probe = Path(raw_probe)
+        try:
+            os.write(descriptor, b"ok")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+            probe.unlink(missing_ok=True)
     except OSError as exc:
         return False, str(exc)
     return True, str(path)

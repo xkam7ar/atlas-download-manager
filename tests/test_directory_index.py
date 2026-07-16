@@ -3,7 +3,12 @@ from __future__ import annotations
 import pytest
 
 from atlas.directory_explorer import DirectoryExplorerAction, directory_explorer_actions
-from atlas.directory_index import UnsupportedDirectoryIndexError
+from atlas.directory_index import (
+    UnsupportedDirectoryIndexError,
+    http_url_origin,
+    same_http_origin,
+    url_within_directory_scope,
+)
 from atlas.directory_parser import parse_directory_index
 from atlas.directory_scanner import directory_scan_result_from_work_item
 from atlas.directory_tree import DirectoryTree, selected_directory_roots
@@ -238,6 +243,28 @@ def test_parse_scope_keeps_skipped_entries_but_only_exposes_safe_children() -> N
     }
 
 
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "https://user@example.com/a/b/file.bin",
+        "https://example.com/a/b/sub/%2Fetc",
+        "https://example.com/a/b/sub/%255cetc",
+        "https://example.com/a/b/x%00y",
+        "https://example.com/a/b/../escape.bin",
+    ],
+)
+def test_directory_scope_rejects_origins_and_paths_execution_would_refuse(
+    candidate: str,
+) -> None:
+    assert not url_within_directory_scope("https://example.com/a/b/", candidate)
+
+
+def test_http_origin_rejects_userinfo_and_normalizes_default_ports() -> None:
+    assert http_url_origin("https://user@example.com/") is None
+    assert not same_http_origin("https://example.com/", "https://user@example.com/")
+    assert same_http_origin("https://example.com:443/a/", "https://example.com/a/b")
+
+
 def test_parse_apache_table_skips_sort_headers_and_keeps_row_metadata() -> None:
     html = """
     <table>
@@ -259,6 +286,69 @@ def test_parse_apache_table_skips_sort_headers_and_keeps_row_metadata() -> None:
     assert index.folders[0].last_modified is not None
     assert index.files[0].last_modified is not None
     assert index.files[0].visible_size == 1024
+
+
+def test_parse_autoindex_filters_ampersand_sort_controls_and_split_iec_sizes() -> None:
+    html = """
+    <html><head><title>Index of /archive/</title></head><body>
+    <table id="list"><thead><tr>
+      <th><a href="?C=N&amp;O=A">File Name</a>
+          <a href="?C=N&amp;O=D">&darr;</a></th>
+      <th><a href="?C=S&amp;O=A">File Size</a>
+          <a href="?C=S&amp;O=D">&darr;</a></th>
+      <th><a href="?C=M&amp;O=A">Date</a>
+          <a href="?C=M&amp;O=D">&darr;</a></th>
+    </tr></thead><tbody>
+      <tr><td><a href="README.txt">README.txt</a></td>
+          <td>2.8 KiB</td><td>2022-Jan-20 08:52</td></tr>
+      <tr><td><a href="archive.torrent">archive.torrent</a></td>
+          <td>4.7 MiB</td><td>2022-Jan-22 03:47</td></tr>
+      <tr><td><a href="bundle.zip">bundle.zip</a></td>
+          <td>3.4 GiB</td><td>2022-Jan-22 03:47</td></tr>
+    </tbody></table></body></html>
+    """
+
+    index = parse_directory_index("https://example.com/archive/", html)
+
+    assert index.parser_name == "autoindex-html"
+    assert [entry.name for entry in index.entries] == [
+        "README.txt",
+        "archive.torrent",
+        "bundle.zip",
+    ]
+    assert [entry.visible_size for entry in index.files] == [
+        2_867,
+        4_928_307,
+        3_650_722_201,
+    ]
+    assert index.files[0].last_modified is not None
+    assert index.files[0].last_modified.isoformat() == "2022-01-20T08:52:00"
+
+
+def test_parse_query_driven_folder_uses_query_value_as_name() -> None:
+    html = """
+    <html><head><title>AffWeb Files</title></head><body>
+      <a href="index.php?dir=audio">
+        <i class="material-icons-round folder-icon">folder</i>
+        <span class="file-name">audio</span>
+      </a>
+    </body></html>
+    """
+
+    index = parse_directory_index("https://files.example/", html)
+
+    assert [entry.name for entry in index.folders] == ["audio/"]
+    assert index.folders[0].url == "https://files.example/index.php?dir=audio"
+
+
+def test_out_of_scope_file_is_skipped_without_becoming_parent_directory() -> None:
+    html = '<a href="../captions/episode.vtt">episode captions</a>'
+
+    index = parse_directory_index("https://example.com/download/", html)
+
+    assert index.entries[0].kind == "file"
+    assert index.entries[0].parent is False
+    assert index.entries[0].skipped_reason == ("parent directory link skipped by no-parent policy")
 
 
 def test_directory_scan_result_keeps_failed_status_separate_from_empty_entries() -> None:

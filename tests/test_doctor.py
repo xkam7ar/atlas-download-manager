@@ -4,7 +4,7 @@ from pathlib import Path
 
 import atlas.doctor as doctor_module
 from atlas.config import AtlasSettings
-from atlas.doctor import Wget2Capabilities, _parse_wget2_capabilities, run_doctor
+from atlas.doctor import Wget2Capabilities, _parse_wget2_capabilities, _writable_dir, run_doctor
 
 
 def test_doctor_reports_required_checks(tmp_path: Path) -> None:
@@ -35,6 +35,30 @@ def test_doctor_plan_only_does_not_create_output_path(tmp_path: Path) -> None:
     output_check = next(check for check in report.checks if check.name == "output dir")
     assert output_check.ok is True
     assert not output_dir.exists()
+
+
+def test_writable_dir_preserves_legacy_probe_name(tmp_path: Path) -> None:
+    sentinel = tmp_path / ".atlas-write-test"
+    sentinel.write_text("KEEP", encoding="utf-8")
+
+    ok, _detail = _writable_dir(tmp_path)
+
+    assert ok is True
+    assert sentinel.read_text(encoding="utf-8") == "KEEP"
+    assert not list(tmp_path.glob(".atlas-write-test-*"))
+
+
+def test_writable_dir_does_not_follow_legacy_probe_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("KEEP", encoding="utf-8")
+    sentinel = tmp_path / ".atlas-write-test"
+    sentinel.symlink_to(target)
+
+    ok, _detail = _writable_dir(tmp_path)
+
+    assert ok is True
+    assert sentinel.is_symlink()
+    assert target.read_text(encoding="utf-8") == "KEEP"
 
 
 def test_doctor_fails_when_required_tools_missing(

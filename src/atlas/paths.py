@@ -7,9 +7,17 @@ from urllib.parse import unquote
 
 from platformdirs import PlatformDirs
 
+from atlas.private_files import ensure_private_directory
+
 APP_NAME = "atlas"
 _DANGEROUS_FILENAME_CHARS = set('/\\:*?"<>|\0')
 _MAX_FILENAME_LENGTH = 180
+_MAX_FILENAME_BYTES = 240
+_WINDOWS_RESERVED_STEMS = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)}
+)
 
 
 def app_dirs() -> PlatformDirs:
@@ -46,7 +54,7 @@ def default_output_dir() -> Path:
 
 def ensure_app_dirs() -> None:
     for directory in (config_dir(), data_dir(), cache_dir(), log_dir()):
-        directory.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(directory)
 
 
 def safe_filename(value: str | None, *, default: str = "download") -> str:
@@ -63,14 +71,28 @@ def safe_filename(value: str | None, *, default: str = "download") -> str:
     ).strip(" .")
     if not cleaned or cleaned in {".", ".."}:
         return default
-    return _truncate_filename(cleaned, max_length=_MAX_FILENAME_LENGTH)
+    if cleaned.partition(".")[0].upper() in _WINDOWS_RESERVED_STEMS:
+        cleaned = f"_{cleaned}"
+    return _truncate_filename(
+        cleaned,
+        max_length=_MAX_FILENAME_LENGTH,
+        max_bytes=_MAX_FILENAME_BYTES,
+    )
 
 
-def _truncate_filename(name: str, *, max_length: int) -> str:
-    if len(name) <= max_length:
+def _truncate_filename(name: str, *, max_length: int, max_bytes: int) -> str:
+    if len(name) <= max_length and len(name.encode("utf-8")) <= max_bytes:
         return name
     suffix = PurePosixPath(name).suffix
-    if suffix and len(suffix) < max_length // 2:
-        stem_limit = max_length - len(suffix)
-        return f"{name[:stem_limit]}{suffix}"
-    return name[:max_length]
+    suffix_bytes = suffix.encode("utf-8")
+    if suffix and len(suffix) < max_length // 2 and len(suffix_bytes) < max_bytes // 2:
+        stem = name[: -len(suffix)][: max_length - len(suffix)]
+        return f"{_utf8_prefix(stem, max_bytes - len(suffix_bytes))}{suffix}"
+    return _utf8_prefix(name[:max_length], max_bytes)
+
+
+def _utf8_prefix(value: str, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")

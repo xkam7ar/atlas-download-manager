@@ -102,7 +102,7 @@ Atlas must provide a one-command guided installer for normal users on macOS,
 Debian/Ubuntu, Fedora, and Arch-family Linux. Runtime packages use Homebrew,
 apt, dnf, or pacman as appropriate; Arch uses Homebrew on Linux for `wget2`.
 
-Supported install paths:
+Target install paths:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/xkam7ar/atlas/main/install.sh | bash
@@ -110,6 +110,12 @@ brew install xkam7ar/tap/atlas
 uv tool install git+https://github.com/xkam7ar/atlas.git
 atlas setup
 ```
+
+These remote paths are not yet release-available: the documented repository,
+raw installer, tag, and tap are unpublished, while the unqualified PyPI and
+Homebrew `atlas` names belong to unrelated projects. Until a collision-free
+release identity is chosen, the supported working path is a local checkout via
+`uv tool install . --force`; `install.sh --no-install` is safe for plan review.
 
 The installer/setup layer must:
 
@@ -439,7 +445,10 @@ Machine progress must:
 
 Final `--json` result mode has precedence over every `--progress` value and
 emits exactly one JSON document. NDJSON is available only through
-`--progress json` when final JSON mode is not active.
+`--progress json` when final JSON mode is not active. Parser failures in either
+machine mode must use the selected protocol, dry runs emit one terminal event,
+and batch streams end with an aggregate `batch_summary` terminal event carrying
+status and exit code.
 
 Direct-file progress uses file-specific next phases such as verify/finalize.
 Media progress derives its steps from the resolved plan and must not display
@@ -480,6 +489,9 @@ Artifact rules:
 - `retry.atlas.json` points to retry, resume, export, save, and load flows.
 - Saved backend argv must be redacted before entering manifests, previews,
   copy actions, or JSON reports.
+- Retry URL lists may retain the original signed URL required for recovery.
+  They must be owner-only, atomic operational artifacts and must never be
+  described as sanitized for sharing.
 - Retry/resume/export commands load saved artifacts and then reuse the normal
   batch execution path.
 
@@ -530,6 +542,12 @@ Atlas supports normal authorized access and polite compatibility controls:
 - proxies
 - waits, random waits, rate limits, retry/backoff controls
 - yt-dlp supported impersonation profiles
+
+Native direct-download credentials and sensitive request context must be
+initial-origin only. Recursive mirror request bodies and secret-bearing custom
+headers/referrers are rejected; site Basic authentication must not fall back to
+GNU Wget. WARC/session/cookie material is staged privately and published only
+through symlink-safe owner-only file operations.
 
 Atlas must not implement:
 

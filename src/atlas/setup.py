@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import shlex
@@ -15,6 +16,7 @@ from pathlib import Path
 
 from atlas.config import AtlasSettings, settings_as_toml
 from atlas.paths import config_path, ensure_app_dirs
+from atlas.private_files import write_private_text
 
 ATLAS_REPOSITORY = "https://github.com/xkam7ar/atlas.git"
 ATLAS_RAW_INSTALL_URL = "https://raw.githubusercontent.com/xkam7ar/atlas/main/install.sh"
@@ -224,14 +226,16 @@ def detect_install_method(
 ) -> str:
     """Best-effort install-method detection for update guidance."""
 
-    brew = which("brew")
     atlas_executable = which("atlas")
-    if brew and _brew_has_formula("atlas", brew=brew):
+    resolved_executable = (
+        Path(atlas_executable).expanduser().resolve(strict=False) if atlas_executable else None
+    )
+    if resolved_executable is not None and "/uv/tools/" in resolved_executable.as_posix():
+        return "uv-tool"
+    if _running_from_uv_tool():
+        return "uv-tool"
+    if resolved_executable is not None and _is_atlas_homebrew_install(resolved_executable):
         return "homebrew"
-    if atlas_executable and "/uv/tools/" in atlas_executable:
-        return "uv-tool"
-    if uv_path and _running_from_uv_tool():
-        return "uv-tool"
     if _source_checkout_root() is not None:
         return "source-checkout"
     return "unknown"
@@ -334,11 +338,10 @@ def apply_setup_plan(
     config_written = False
     if not plan.config_file.exists():
         plan.config_file.parent.mkdir(parents=True, exist_ok=True)
-        plan.config_file.write_text(
+        write_private_text(
+            plan.config_file,
             settings_as_toml(settings, redact_sensitive=False),
-            encoding="utf-8",
         )
-        plan.config_file.chmod(0o600)
         config_written = True
     commands_run: list[tuple[str, ...]] = []
     if install:
@@ -629,18 +632,20 @@ def _run_command(command: Sequence[str]) -> None:
     subprocess.run(list(command), check=True)
 
 
-def _brew_has_formula(name: str, *, brew: str) -> bool:
-    try:
-        result = subprocess.run(
-            [brew, "list", "--formula", name],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return result.returncode == 0
+def _is_atlas_homebrew_install(executable: Path) -> bool:
+    """Identify this tap's formula without invoking Homebrew or matching core/atlas."""
+
+    for parent in executable.parents:
+        receipt = parent / "INSTALL_RECEIPT.json"
+        if not receipt.is_file():
+            continue
+        try:
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        source = payload.get("source")
+        return isinstance(source, dict) and source.get("tap") == "xkam7ar/tap"
+    return False
 
 
 def _running_from_uv_tool() -> bool:

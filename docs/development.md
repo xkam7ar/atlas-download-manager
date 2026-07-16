@@ -204,9 +204,11 @@ uv run atlas update --dry-run --json
 ```
 
 The Homebrew formula in `packaging/homebrew/atlas.rb` is a tap template until a
-release tarball SHA and generated Python resource blocks are added. Before
-publishing the tap, copy the formula into the tap, replace the SHA, run
-`brew update-python-resources atlas`, and test:
+release tarball SHA and generated Python resource blocks are added. Homebrew
+core already ships an unrelated `atlas` executable, so release work must also
+choose and test an explicit collision strategy. Before publishing the tap, copy
+the formula into the tap, replace the SHA, generate resources, and test the
+chosen formula name.
 
 ```bash
 brew install xkam7ar/tap/atlas
@@ -238,8 +240,8 @@ uv run atlas video "$CHANNEL_URL" --playlist --dry-run --json
 uv run atlas get "https://example.com/archive.zip" --kind file --backend wget2 --dry-run --json
 uv run atlas file "https://example.com/archive.zip" --adaptive --explain --json
 uv run atlas site "https://example.com/docs/" --backend wget2 --depth 1 --same-host-only --max-runtime 60 --dry-run
-uv run atlas dir "https://example.com/files/" --backend wget2 --same-host-only --max-files 100 --adaptive --explain --json
-uv run atlas dir "https://example.com/files/" --same-host-only --max-files 10 --max-total-size 100M --dry-run --json
+uv run atlas dir "https://example.com/files/" --backend wget2 --same-host-only --max-total-size 100M --adaptive --explain --json
+uv run atlas dir "https://example.com/files/" --same-host-only --max-total-size 100M --max-runtime 60 --dry-run --json
 uv run atlas batch /tmp/urls.txt --kind file --adaptive --explain --json
 uv run atlas batch /tmp/urls.txt --kind file --adaptive --progress json
 uv run atlas wget2 --dry-run -- --version
@@ -252,7 +254,8 @@ For live downloader smoke tests, prefer small bounded fixtures first:
 - one tiny direct file
 - one medium ranged direct file
 - one small authorized open-directory mirror with explicit suffix, depth,
-  file-count, total-size, runtime, and temporary-output bounds
+  total-size, runtime, and temporary-output bounds; add a file-count bound only
+  when the fixture is a supported exact directory index
 - one batch that includes duplicate basenames
 
 Use a disposable output and clean it after the bounded directory check:
@@ -260,7 +263,7 @@ Use a disposable output and clean it after the bounded directory check:
 ```bash
 tmp_dir="$(mktemp -d)"
 uv run atlas dir "$AUTHORIZED_DIRECTORY_URL" --accept pdf --depth 1 \
-  --max-files 2 --max-total-size 10M --max-runtime 60 --output "$tmp_dir"
+  --max-total-size 10M --max-runtime 60 --output "$tmp_dir"
 rm -rf "$tmp_dir"
 ```
 

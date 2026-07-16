@@ -5,10 +5,12 @@ from __future__ import annotations
 import codecs
 import os
 import selectors
+import signal
 import subprocess
 import time
 from collections import deque
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from threading import Event, Lock
 
@@ -27,6 +29,7 @@ LineCallback = Callable[[str], None]
 # Streaming backends can emit huge, repetitive progress logs. Callers receive every
 # parsed line through ``on_line``; keep only a useful diagnostic tail in the result.
 _STREAM_OUTPUT_TAIL_LINES = 200
+_STREAM_LINE_MAX_CHARS = 4_096
 
 
 class ProcessCanceled(RuntimeError):
@@ -70,6 +73,7 @@ def run_args(
     timeout: float | None = 15.0,
     *,
     control: ProcessControl | None = None,
+    cwd: str | os.PathLike[str] | None = None,
 ) -> SubprocessResult:
     """Run a command without a shell and capture text output."""
 
@@ -82,6 +86,10 @@ def run_args(
         stderr=subprocess.PIPE,
         shell=False,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=cwd,
+        start_new_session=os.name == "posix",
     )
     started = time.monotonic()
     try:
@@ -105,10 +113,20 @@ def run_args(
                 stdout, stderr = process.communicate(timeout=poll_timeout)
                 break
             except subprocess.TimeoutExpired:
+                if process.poll() is not None:
+                    _terminate_process(process)
+                    stdout, stderr = process.communicate()
+                    break
                 continue
     except BaseException:
         if process.poll() is None:
             _terminate_process(process)
+        with suppress(subprocess.TimeoutExpired, OSError, ValueError):
+            process.communicate(timeout=1)
+        for pipe in (process.stdout, process.stderr):
+            if pipe is not None:
+                with suppress(OSError, ValueError):
+                    pipe.close()
         raise
     return SubprocessResult(
         args=command,
@@ -124,6 +142,7 @@ def run_args_stream(
     on_line: LineCallback,
     timeout: float | None = None,
     control: ProcessControl | None = None,
+    cwd: str | os.PathLike[str] | None = None,
 ) -> SubprocessResult:
     """Run a command without a shell and stream output lines.
 
@@ -144,6 +163,8 @@ def run_args_stream(
         bufsize=1,
         encoding="utf-8",
         errors="replace",
+        cwd=cwd,
+        start_new_session=os.name == "posix",
     )
     stdout = process.stdout
     if stdout is None:
@@ -170,6 +191,7 @@ def run_args_stream(
             if process.poll() is not None:
                 ready = selector.select(timeout=0)
                 if not ready:
+                    _terminate_process(process)
                     break
             else:
                 ready = selector.select(timeout=0.1)
@@ -224,9 +246,35 @@ def _publish_stream_chunk(
             _publish_stream_line(buffer, lines, on_line)
         else:
             buffer.append(character)
+            if len(buffer) >= _STREAM_LINE_MAX_CHARS:
+                _publish_stream_line(buffer, lines, on_line)
 
 
 def _terminate_process(process: subprocess.Popen[str]) -> None:
+    if os.name == "posix":
+        group_signaled = False
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            group_signaled = True
+        except (PermissionError, ProcessLookupError):
+            # A just-exited group leader can make group signalling racy on some
+            # platforms. Still terminate the leader when it remains available.
+            if process.poll() is None:
+                with suppress(PermissionError, ProcessLookupError):
+                    process.terminate()
+        with suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=0.25)
+        if group_signaled:
+            # The leader may have exited while a descendant still owns an output
+            # pipe. Always make a final group-wide attempt so communicate() can
+            # reach EOF instead of waiting for that descendant indefinitely.
+            with suppress(PermissionError, ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+        if process.poll() is None:
+            with suppress(PermissionError, ProcessLookupError):
+                process.kill()
+            process.wait()
+        return
     if process.poll() is not None:
         return
     process.terminate()

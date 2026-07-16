@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from atlas.models import FormatInfo, FormatSort, MediaFormatChoice, MediaInfo
+from atlas.redaction import redact_url, sanitize_terminal_text
 
 _SAFE_INFO_FIELDS = {
     "id",
@@ -29,10 +30,21 @@ def sanitize_info(info: dict[str, Any]) -> dict[str, Any]:
     """Keep display-safe metadata and omit cookies, headers, and large raw fields."""
 
     sanitized = {key: info.get(key) for key in _SAFE_INFO_FIELDS if key in info}
+    webpage_url = sanitized.get("webpage_url")
+    if isinstance(webpage_url, str):
+        sanitized["webpage_url"] = sanitize_terminal_text(redact_url(webpage_url))
+    for field in ("id", "title", "uploader", "channel", "extractor", "availability"):
+        value = sanitized.get(field)
+        if isinstance(value, str):
+            sanitized[field] = sanitize_terminal_text(value)
     if "formats" in sanitized and isinstance(sanitized["formats"], list):
         sanitized["formats"] = [
             {
-                key: fmt.get(key)
+                key: (
+                    sanitize_terminal_text(value)
+                    if isinstance((value := fmt.get(key)), str)
+                    else value
+                )
                 for key in (
                     "format_id",
                     "ext",

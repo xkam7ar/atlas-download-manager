@@ -4,12 +4,37 @@ from __future__ import annotations
 
 import re
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 DEFAULT_DIRECTORY_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+
+
+def _normalize_http_url(value: str) -> str:
+    cleaned = value.strip()
+    if not cleaned:
+        msg = "URL cannot be blank"
+        raise ValueError(msg)
+    if any(ord(character) < 32 or ord(character) == 127 for character in cleaned):
+        msg = "URL cannot contain control characters"
+        raise ValueError(msg)
+    try:
+        parsed = urlsplit(cleaned)
+        host = parsed.hostname
+        _ = parsed.port
+    except ValueError as exc:
+        msg = "URL must be a valid absolute HTTP or HTTPS URL"
+        raise ValueError(msg) from exc
+    if parsed.scheme.lower() not in {"http", "https"} or not host:
+        msg = "URL must be an absolute HTTP or HTTPS URL with a host"
+        raise ValueError(msg)
+    if parsed.username is not None or parsed.password is not None:
+        msg = "URL user information is not allowed; use explicit authentication options"
+        raise ValueError(msg)
+    return cleaned
 
 
 class Container(StrEnum):
@@ -435,10 +460,33 @@ class BaseDownloadOptions(BaseModel):
     @field_validator("url")
     @classmethod
     def url_must_not_be_blank(cls, value: str) -> str:
-        if not value.strip():
-            msg = "URL cannot be blank"
+        return _normalize_http_url(value)
+
+    @field_validator("filename_template")
+    @classmethod
+    def filename_template_must_stay_under_output(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        if any(ord(character) < 32 or ord(character) == 127 for character in cleaned):
+            msg = "filename_template cannot contain control characters"
             raise ValueError(msg)
-        return value.strip()
+        posix = PurePosixPath(cleaned.replace("\\", "/"))
+        windows = PureWindowsPath(cleaned)
+        if (
+            posix.is_absolute()
+            or windows.is_absolute()
+            or bool(windows.drive)
+            or ".." in posix.parts
+        ):
+            msg = "filename_template must be a relative path under output_dir"
+            raise ValueError(msg)
+        return cleaned
 
     @field_validator("output_dir", "archive_file", "cookies_file", mode="before")
     @classmethod
@@ -540,22 +588,7 @@ class BaseDownloadOptions(BaseModel):
     @field_validator("playlist_items")
     @classmethod
     def playlist_items_must_be_simple_ranges(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        cleaned = value.strip()
-        if not cleaned:
-            return None
-        if not _PLAYLIST_ITEMS_PATTERN.fullmatch(cleaned):
-            msg = "playlist_items must look like 1-10,15,20-"
-            raise ValueError(msg)
-        for segment in cleaned.split(","):
-            if "-" not in segment:
-                continue
-            start_text, end_text = segment.split("-", 1)
-            if end_text and int(start_text) > int(end_text):
-                msg = "playlist item ranges cannot count backwards"
-                raise ValueError(msg)
-        return cleaned
+        return _normalize_playlist_items(value)
 
     @model_validator(mode="after")
     def playlist_range_must_be_ordered(self) -> BaseDownloadOptions:
@@ -640,10 +673,7 @@ class InfoOptions(BaseModel):
     @field_validator("url")
     @classmethod
     def url_must_not_be_blank(cls, value: str) -> str:
-        if not value.strip():
-            msg = "URL cannot be blank"
-            raise ValueError(msg)
-        return value.strip()
+        return _normalize_http_url(value)
 
     @field_validator("cookies_file", mode="before")
     @classmethod
@@ -657,22 +687,7 @@ class InfoOptions(BaseModel):
     @field_validator("playlist_items")
     @classmethod
     def playlist_items_must_be_simple_ranges(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        cleaned = value.strip()
-        if not cleaned:
-            return None
-        if not _PLAYLIST_ITEMS_PATTERN.fullmatch(cleaned):
-            msg = "playlist_items must look like 1-10,15,20-"
-            raise ValueError(msg)
-        for segment in cleaned.split(","):
-            if "-" not in segment:
-                continue
-            start_text, end_text = segment.split("-", 1)
-            if end_text and int(start_text) > int(end_text):
-                msg = "playlist item ranges cannot count backwards"
-                raise ValueError(msg)
-        return cleaned
+        return _normalize_playlist_items(value)
 
     @model_validator(mode="after")
     def playlist_range_must_be_ordered(self) -> InfoOptions:
@@ -858,10 +873,7 @@ class FileDownloadOptions(BaseModel):
     @field_validator("url")
     @classmethod
     def file_url_must_not_be_blank(cls, value: str) -> str:
-        if not value.strip():
-            msg = "URL cannot be blank"
-            raise ValueError(msg)
-        return value.strip()
+        return _normalize_http_url(value)
 
     @field_validator("output_dir", mode="before")
     @classmethod
@@ -1167,10 +1179,22 @@ class SiteDownloadOptions(BaseModel):
     @field_validator("url")
     @classmethod
     def site_url_must_not_be_blank(cls, value: str) -> str:
-        if not value.strip():
-            msg = "URL cannot be blank"
+        cleaned = value.strip()
+        if not cleaned:
+            msg = "URL or parser input path cannot be blank"
             raise ValueError(msg)
-        return value.strip()
+        if any(ord(character) < 32 or ord(character) == 127 for character in cleaned):
+            msg = "URL or parser input path cannot contain control characters"
+            raise ValueError(msg)
+        return cleaned
+
+    @model_validator(mode="after")
+    def site_url_must_match_input_mode(self) -> SiteDownloadOptions:
+        if self.base is not None:
+            self.base = _normalize_http_url(self.base)
+        if not self.input_file_only or self.base is not None:
+            self.url = _normalize_http_url(self.url)
+        return self
 
     @field_validator("output_dir", mode="before")
     @classmethod
@@ -1515,3 +1539,23 @@ class DoctorReport(BaseModel):
     @property
     def ok(self) -> bool:
         return all(check.ok for check in self.checks if check.required)
+
+
+def _normalize_playlist_items(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if not _PLAYLIST_ITEMS_PATTERN.fullmatch(cleaned):
+        msg = "playlist_items must look like 1-10,15,20-"
+        raise ValueError(msg)
+    for segment in cleaned.split(","):
+        start_text, separator, end_text = segment.partition("-")
+        if int(start_text) < 1 or (end_text and int(end_text) < 1):
+            msg = "playlist item indexes must start at 1"
+            raise ValueError(msg)
+        if separator and end_text and int(start_text) > int(end_text):
+            msg = "playlist item ranges cannot count backwards"
+            raise ValueError(msg)
+    return cleaned

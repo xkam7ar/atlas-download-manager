@@ -203,11 +203,12 @@ symlink escapes, and case-insensitive destination collisions before transfer,
 then honors native resume, timestamps, overwrite, rate, TLS, and retry policy.
 Cancellation is checked between files and at native progress checkpoints. The
 transfer loop is currently sequential, one native file at a time. Recursive
-mirror `--wait` and `--random-wait` settings do not apply to this exact loop.
+mirror `--wait` does not apply to this exact loop; `atlas dir` does not expose
+`--random-wait`.
 
 The planner passes through Wget2-native behavior for:
 
-- scope and recursion controls such as `--no-parent`, `--depth`, `--domains`,
+- site scope and recursion controls such as `--no-parent`, `--depth`, `--domains`,
   `--exclude-domains`, `--span-hosts`, `--same-host-only`,
   `--same-domain-www`, and `--include-subdomains`
 - parser controls such as `--follow-tags`, `--ignore-tags`, `--force-html`, and
@@ -218,7 +219,7 @@ The planner passes through Wget2-native behavior for:
   `--adjust-extension`, and `--page-requisites`
 - URL and filename shaping such as `--filter-urls`, `--cut-url-get-vars`,
   `--cut-file-get-vars`, `--keep-extension`, and `--convert-file-only`
-- network controls such as `--bind-interface`, `--prefer-family`,
+- site network controls such as `--bind-interface`, `--prefer-family`,
   `--dns-cache-preload`, `--tcp-fastopen`, `--wait`, `--random-wait`,
   `--timeout`, and `--tries`
 - TLS, OCSP, HSTS, and detached signature controls such as `--ocsp-stapling`,
@@ -229,9 +230,10 @@ Atlas adapts two areas around Wget2:
 - Friendly scope presets compile to Wget2 host/domain controls. `same-host-only`
   disables spanning; `same-domain-www` expands the seed domain to include the
   `www` variant; `include-subdomains` enables domain-bounded spanning.
-- `max_files`, `max_total_size`, and `max_runtime` keep recursive plans bounded.
-  `max_files` is a scan-planning guard, `max_total_size` maps to quota, and
-  `max_runtime` is enforced by Atlas around the mirror process.
+- `max_total_size` and `max_runtime` keep conventional recursive plans bounded.
+  `max_total_size` maps to quota, and `max_runtime` is enforced by Atlas around
+  the mirror process. `max_files` is guaranteed only by the exact directory
+  executor and is rejected for conventional Wget/Wget2 recursion.
 - `--cookies-from-browser` exports browser cookies through yt-dlp's cookie
   extractor into a temporary Netscape cookie jar, then passes that file to
   Wget2 with `--load-cookies`.

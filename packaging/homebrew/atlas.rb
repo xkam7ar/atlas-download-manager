@@ -1,3 +1,7 @@
+# typed: strict
+# frozen_string_literal: true
+
+# Homebrew release template for the Atlas download utility.
 class Atlas < Formula
   include Language::Python::Virtualenv
 
@@ -7,11 +11,11 @@ class Atlas < Formula
   sha256 "REPLACE_WITH_RELEASE_TARBALL_SHA256"
   license "MIT"
 
-  depends_on "python@3.12"
-  depends_on "ffmpeg"
   depends_on "aria2"
-  depends_on "wget2"
+  depends_on "ffmpeg"
+  depends_on "python@3.12"
   depends_on "wget"
+  depends_on "wget2"
 
   # Copy this template into the Homebrew tap and run:
   #   brew update-python-resources atlas

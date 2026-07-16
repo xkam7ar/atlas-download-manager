@@ -17,26 +17,25 @@ directories.
 | Log dir | macOS: `~/Library/Logs/atlas`; Linux: `~/.local/state/atlas/log` |
 | Default output dir | `~/Downloads/atlas` |
 
-## Install Atlas
+## Install This Pre-release Checkout
 
-The guided installer is the recommended migration path on macOS,
-Debian/Ubuntu, Fedora, and Arch-family Linux because it installs Atlas plus the
-selected system runtime in one reviewed plan:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/xkam7ar/atlas/main/install.sh | bash
-```
-
-For a Python-only install, use uv and then explicitly provision the system
-runtime.
-
-From a local checkout:
+The documented GitHub repository, raw installer, release tag, and Homebrew tap
+are not public yet. The unqualified PyPI and Homebrew `atlas` names also belong
+to unrelated projects, so do not install either one expecting this application.
+Install the current checkout with uv:
 
 ```bash
-uv tool install .
+uv tool install . --force
 ```
 
-From GitHub:
+The local guided installer can be reviewed without mutation:
+
+```bash
+bash install.sh --no-install --no-menu --yes
+```
+
+After a public repository and collision-free release identity exist, the
+intended GitHub path is:
 
 ```bash
 uv tool install git+https://github.com/xkam7ar/atlas.git

@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+import os
+import stat
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
+from urllib.error import URLError
+from urllib.request import ProxyHandler
 
 import pytest
 
 from atlas.adaptive import AdaptiveScheduler
 from atlas.aria2_rpc import (
+    _MAX_METALINK_BYTES,
+    Aria2RpcClient,
     Aria2RpcQueuedDownload,
     Aria2RpcSession,
+    Aria2RpcStartupError,
+    _fetch_metalink,
     progress_event_from_aria2_rpc_status,
 )
 from atlas.errors import EngineError
@@ -94,6 +102,87 @@ class FakeRpcClient:
         if method in {"aria2.shutdown", "aria2.remove", "aria2.saveSession"}:
             return "OK"
         raise AssertionError(f"unexpected method {method}")
+
+
+def test_rpc_client_disables_environment_proxies(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured_handlers: list[object] = []
+    captured_requests: list[object] = []
+
+    class FakeResponse:
+        def __enter__(self) -> FakeResponse:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b'{"jsonrpc":"2.0","id":"atlas-1","result":"ok"}'
+
+    class FakeOpener:
+        def open(self, request: object, *, timeout: float) -> FakeResponse:
+            assert timeout == 1.5
+            captured_requests.append(request)
+            return FakeResponse()
+
+    def fake_build_opener(*handlers: object) -> FakeOpener:
+        captured_handlers.extend(handlers)
+        return FakeOpener()
+
+    monkeypatch.setattr("atlas.aria2_rpc.build_opener", fake_build_opener)
+    client = Aria2RpcClient("http://127.0.0.1:6800/jsonrpc", timeout=1.5)
+
+    assert client.call("aria2.getVersion", ["token:top-secret"]) == "ok"
+    assert len(captured_handlers) == 1
+    assert isinstance(captured_handlers[0], ProxyHandler)
+    assert captured_handlers[0].proxies == {}
+    assert len(captured_requests) == 1
+
+
+def test_rpc_close_rehardens_replaced_save_session(tmp_path: Path) -> None:
+    save_session = tmp_path / "aria2.session"
+
+    class ReplacingClient:
+        def call(self, method: str, _params: list[object]) -> object:
+            if method == "aria2.saveSession":
+                save_session.unlink(missing_ok=True)
+                save_session.write_text(
+                    "https://example.com/file?token=private\n",
+                    encoding="utf-8",
+                )
+                save_session.chmod(0o666)
+            return "OK"
+
+    session = Aria2RpcSession(save_session=save_session)
+    session._process = FakeProcess()
+    session._client = ReplacingClient()
+    session._secret = "secret"
+
+    session.close()
+
+    assert stat.S_IMODE(save_session.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks are unavailable")
+def test_rpc_start_refuses_save_session_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "outside"
+    target.write_text("preserve", encoding="utf-8")
+    save_session = tmp_path / "aria2.session"
+    save_session.symlink_to(target)
+    spawned = False
+
+    def unexpected_spawn(*_args: object, **_kwargs: object) -> FakeProcess:
+        nonlocal spawned
+        spawned = True
+        return FakeProcess()
+
+    with pytest.raises(Aria2RpcStartupError, match="private aria2 session file"):
+        Aria2RpcSession(
+            save_session=save_session,
+            popen_factory=unexpected_spawn,
+        ).start()
+
+    assert spawned is False
+    assert target.read_text(encoding="utf-8") == "preserve"
 
 
 def test_progress_event_from_rpc_status_maps_structured_fields() -> None:
@@ -280,7 +369,7 @@ def test_rpc_session_adds_uri_options_and_emits_progress(tmp_path: Path) -> None
     assert result.gid == "gid-1"
     assert result.output == output
     assert fake_process.wait_calls >= 1
-    assert [event.status for event in events] == ["starting", "downloading", "done", "done"]
+    assert [event.status for event in events] == ["starting", "downloading", "done"]
     assert events[1].active_connections == 2
     add_uri = next(call for call in clients[0].calls if call[0] == "aria2.addUri")
     assert add_uri[1][0] == "token:test-secret"
@@ -325,6 +414,52 @@ def test_rpc_session_adds_uri_options_and_emits_progress(tmp_path: Path) -> None
     assert ("aria2.saveSession", ["token:test-secret"]) in clients[0].calls
 
 
+def test_rpc_complete_without_output_emits_error_without_false_done(tmp_path: Path) -> None:
+    output = tmp_path / "missing.bin"
+    process = FakeProcess()
+    events: list[ProgressEvent] = []
+
+    def client_factory(endpoint: str, timeout: float) -> FakeRpcClient:
+        return FakeRpcClient(
+            endpoint,
+            timeout,
+            statuses=[
+                {
+                    "gid": "gid-1",
+                    "status": "complete",
+                    "completedLength": "10",
+                    "totalLength": "10",
+                    "downloadSpeed": "0",
+                    "connections": "0",
+                    "files": [
+                        {
+                            "path": str(output),
+                            "length": "10",
+                            "completedLength": "10",
+                        }
+                    ],
+                }
+            ],
+        )
+
+    options = FileDownloadOptions(
+        url="https://example.com/missing.bin",
+        output_dir=tmp_path,
+        backend=FileBackendChoice.aria2,
+    )
+
+    with pytest.raises(EngineError, match="output file was not found"):
+        Aria2RpcSession(
+            port_factory=lambda: 39011,
+            token_factory=lambda: "test-secret",
+            popen_factory=lambda _args, **_kwargs: process,
+            rpc_client_factory=client_factory,
+            sleep=lambda _seconds: None,
+        ).download(options, output, progress_callback=events.append)
+
+    assert [event.status for event in events] == ["starting", "error"]
+
+
 def test_rpc_session_adds_metalink_manifest_and_uses_payload_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -335,13 +470,16 @@ def test_rpc_session_adds_metalink_manifest_and_uses_payload_output(
     clients: list[FakeRpcClient] = []
 
     class FakeManifestResponse:
+        headers: ClassVar[dict[str, str]] = {}
+
         def __enter__(self) -> FakeManifestResponse:
             return self
 
         def __exit__(self, *_args: object) -> None:
             return None
 
-        def read(self) -> bytes:
+        def read(self, size: int) -> bytes:
+            assert size > len(b"<metalink />")
             return b"<metalink />"
 
     def client_factory(endpoint: str, timeout: float) -> FakeRpcClient:
@@ -396,6 +534,93 @@ def test_rpc_session_adds_metalink_manifest_and_uses_payload_output(
     assert isinstance(rpc_options, dict)
     assert rpc_options["dir"] == str(tmp_path)
     assert "out" not in rpc_options
+
+
+def test_metalink_fetch_rejects_declared_oversize_response(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class OversizeResponse:
+        headers: ClassVar[dict[str, str]] = {"Content-Length": str(_MAX_METALINK_BYTES + 1)}
+
+        def __enter__(self) -> OversizeResponse:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _size: int) -> bytes:
+            pytest.fail("oversized declared response must not be read")
+
+    monkeypatch.setattr(
+        "atlas.aria2_rpc.urlopen",
+        lambda _request, *, timeout: OversizeResponse(),
+    )
+    options = FileDownloadOptions(
+        url="https://example.com/release.meta4",
+        output_dir=tmp_path,
+        backend=FileBackendChoice.aria2,
+    )
+
+    with pytest.raises(EngineError, match="safety limit"):
+        _fetch_metalink(options)
+
+
+def test_metalink_fetch_rejects_chunked_oversize_response(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class OversizeResponse:
+        headers: ClassVar[dict[str, str]] = {}
+
+        def __enter__(self) -> OversizeResponse:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, size: int) -> bytes:
+            assert size == _MAX_METALINK_BYTES + 1
+            return b"x" * size
+
+    monkeypatch.setattr(
+        "atlas.aria2_rpc.urlopen",
+        lambda _request, *, timeout: OversizeResponse(),
+    )
+    options = FileDownloadOptions(
+        url="https://example.com/release.meta4",
+        output_dir=tmp_path,
+        backend=FileBackendChoice.aria2,
+    )
+
+    with pytest.raises(EngineError, match="safety limit"):
+        _fetch_metalink(options)
+
+
+def test_rpc_startup_failure_closes_spawned_process() -> None:
+    process = StubbornProcess()
+
+    class UnavailableClient:
+        def call(self, _method: str, _params: list[object]) -> object:
+            raise URLError("not ready")
+
+    session = Aria2RpcSession(
+        startup_timeout=0,
+        popen_factory=lambda _args, **_kwargs: process,
+        rpc_client_factory=lambda _endpoint, _timeout: UnavailableClient(),
+        port_factory=lambda: 39009,
+        token_factory=lambda: "test-secret",
+        sleep=lambda _seconds: None,
+        clock=lambda: 0,
+    )
+
+    with pytest.raises(Aria2RpcStartupError, match="did not become ready"):
+        session.start()
+
+    assert process.terminated is True
+    assert process.killed is True
+    assert session._process is None
+    assert session._client is None
 
 
 def test_rpc_session_download_many_reuses_one_process_and_queue(
@@ -539,8 +764,8 @@ def test_rpc_session_download_many_reuses_one_process_and_queue(
         output_one,
         output_two,
     ]
-    assert [event.status for event in events_one] == ["starting", "downloading", "done", "done"]
-    assert [event.status for event in events_two] == ["starting", "downloading", "done", "done"]
+    assert [event.status for event in events_one] == ["starting", "downloading", "done"]
+    assert [event.status for event in events_two] == ["starting", "downloading", "done"]
     assert [call[0] for call in clients[0].calls].count("aria2.addUri") == 2
     assert fake_process.wait_calls >= 1
 

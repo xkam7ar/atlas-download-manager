@@ -342,11 +342,13 @@ resolve_atlas() {
 
 plan_atlas_install() {
   resolve_atlas
-  if [ -n "$ATLAS_BIN" ] && "$ATLAS_BIN" setup --help >/dev/null 2>&1; then
+  if [ -n "$ATLAS_BIN" ] && { [ "$NO_INSTALL" = "1" ] || \
+       "$ATLAS_BIN" setup --help >/dev/null 2>&1; }; then
     ATLAS_INSTALL_METHOD="existing"
-  elif [ "$MODE" = "full" ] && [ -n "$BREW" ] && \
+  elif [ "$MODE" = "full" ] && [ -n "$BREW" ] && { \
+       [ "$NO_INSTALL" = "1" ] || \
        HOMEBREW_NO_AUTO_UPDATE=1 "$BREW" info "$ATLAS_TAP_FORMULA" \
-       >/dev/null 2>&1; then
+       >/dev/null 2>&1; }; then
     ATLAS_INSTALL_METHOD="formula"
   elif [ "$MODE" = "full" ] && [ -z "$BREW" ] && [ -n "$BREW_PACKAGES" ]; then
     ATLAS_INSTALL_METHOD="formula-after-bootstrap"

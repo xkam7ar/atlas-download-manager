@@ -27,6 +27,9 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+from typer._click.exceptions import Exit as ClickExit
+from typer._click.exceptions import UsageError
+from typer.core import TyperGroup
 
 from atlas import __version__
 from atlas.adapters import DirectFileAdapter, SiteMirrorAdapter
@@ -47,6 +50,7 @@ from atlas.aria2_rpc import (
 )
 from atlas.backends import (
     FileDownloadEngine,
+    MirrorDownloadError,
     SiteMirrorEngine,
     can_attempt_verified_curl_fallback,
     filename_from_url,
@@ -138,7 +142,7 @@ from atlas.paths import config_path, log_dir, safe_filename
 from atlas.planner import SmartPlanner
 from atlas.preflight import ensure_download_dependencies
 from atlas.presets import DEFAULT_AUDIO_FORMAT, DEFAULT_VIDEO_FORMAT
-from atlas.private_files import ensure_private_directory, write_private_text
+from atlas.private_files import ensure_private_directory, prepare_private_file, write_private_text
 from atlas.progress import (
     BatchProgressReporter,
     FileProgressReporter,
@@ -152,7 +156,8 @@ from atlas.progress import (
     resolve_progress_mode,
     should_use_alternate_screen,
 )
-from atlas.runner import ProcessControl
+from atlas.redaction import redact_command_args, redact_structure, redact_text, redact_url
+from atlas.runner import ProcessCanceled, ProcessControl
 from atlas.sessions import batch_session, site_session
 from atlas.setup import (
     SetupMode,
@@ -262,11 +267,78 @@ class PlaylistDownloadKind(StrEnum):
     audio = "audio"
 
 
+def _machine_output_requested(args: Sequence[str] | None) -> tuple[bool, bool]:
+    tokens = list(sys.argv[1:] if args is None else args)
+    json_output = "--json" in tokens
+    progress_json = "--progress=json" in tokens or any(
+        token == "--progress" and index + 1 < len(tokens) and tokens[index + 1] == "json"
+        for index, token in enumerate(tokens)
+    )
+    return json_output, progress_json and not json_output
+
+
+class _MachineAwareTyperGroup(TyperGroup):
+    """Keep parser-time failures machine-readable when machine mode was requested."""
+
+    def main(
+        self,
+        args: Sequence[str] | None = None,
+        prog_name: str | None = None,
+        complete_var: str | None = None,
+        standalone_mode: bool = True,
+        windows_expand_args: bool = True,
+        **extra: Any,
+    ) -> Any:
+        json_output, ndjson_output = _machine_output_requested(args)
+        if not json_output and not ndjson_output:
+            return super().main(
+                args=args,
+                prog_name=prog_name,
+                complete_var=complete_var,
+                standalone_mode=standalone_mode,
+                windows_expand_args=windows_expand_args,
+                **extra,
+            )
+        try:
+            result = super().main(
+                args=args,
+                prog_name=prog_name,
+                complete_var=complete_var,
+                standalone_mode=False,
+                windows_expand_args=windows_expand_args,
+                **extra,
+            )
+            # Click returns an Exit's status instead of re-raising it when
+            # standalone mode is disabled. Restore the caller-visible exit so
+            # application failures do not become successful machine runs.
+            if isinstance(result, int):
+                if standalone_mode:
+                    raise SystemExit(result)
+                raise ClickExit(result)
+            return result
+        except UsageError as exc:
+            _handle_error(
+                exc,
+                verbose=False,
+                json_output=json_output,
+                ndjson_output=ndjson_output,
+                exit_code=exc.exit_code,
+            )
+            if standalone_mode:
+                raise SystemExit(exc.exit_code) from None
+            raise ClickExit(exc.exit_code) from None
+        except ClickExit as exc:
+            if standalone_mode:
+                raise SystemExit(exc.exit_code) from None
+            raise
+
+
 app = typer.Typer(
     name="atlas",
     help="atlas: intent-first downloads for media, files, batches, and mirrors.",
     invoke_without_command=True,
     rich_markup_mode=None,
+    cls=_MachineAwareTyperGroup,
 )
 config_app = typer.Typer(
     help="Show atlas configuration.",
@@ -325,6 +397,16 @@ def main(
     )
     if ctx.invoked_subcommand is not None:
         return
+    if json_output:
+        _print_json(
+            {
+                "status": "help",
+                "name": "atlas",
+                "version": __version__,
+                "help": ctx.get_help(),
+            }
+        )
+        raise typer.Exit()
     if _should_auto_launch_menu(no_menu=no_menu, json_output=json_output):
         _launch_menu()
         raise typer.Exit()
@@ -351,11 +433,21 @@ def _configure_cli_visuals(
     console = themed_console()
 
 
-def _settings() -> AtlasSettings:
+def _settings(
+    *,
+    json_output: bool = False,
+    progress_mode: ProgressMode | None = None,
+) -> AtlasSettings:
     try:
         return load_config()
     except ConfigError as exc:
-        console.print(f"[{ATLAS_ERROR_STYLE}]Config error:[/{ATLAS_ERROR_STYLE}] {exc}")
+        _handle_error(
+            exc,
+            verbose=False,
+            json_output=json_output,
+            ndjson_output=not json_output and progress_mode == ProgressMode.json,
+            exit_code=2,
+        )
         raise typer.Exit(2) from exc
 
 
@@ -448,21 +540,71 @@ def _looks_like_ip_or_localhost(host: str) -> bool:
     return all(part.isdigit() for part in host.split(".") if part)
 
 
-def _handle_error(exc: Exception, *, verbose: bool) -> None:
+def _handle_error(
+    exc: Exception,
+    *,
+    verbose: bool,
+    json_output: bool = False,
+    ndjson_output: bool = False,
+    exit_code: int = 1,
+    extra: Mapping[str, object] | None = None,
+) -> None:
     if isinstance(exc, ValidationError):
         message = _validation_error_message(exc)
     else:
         message = " ".join(str(exc).split())
+    message = redact_text(message)
+    hint = _recovery_hint(message)
+    if json_output:
+        document: dict[str, object] = {
+            "status": "error",
+            "error": {
+                "type": type(exc).__name__,
+                "message": message,
+                "hint": hint,
+            },
+            "exit_code": exit_code,
+        }
+        document.update(extra or {})
+        _print_json(document)
+        return
+    if ndjson_output:
+        event: dict[str, object] = {
+            "engine": EngineKind.unknown.value,
+            "status": "error",
+            "phase": ProgressPhase.error.value,
+            "error_code": type(exc).__name__,
+            "message": message,
+            "hint": hint,
+            "exit_code": exit_code,
+        }
+        event.update(extra or {})
+        _print_ndjson(event)
+        return
     output = Text("Error: ", style=ATLAS_ERROR_STYLE)
     output.append(message)
     console.print(output)
-    hint = _recovery_hint(message)
     if hint:
         hint_output = Text("Hint: ", style=ATLAS_WARNING_STYLE)
         hint_output.append(hint, style=ATLAS_MUTED_STYLE)
         console.print(hint_output)
     if verbose and sys.exception() is exc:
-        console.print_exception()
+        frames: list[str] = []
+        traceback = exc.__traceback__
+        while traceback is not None:
+            code = traceback.tb_frame.f_code
+            frames.append(f"{code.co_filename}:{traceback.tb_lineno} in {code.co_name}")
+            traceback = traceback.tb_next
+        if frames:
+            console.print(Text("Trace (values omitted):", style=ATLAS_MUTED_STYLE))
+            for frame in frames:
+                console.print(Text(f"  {frame}", style=ATLAS_MUTED_STYLE))
+        console.print(
+            Text(
+                f"{type(exc).__name__}: {message}",
+                style=ATLAS_MUTED_STYLE,
+            )
+        )
 
 
 def _validation_error_message(exc: ValidationError) -> str:
@@ -504,8 +646,73 @@ def _print_dry_run(result_opts: dict[str, object] | None) -> None:
     console.print_json(json.dumps(result_opts or {}, default=str, indent=2))
 
 
-def _print_json(result_opts: dict[str, object] | None) -> None:
-    console.print_json(json.dumps(result_opts or {}, default=str, indent=2))
+def _print_json(payload: object) -> None:
+    """Write machine JSON without Rich highlighting, markup, or terminal wrapping."""
+
+    normalized = {} if payload is None else payload
+    console.print(
+        json.dumps(normalized, default=str, indent=2),
+        markup=False,
+        highlight=False,
+        soft_wrap=True,
+    )
+
+
+def _print_ndjson(payload: object) -> None:
+    """Write one compact, unstyled machine event."""
+
+    console.print(
+        json.dumps(payload, default=str, separators=(",", ":")),
+        markup=False,
+        highlight=False,
+        soft_wrap=True,
+    )
+
+
+def _print_batch_terminal_event(summary: BatchSummary) -> None:
+    exit_code = 1 if summary.failed else 130 if summary.canceled else 0
+    status = "error" if summary.failed else "canceled" if summary.canceled else "done"
+    _print_ndjson(
+        {
+            "event_type": "batch_summary",
+            "engine": EngineKind.unknown.value,
+            "phase": (
+                ProgressPhase.error.value
+                if summary.failed or summary.canceled
+                else ProgressPhase.done.value
+            ),
+            "status": status,
+            "kind": summary.kind.value,
+            "total": summary.total,
+            "succeeded": summary.succeeded,
+            "failed": summary.failed,
+            "skipped": summary.skipped,
+            "canceled": summary.canceled,
+            "exit_code": exit_code,
+        }
+    )
+
+
+def _print_dry_run_ndjson(
+    *,
+    kind: HubKind,
+    url: str,
+    plan: Mapping[str, object] | None,
+) -> None:
+    payload = redact_structure(dict(plan or {}))
+    _print_ndjson(
+        {
+            "event_type": "dry_run",
+            "engine": EngineKind.unknown.value,
+            "phase": ProgressPhase.done.value,
+            "status": "done",
+            "kind": kind.value,
+            "url": redact_url(url),
+            "dry_run": True,
+            "plan": payload,
+            "exit_code": 0,
+        }
+    )
 
 
 def _print_runtime_json(
@@ -536,6 +743,17 @@ def _archive_settings(
     if archive_path:
         return True, archive_path
     return settings.archive, settings.archive_file
+
+
+def _prepare_media_archive(
+    options: VideoDownloadOptions | AudioDownloadOptions,
+) -> None:
+    if not options.archive or options.archive_file is None:
+        return
+    try:
+        prepare_private_file(options.archive_file)
+    except OSError as exc:
+        raise AtlasError(f"Could not prepare private download archive: {exc}") from exc
 
 
 def _download_engine(
@@ -872,33 +1090,6 @@ def _primary_saved_result_path(saved_paths: Sequence[Path]) -> Path:
 
 def _looks_like_temporary_stream(path: Path) -> bool:
     return bool(_TEMP_STREAM_RE.search(path.name))
-
-
-def _video_archive_retry_options(options: VideoDownloadOptions) -> VideoDownloadOptions | None:
-    if not options.archive:
-        return None
-    return options.model_copy(update={"archive": False, "archive_file": None})
-
-
-def _audio_archive_retry_options(options: AudioDownloadOptions) -> AudioDownloadOptions | None:
-    if not options.archive:
-        return None
-    return options.model_copy(update={"archive": False, "archive_file": None})
-
-
-def _maybe_print_archive_retry(
-    options: VideoDownloadOptions | AudioDownloadOptions,
-) -> None:
-    if options.quiet or bool(getattr(options, "json_output", False)):
-        return
-    console.print()
-    console.print(
-        Text(
-            f"{status_glyph('warning')} Archive mismatch - saved file missing. "
-            "Re-downloading once.",
-            style=ATLAS_WARNING_STYLE,
-        )
-    )
 
 
 def _active_progress_mode(options: object) -> ProgressMode:
@@ -1447,15 +1638,13 @@ def _print_site_summary(
         )
     if options.warc_file:
         rows.append(("WARC", _styled_path(options.warc_file)))
-    bounds = [
-        label
-        for label, value in (
-            (f"max-files {options.max_files}", options.max_files),
-            (f"max-total-size {options.max_total_size}", options.max_total_size),
-            (f"max-runtime {options.max_runtime:g}s", options.max_runtime),
-        )
-        if value is not None
-    ]
+    bounds: list[str] = []
+    if options.max_files is not None:
+        bounds.append(f"max-files {options.max_files}")
+    if options.max_total_size is not None:
+        bounds.append(f"max-total-size {options.max_total_size}")
+    if options.max_runtime is not None:
+        bounds.append(f"max-runtime {options.max_runtime:g}s")
     if bounds:
         rows.append(("Bounds", ", ".join(bounds)))
     filters = [
@@ -1892,7 +2081,10 @@ def _print_backend_command_plan(plan: BackendCommandPlan) -> None:
         "Advanced Backend",
         [
             ("Tool", plan.display_name),
-            ("Command", escape(shlex.join(plan.command))),
+            (
+                "Command",
+                escape(shlex.join(str(arg) for arg in redact_command_args(plan.command))),
+            ),
             ("Working Dir", _styled_path(plan.cwd)),
             ("Mode", "raw pass-through"),
             ("Safety", "; ".join(plan.safety)),
@@ -1919,6 +2111,7 @@ def _run_backend_passthrough(
                 f"Pass {tool.value} arguments after --, for example: atlas {tool.name} -- --help"
             ),
             verbose=verbose,
+            json_output=json_output,
         )
         raise typer.Exit(1)
     try:
@@ -1931,16 +2124,13 @@ def _run_backend_passthrough(
             _print_backend_command_plan(plan)
         if json_output:
             result = run_backend_command(plan, timeout=timeout, stream=False)
-            console.print_json(
-                json.dumps(
-                    {
-                        "plan": backend_plan_as_dict(plan),
-                        "returncode": result.returncode,
-                        "stdout": result.stdout,
-                        "stderr": result.stderr,
-                    },
-                    default=str,
-                )
+            _print_json(
+                {
+                    "plan": backend_plan_as_dict(plan),
+                    "returncode": result.returncode,
+                    "stdout": redact_text(result.stdout),
+                    "stderr": redact_text(result.stderr),
+                }
             )
         elif quiet:
             result = run_backend_command(plan, timeout=timeout, stream=False)
@@ -1949,7 +2139,7 @@ def _run_backend_passthrough(
                 plan,
                 timeout=timeout,
                 stream=True,
-                on_line=lambda line: console.print(escape(line)),
+                on_line=lambda line: console.print(escape(redact_text(line))),
             )
         if result.returncode != 0:
             message = (result.stderr or result.stdout).strip() or (
@@ -1957,10 +2147,17 @@ def _run_backend_passthrough(
             )
             if json_output:
                 raise typer.Exit(result.returncode)
-            _handle_error(AtlasError(message), verbose=verbose)
+            _handle_error(AtlasError(message), verbose=verbose, json_output=json_output)
             raise typer.Exit(result.returncode)
+    except subprocess.TimeoutExpired as exc:
+        _handle_error(
+            AtlasError(f"{tool.value} exceeded its {exc.timeout:g}-second timeout"),
+            verbose=verbose,
+            json_output=json_output,
+        )
+        raise typer.Exit(1) from None
     except AtlasError as exc:
-        _handle_error(exc, verbose=verbose)
+        _handle_error(exc, verbose=verbose, json_output=json_output)
         raise typer.Exit(1) from exc
 
 
@@ -1992,10 +2189,21 @@ def _run_video_download(settings: AtlasSettings, options: VideoDownloadOptions) 
         engine = _engine(settings)
         if options.dry_run:
             result = engine.download_video(options)
-            _print_json(result.ydl_opts) if options.json_output else _print_dry_run(result.ydl_opts)
+            if options.json_output:
+                _print_json(result.ydl_opts)
+            elif options.progress_mode == ProgressMode.json:
+                _print_dry_run_ndjson(
+                    kind=HubKind.video,
+                    url=options.url,
+                    plan=result.ydl_opts,
+                )
+            else:
+                _print_dry_run(result.ydl_opts)
             return []
+        _prepare_media_archive(options)
         ensure_download_dependencies(settings, BatchKind.video, plan)
         progress_mode = _active_progress_mode(options)
+        machine_progress = progress_mode == ProgressMode.json
         with _rich_progress_reporter(
             progress_mode,
             HubKind.video,
@@ -2016,7 +2224,7 @@ def _run_video_download(settings: AtlasSettings, options: VideoDownloadOptions) 
                     verbose=options.verbose,
                 )
             )
-            if not options.quiet and not options.json_output:
+            if not options.quiet and not options.json_output and not machine_progress:
                 _print_video_summary(media, options, plan)
             _emit_media_startup_phases(reporter, options, plan)
             engine.download_video(
@@ -2024,38 +2232,28 @@ def _run_video_download(settings: AtlasSettings, options: VideoDownloadOptions) 
                 progress_hooks=_media_progress_hooks(reporter, HubKind.video),
                 postprocessor_hooks=_media_postprocessor_hooks(reporter, HubKind.video),
             )
-        retry_options = _video_archive_retry_options(options) if not reporter.saved_paths else None
-        if retry_options is not None:
-            _maybe_print_archive_retry(options)
-            with _rich_progress_reporter(
-                progress_mode,
-                HubKind.video,
-                work_context=_media_work_context(retry_options, plan),
-            ) as retry_reporter:
-                _emit_media_startup_phases(retry_reporter, retry_options, plan)
-                engine.download_video(
-                    retry_options,
-                    progress_hooks=_media_progress_hooks(retry_reporter, HubKind.video),
-                    postprocessor_hooks=_media_postprocessor_hooks(retry_reporter, HubKind.video),
-                )
-            reporter = retry_reporter
         if options.json_output:
             _print_runtime_json(
                 kind=HubKind.video,
                 url=options.url,
                 paths=reporter.saved_paths,
             )
-        elif not options.quiet:
+        elif not options.quiet and not machine_progress:
             _print_saved_result(
                 "Download complete",
                 reporter,
                 options.output_dir,
-                archive_enabled=retry_options is None and options.archive,
+                archive_enabled=options.archive,
                 archive_file=options.archive_file,
             )
         return [Path(path) for path in reporter.saved_paths]
     except AtlasError as exc:
-        _handle_error(exc, verbose=options.verbose)
+        _handle_error(
+            exc,
+            verbose=options.verbose,
+            json_output=options.json_output,
+            ndjson_output=(not options.json_output and options.progress_mode == ProgressMode.json),
+        )
         raise typer.Exit(1) from exc
 
 
@@ -2065,10 +2263,21 @@ def _run_audio_download(settings: AtlasSettings, options: AudioDownloadOptions) 
         engine = _engine(settings)
         if options.dry_run:
             result = engine.download_audio(options)
-            _print_json(result.ydl_opts) if options.json_output else _print_dry_run(result.ydl_opts)
+            if options.json_output:
+                _print_json(result.ydl_opts)
+            elif options.progress_mode == ProgressMode.json:
+                _print_dry_run_ndjson(
+                    kind=HubKind.audio,
+                    url=options.url,
+                    plan=result.ydl_opts,
+                )
+            else:
+                _print_dry_run(result.ydl_opts)
             return []
+        _prepare_media_archive(options)
         ensure_download_dependencies(settings, BatchKind.audio, plan)
         progress_mode = _active_progress_mode(options)
+        machine_progress = progress_mode == ProgressMode.json
         with _rich_progress_reporter(
             progress_mode,
             HubKind.audio,
@@ -2089,7 +2298,7 @@ def _run_audio_download(settings: AtlasSettings, options: AudioDownloadOptions) 
                     verbose=options.verbose,
                 )
             )
-            if not options.quiet and not options.json_output:
+            if not options.quiet and not options.json_output and not machine_progress:
                 _print_audio_summary(media, options, plan)
             _emit_media_startup_phases(reporter, options, plan)
             engine.download_audio(
@@ -2097,38 +2306,28 @@ def _run_audio_download(settings: AtlasSettings, options: AudioDownloadOptions) 
                 progress_hooks=_media_progress_hooks(reporter, HubKind.audio),
                 postprocessor_hooks=_media_postprocessor_hooks(reporter, HubKind.audio),
             )
-        retry_options = _audio_archive_retry_options(options) if not reporter.saved_paths else None
-        if retry_options is not None:
-            _maybe_print_archive_retry(options)
-            with _rich_progress_reporter(
-                progress_mode,
-                HubKind.audio,
-                work_context=_media_work_context(retry_options, plan),
-            ) as retry_reporter:
-                _emit_media_startup_phases(retry_reporter, retry_options, plan)
-                engine.download_audio(
-                    retry_options,
-                    progress_hooks=_media_progress_hooks(retry_reporter, HubKind.audio),
-                    postprocessor_hooks=_media_postprocessor_hooks(retry_reporter, HubKind.audio),
-                )
-            reporter = retry_reporter
         if options.json_output:
             _print_runtime_json(
                 kind=HubKind.audio,
                 url=options.url,
                 paths=reporter.saved_paths,
             )
-        elif not options.quiet:
+        elif not options.quiet and not machine_progress:
             _print_saved_result(
                 "Audio saved",
                 reporter,
                 options.output_dir,
-                archive_enabled=retry_options is None and options.archive,
+                archive_enabled=options.archive,
                 archive_file=options.archive_file,
             )
         return [Path(path) for path in reporter.saved_paths]
     except AtlasError as exc:
-        _handle_error(exc, verbose=options.verbose)
+        _handle_error(
+            exc,
+            verbose=options.verbose,
+            json_output=options.json_output,
+            ndjson_output=(not options.json_output and options.progress_mode == ProgressMode.json),
+        )
         raise typer.Exit(1) from exc
 
 
@@ -2143,7 +2342,16 @@ def _run_file_download(
         plan = engine.plan(options)
         if options.dry_run:
             result = engine.download(options)
-            _print_backend_plan(result.ydl_opts or {}, json_output=options.json_output)
+            if options.json_output:
+                _print_backend_plan(result.ydl_opts or {}, json_output=True)
+            elif options.progress_mode == ProgressMode.json:
+                _print_dry_run_ndjson(
+                    kind=HubKind.file,
+                    url=options.url,
+                    plan=result.ydl_opts,
+                )
+            else:
+                _print_backend_plan(result.ydl_opts or {}, json_output=False)
             return []
         if options.explain:
             _print_backend_plan(
@@ -2152,12 +2360,13 @@ def _run_file_download(
                 explain=True,
             )
             return []
-        if not options.quiet and not options.json_output:
+        progress_mode = _active_progress_mode(options)
+        machine_progress = progress_mode == ProgressMode.json
+        if not options.quiet and not options.json_output and not machine_progress:
             _print_file_summary(options, plan.backend, plan.output, preview=preview)
         if options.quiet or options.json_output:
             result = DirectFileAdapter().run(options)
         else:
-            progress_mode = _active_progress_mode(options)
             with FileProgressReporter(
                 console,
                 title=plan.output.name,
@@ -2168,11 +2377,16 @@ def _run_file_download(
                 result = DirectFileAdapter().run(options, progress_callback=reporter.handle_event)
         if options.json_output:
             _print_runtime_json(kind=HubKind.file, url=options.url, paths=[plan.output])
-        elif not options.quiet:
+        elif not options.quiet and not machine_progress:
             _print_backend_result("File saved", result.message, options.output_dir)
         return [plan.output]
     except AtlasError as exc:
-        _handle_error(exc, verbose=options.verbose)
+        _handle_error(
+            exc,
+            verbose=options.verbose,
+            json_output=options.json_output,
+            ndjson_output=(not options.json_output and options.progress_mode == ProgressMode.json),
+        )
         raise typer.Exit(1) from exc
 
 
@@ -2187,7 +2401,18 @@ def _run_site_download(
         plan = engine.plan(options)
         if options.dry_run:
             result = engine.mirror(options)
-            _print_backend_plan(result.ydl_opts or {}, json_output=options.json_output)
+            if options.json_output:
+                _print_backend_plan(result.ydl_opts or {}, json_output=True)
+            elif options.progress_mode == ProgressMode.json:
+                _print_dry_run_ndjson(
+                    kind=(
+                        HubKind.dir if isinstance(options, DirectoryMirrorOptions) else HubKind.site
+                    ),
+                    url=options.url,
+                    plan=result.ydl_opts,
+                )
+            else:
+                _print_backend_plan(result.ydl_opts or {}, json_output=False)
             return []
         if options.explain:
             _print_backend_plan(
@@ -2196,13 +2421,15 @@ def _run_site_download(
                 explain=True,
             )
             return []
-        if not options.quiet and not options.json_output:
+        _preflight_batch_artifact_directory(options.output_dir)
+        progress_mode = _active_progress_mode(options)
+        machine_progress = progress_mode == ProgressMode.json
+        if not options.quiet and not options.json_output and not machine_progress:
             _print_site_summary(options, plan.backend, preview=preview)
         try:
             if options.quiet or options.json_output:
                 result = SiteMirrorAdapter().run(options)
             else:
-                progress_mode = _active_progress_mode(options)
                 with FileProgressReporter(
                     console,
                     title=plan.backend,
@@ -2219,13 +2446,18 @@ def _run_site_download(
                         progress_callback=reporter.handle_event,
                     )
         except AtlasError as exc:
+            canceled = isinstance(exc, MirrorDownloadError) and isinstance(
+                exc.__cause__, ProcessCanceled
+            )
+            failure_stats = exc.stats if isinstance(exc, MirrorDownloadError) else {}
             failure_result = DownloadResult(
-                status=DownloadStatus.failed,
+                status=DownloadStatus.canceled if canceled else DownloadStatus.failed,
                 url=options.url,
                 message=str(exc),
                 ydl_opts={
                     "backend": plan.backend,
                     "output": str(options.output_dir),
+                    "stats": failure_stats,
                     "warnings": plan.warnings,
                 },
             )
@@ -2235,9 +2467,9 @@ def _run_site_download(
                     failure_result,
                     backend=plan.backend,
                 )
-                if not options.quiet:
+                if not options.quiet and not options.json_output and not machine_progress:
                     _print_artifact_panel(artifact_paths)
-            except OSError as artifact_exc:
+            except (AtlasError, OSError) as artifact_exc:
                 logging.getLogger(__name__).warning(
                     "could not write mirror artifacts after failure: %s",
                     artifact_exc,
@@ -2250,7 +2482,7 @@ def _run_site_download(
                 url=options.url,
                 paths=[plan.output],
             )
-        elif not options.quiet:
+        elif not options.quiet and not machine_progress:
             label = (
                 "Directory mirror complete"
                 if isinstance(options, DirectoryMirrorOptions)
@@ -2262,8 +2494,19 @@ def _run_site_download(
             _print_artifact_panel(artifact_paths)
         return [plan.output]
     except AtlasError as exc:
-        _handle_error(exc, verbose=options.verbose)
-        raise typer.Exit(1) from exc
+        canceled = isinstance(exc, MirrorDownloadError) and isinstance(
+            exc.__cause__, ProcessCanceled
+        )
+        exit_code = 130 if canceled else 1
+        _handle_error(
+            exc,
+            verbose=options.verbose,
+            json_output=options.json_output,
+            ndjson_output=(not options.json_output and options.progress_mode == ProgressMode.json),
+            exit_code=exit_code,
+            extra={"status": "canceled"} if canceled else None,
+        )
+        raise typer.Exit(exit_code) from exc
 
 
 def _run_hub_get(
@@ -2316,16 +2559,23 @@ def _run_hub_get(
         backend=backend,
         checksum=checksum,
     )
+    machine_progress = not json_output and progress_mode == ProgressMode.json
     if explain and execution_plan.route.kind in {HubKind.audio, HubKind.video}:
         if json_output:
             _print_json(plan_as_dict(execution_plan.preview))
+        elif machine_progress:
+            _print_dry_run_ndjson(
+                kind=execution_plan.route.kind,
+                url=url,
+                plan=plan_as_dict(execution_plan.preview),
+            )
         elif not quiet:
             _print_hub_plan(execution_plan)
         return []
     if dry_run and json_output:
         _print_json(plan_as_dict(execution_plan.preview))
         return []
-    if not quiet and not json_output:
+    if not quiet and not json_output and not machine_progress:
         _print_hub_plan(execution_plan)
     return _execute_hub_plan(settings, execution_plan)
 
@@ -2375,7 +2625,16 @@ def _execute_hub_plan(settings: AtlasSettings, plan: HubExecutionPlan) -> list[P
         return _run_video_download(settings, options)
     if isinstance(options, SiteDownloadOptions):
         if options.dry_run:
-            _print_backend_plan(plan_as_dict(plan.preview), json_output=options.json_output)
+            if not options.json_output and options.progress_mode == ProgressMode.json:
+                _print_dry_run_ndjson(
+                    kind=(
+                        HubKind.dir if isinstance(options, DirectoryMirrorOptions) else HubKind.site
+                    ),
+                    url=options.url,
+                    plan=plan_as_dict(plan.preview),
+                )
+            else:
+                _print_backend_plan(plan_as_dict(plan.preview), json_output=options.json_output)
             return []
         if options.explain:
             _print_backend_plan(
@@ -2386,7 +2645,14 @@ def _execute_hub_plan(settings: AtlasSettings, plan: HubExecutionPlan) -> list[P
             return []
         return _run_site_download(settings, options, preview=plan_as_dict(plan.preview))
     if options.dry_run:
-        _print_backend_plan(plan_as_dict(plan.preview), json_output=options.json_output)
+        if not options.json_output and options.progress_mode == ProgressMode.json:
+            _print_dry_run_ndjson(
+                kind=HubKind.file,
+                url=options.url,
+                plan=plan_as_dict(plan.preview),
+            )
+        else:
+            _print_backend_plan(plan_as_dict(plan.preview), json_output=options.json_output)
         return []
     if options.explain:
         _print_backend_plan(
@@ -2412,7 +2678,12 @@ def _execute_options_or_exit(
     try:
         return _execute_hub_plan(settings, _hub_plan_from_options(settings, options, kind))
     except AtlasError as exc:
-        _handle_error(exc, verbose=options.verbose)
+        _handle_error(
+            exc,
+            verbose=options.verbose,
+            json_output=options.json_output,
+            ndjson_output=(not options.json_output and options.progress_mode == ProgressMode.json),
+        )
         raise typer.Exit(1) from exc
 
 
@@ -2920,6 +3191,7 @@ def _run_batch_hub_plan(
     if process_control is not None:
         process_control.raise_if_canceled(["atlas", plan.route.kind.value])
     if isinstance(options, AudioDownloadOptions):
+        _prepare_media_archive(options)
         ensure_download_dependencies(
             settings,
             BatchKind.audio,
@@ -2940,6 +3212,7 @@ def _run_batch_hub_plan(
         )
         return _download_result_with_batch_plan(result, plan_preview)
     if isinstance(options, VideoDownloadOptions):
+        _prepare_media_archive(options)
         ensure_download_dependencies(
             settings,
             BatchKind.video,
@@ -3030,7 +3303,7 @@ def _batch_progress_callback(
     adaptive_items_by_url: Mapping[str, WorkItem] | None = None,
     tls_fallback_retry: bool = False,
 ) -> Callable[[ProgressEvent], None] | None:
-    if reporter is None:
+    if reporter is None and adaptive_plan is None:
         return None
 
     def callback(event: ProgressEvent) -> None:
@@ -3050,7 +3323,8 @@ def _batch_progress_callback(
                 "item_id": str(entry.line_no),
             }
         )
-        reporter.hook(event.model_copy(update=updates))
+        if reporter is not None:
+            reporter.hook(event.model_copy(update=updates))
 
     return callback
 
@@ -3359,7 +3633,15 @@ def _artifact_write_lock(artifact_dir: Path) -> Iterator[None]:
     """Serialize artifact generation changes across local Atlas processes."""
 
     lock_path = artifact_dir / ".write.lock"
-    with lock_path.open("a", encoding="utf-8") as lock:
+    try:
+        prepare_private_file(lock_path)
+        flags = os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(lock_path, flags)
+    except OSError as exc:
+        raise AtlasError(f"Could not prepare Atlas artifact lock: {exc}") from exc
+    with os.fdopen(descriptor, "a+", encoding="utf-8") as lock:
         try:
             import fcntl
         except ImportError:
@@ -3388,7 +3670,7 @@ def _publish_latest_artifacts(
     """Publish a complete latest-session directory in one directory swap."""
 
     try:
-        artifact_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(artifact_dir)
     except OSError as exc:
         raise AtlasError(f"Could not create Atlas artifact folder {artifact_dir}: {exc}") from exc
     if artifact_dir.is_symlink():
@@ -3427,6 +3709,17 @@ def _publish_latest_artifacts(
     return {name: latest_dir / name for name in files}
 
 
+def _preflight_batch_artifact_directory(output_dir: Path) -> None:
+    resolved_output = output_dir.expanduser()
+    try:
+        resolved_output.mkdir(parents=True, exist_ok=True)
+        if resolved_output.is_symlink() or not resolved_output.is_dir():
+            raise OSError(f"Refusing non-directory or symbolic-link output: {resolved_output}")
+        ensure_private_directory(resolved_output / ".atlas")
+    except OSError as exc:
+        raise AtlasError(f"Could not prepare Atlas artifact folder: {exc}") from exc
+
+
 def _write_batch_artifacts(
     summary: BatchSummary,
     *,
@@ -3440,14 +3733,12 @@ def _write_batch_artifacts(
     summary_path = artifact_dir / f"batch-summary-{stamp}.json"
     manifest_path = artifact_dir / f"batch-manifest-{stamp}.json"
     retry_path = artifact_dir / f"batch-retry-{stamp}.txt"
-    latest_summary_path = latest_dir / "summary.json"
-    latest_manifest_path = latest_dir / "manifest.json"
     failed_path = latest_dir / "failed.txt"
     skipped_path = latest_dir / "skipped.txt"
     canceled_path = latest_dir / "canceled.txt"
     retry_manifest_path = latest_dir / "retry.atlas.json"
 
-    summary_payload = summary.model_dump(mode="json")
+    summary_payload = redact_structure(summary.model_dump(mode="json"))
     summary_text = json.dumps(summary_payload, indent=2, sort_keys=True) + "\n"
     failed_urls = [
         result.entry.url
@@ -3475,15 +3766,19 @@ def _write_batch_artifacts(
         "failed": summary.failed,
         "skipped": summary.skipped,
         "canceled": summary.canceled,
-        "smart_session": batch_session(
-            source=source,
-            kind=summary.kind,
-            output_dir=output_dir,
-            adaptive_plan=adaptive_plan,
-            total=summary.total,
-            summary=summary,
-        ).model_dump(mode="json"),
-        "adaptive_plan": adaptive_plan.model_dump(mode="json") if adaptive_plan else None,
+        "smart_session": redact_structure(
+            batch_session(
+                source=source,
+                kind=summary.kind,
+                output_dir=output_dir,
+                adaptive_plan=adaptive_plan,
+                total=summary.total,
+                summary=summary,
+            ).model_dump(mode="json")
+        ),
+        "adaptive_plan": (
+            redact_structure(adaptive_plan.model_dump(mode="json")) if adaptive_plan else None
+        ),
         "items": [
             {
                 "line_no": result.entry.line_no,
@@ -3491,7 +3786,7 @@ def _write_batch_artifacts(
                 "status": result.status.value,
                 "kind": _plain_batch_result_plan_value(result.plan, "kind"),
                 "engine": _plain_batch_result_plan_value(result.plan, "engine"),
-                "message": result.message,
+                "message": redact_text(result.message) if result.message else None,
                 "backend_args": _batch_result_backend_args(result.plan),
                 "backend_command": _batch_result_backend_command(result.plan),
             }
@@ -3500,15 +3795,16 @@ def _write_batch_artifacts(
     }
     retry_manifest = _batch_retry_manifest(
         summary,
-        manifest_path=latest_manifest_path,
-        summary_path=latest_summary_path,
+        manifest_path=manifest_path,
+        summary_path=summary_path,
+        export_failed_path=retry_path,
         failed_urls=failed_urls,
         skipped_urls=skipped_urls,
         canceled_urls=canceled_urls,
     )
     manifest["artifacts"] = {
-        "summary": str(latest_summary_path),
-        "manifest": str(latest_manifest_path),
+        "summary": str(summary_path),
+        "manifest": str(manifest_path),
         "failed": str(failed_path),
         "skipped": str(skipped_path),
         "canceled": str(canceled_path),
@@ -3517,15 +3813,17 @@ def _write_batch_artifacts(
     manifest_text = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     retry_manifest_text = json.dumps(retry_manifest, indent=2, sort_keys=True) + "\n"
     try:
-        artifact_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(artifact_dir)
     except OSError as exc:
         raise AtlasError(f"Could not create Atlas artifact folder {artifact_dir}: {exc}") from exc
     if artifact_dir.is_symlink():
         raise AtlasError("Refusing to write artifacts through a symbolic link.")
     _write_private_artifact(summary_path, summary_text)
     _write_private_artifact(manifest_path, manifest_text)
-    if failed_urls:
-        _write_private_artifact(retry_path, "\n".join(failed_urls) + "\n")
+    _write_private_artifact(
+        retry_path,
+        ("\n".join(failed_urls) + "\n") if failed_urls else "",
+    )
     latest_paths = _publish_latest_artifacts(
         artifact_dir,
         {
@@ -3557,6 +3855,7 @@ def _batch_retry_manifest(
     *,
     manifest_path: Path,
     summary_path: Path,
+    export_failed_path: Path,
     failed_urls: list[str],
     skipped_urls: list[str],
     canceled_urls: list[str],
@@ -3585,7 +3884,7 @@ def _batch_retry_manifest(
         "retry_checksum_failures_only": checksum_failure_urls,
         "retry_skipped_unknowns_only": skipped_unknown_urls,
         "retry_canceled_only": canceled_urls,
-        "export_failed_urls": str(manifest_path.with_name("failed.txt")),
+        "export_failed_urls": str(export_failed_path),
         "save_manifest": str(manifest_path),
         "load_manifest": str(manifest_path),
         "resume_previous_session": str(manifest_path),
@@ -3612,7 +3911,8 @@ def _batch_result_backend_args(plan: dict[str, object] | None) -> list[str]:
     args = plan.get("args")
     if not isinstance(args, list):
         return []
-    return [str(arg) for arg in args if str(arg).strip()]
+    values = [str(arg) for arg in args if str(arg).strip()]
+    return [str(arg) for arg in redact_command_args(values)]
 
 
 def _batch_result_backend_command(plan: dict[str, object] | None) -> str | None:
@@ -3906,7 +4206,7 @@ def _retry_batch_source(
 def _print_no_retry_urls(*, mode: str, json_output: bool) -> None:
     message = f"No URLs found for retry mode: {mode}"
     if json_output:
-        console.print_json(json.dumps({"status": "empty", "mode": mode, "urls": []}))
+        _print_json({"status": "empty", "mode": mode, "urls": []})
         return
     console.print(f"[{ATLAS_WARNING_STYLE}]{escape(message)}[/{ATLAS_WARNING_STYLE}]")
 
@@ -4234,19 +4534,29 @@ def _session_counts(
 ) -> dict[str, int]:
     counts: dict[str, int] = {}
     for key in ("total", "succeeded", "failed", "skipped", "canceled"):
-        counts[key] = _int_from_payload(summary, key)
-        if counts[key] == 0:
-            counts[key] = _int_from_payload(manifest, key)
-        if counts[key] == 0:
-            counts[key] = _int_from_payload(payload, key)
+        counts[key] = next(
+            (
+                value
+                for source in (summary, manifest, payload)
+                if (value := _optional_int_from_payload(source, key)) is not None
+            ),
+            0,
+        )
     return counts
 
 
 def _int_from_payload(payload: dict[str, object] | None, key: str) -> int:
-    if not payload:
-        return 0
+    return _optional_int_from_payload(payload, key) or 0
+
+
+def _optional_int_from_payload(
+    payload: dict[str, object] | None,
+    key: str,
+) -> int | None:
+    if not payload or key not in payload:
+        return None
     value = payload.get(key)
-    return int(value) if isinstance(value, int) and value >= 0 else 0
+    return int(value) if isinstance(value, int) and value >= 0 else None
 
 
 def _dict_value(
@@ -4524,7 +4834,7 @@ def _session_preview_content(
         return None
     if preview == SessionPreviewChoice.plan:
         content = json.dumps(
-            _session_plan_preview_payload(report, payload, manifest),
+            redact_structure(_session_plan_preview_payload(report, payload, manifest)),
             indent=2,
             sort_keys=True,
         )
@@ -4534,7 +4844,7 @@ def _session_preview_content(
         sample = commands.get("sample")
         if isinstance(sample, list) and sample:
             content = "\n".join(
-                str(item.get("command") or "")
+                redact_text(str(item.get("command") or ""))
                 for item in sample
                 if isinstance(item, dict) and item.get("command")
             )
@@ -4542,7 +4852,11 @@ def _session_preview_content(
             content = "No saved backend commands are available for this view."
         return ("Backend Commands", content, "bash")
     if preview == SessionPreviewChoice.manifest:
-        content = json.dumps(manifest or payload, indent=2, sort_keys=True)
+        content = json.dumps(
+            redact_structure(manifest or payload),
+            indent=2,
+            sort_keys=True,
+        )
         return ("Manifest JSON", content, "json")
     if preview == SessionPreviewChoice.summary:
         summary = _dict_value(report, "counts")
@@ -4555,7 +4869,9 @@ def _session_preview_content(
     if preview == SessionPreviewChoice.failed:
         failed_urls = _dict_value(_dict_value(report, "retry"), "failed").get("urls")
         content = (
-            "\n".join(str(url) for url in failed_urls) if isinstance(failed_urls, list) else ""
+            "\n".join(redact_text(str(url)) for url in failed_urls)
+            if isinstance(failed_urls, list)
+            else ""
         )
         return ("Failed URLs", content or "No failed URLs", "text")
     if preview == SessionPreviewChoice.errors:
@@ -4572,7 +4888,7 @@ def _session_preview_content(
     path = config_path()
     return (
         "Atlas Config",
-        _read_text_preview(path, missing=f"No config file found at {path}"),
+        redact_text(_read_text_preview(path, missing=f"No config file found at {path}")),
         "toml",
     )
 
@@ -4793,12 +5109,16 @@ def _write_mirror_artifacts(
     canceled_path = latest_dir / "canceled.txt"
     retry_manifest_path = latest_dir / "retry.atlas.json"
     stats = (result.ydl_opts or {}).get("stats")
-    stats_payload = stats if isinstance(stats, dict) else {}
-    failed_urls = _mirror_failed_urls_from_stats(stats_payload)
-    if result.status == DownloadStatus.failed and not failed_urls:
-        failed_urls = [options.url]
-    skipped_urls: list[str] = []
-    canceled_urls: list[str] = []
+    raw_stats_payload = stats if isinstance(stats, dict) else {}
+    stats_payload = redact_structure(raw_stats_payload)
+    if not isinstance(stats_payload, dict):
+        stats_payload = {}
+    failed_resource_urls = _mirror_failed_urls_from_stats(raw_stats_payload)
+    failed_urls = (
+        [options.url] if result.status == DownloadStatus.failed or failed_resource_urls else []
+    )
+    skipped_urls = [options.url] if result.status == DownloadStatus.skipped else []
+    canceled_urls = [options.url] if result.status == DownloadStatus.canceled else []
     kind = HubKind.dir if isinstance(options, DirectoryMirrorOptions) else HubKind.site
     created_at = datetime.now().isoformat(timespec="seconds")
     summary = {
@@ -4808,15 +5128,21 @@ def _write_mirror_artifacts(
         "status": result.status.value,
         "output": str(options.output_dir),
         "backend": backend,
-        "failed": len(failed_urls),
+        "total": 1,
+        "succeeded": int(result.status == DownloadStatus.success),
+        "failed": int(result.status == DownloadStatus.failed),
         "skipped": len(skipped_urls),
         "canceled": len(canceled_urls),
-        "message": result.message,
+        "failed_resource_count": len(failed_resource_urls),
+        "failed_resource_urls": [redact_text(url) for url in failed_resource_urls],
+        "message": redact_text(result.message) if result.message else None,
         "stats_summary": stats_payload.get("summary"),
     }
     manifest = {
         **summary,
-        "smart_session": site_session(options, backend=backend).model_dump(mode="json"),
+        "smart_session": redact_structure(
+            site_session(options, backend=backend).model_dump(mode="json")
+        ),
         "items": [
             {
                 "line_no": 1,
@@ -4824,7 +5150,7 @@ def _write_mirror_artifacts(
                 "status": result.status.value,
                 "kind": kind.value,
                 "engine": backend,
-                "message": result.message,
+                "message": redact_text(result.message) if result.message else None,
             }
         ],
         "artifacts": {
@@ -4844,7 +5170,7 @@ def _write_mirror_artifacts(
         "summary_path": str(summary_path),
         "retry_failed_only": failed_urls,
         "retry_checksum_failures_only": [],
-        "retry_skipped_unknowns_only": [],
+        "retry_skipped_unknowns_only": skipped_urls,
         "retry_canceled_only": canceled_urls,
         "export_failed_urls": str(failed_path),
         "save_manifest": str(manifest_path),
@@ -4859,8 +5185,8 @@ def _write_mirror_artifacts(
             "summary.json": json.dumps(summary, indent=2, sort_keys=True) + "\n",
             "manifest.json": json.dumps(manifest, indent=2, sort_keys=True) + "\n",
             "failed.txt": ("\n".join(failed_urls) + "\n") if failed_urls else "",
-            "skipped.txt": "",
-            "canceled.txt": "",
+            "skipped.txt": ("\n".join(skipped_urls) + "\n") if skipped_urls else "",
+            "canceled.txt": ("\n".join(canceled_urls) + "\n") if canceled_urls else "",
             "retry.atlas.json": json.dumps(retry_manifest, indent=2, sort_keys=True) + "\n",
         },
     )
@@ -5182,9 +5508,9 @@ def video(
         DownloadEngineChoice | None,
         typer.Option("--download-engine", help="Downloader planner mode."),
     ] = None,
-    connections: Annotated[int, typer.Option("--connections", min=1, max=64)] = 16,
-    splits: Annotated[int, typer.Option("--splits", min=1, max=64)] = 16,
-    chunk_size: Annotated[str, typer.Option("--chunk-size")] = "1M",
+    connections: Annotated[int | None, typer.Option("--connections", min=1, max=64)] = None,
+    splits: Annotated[int | None, typer.Option("--splits", min=1, max=64)] = None,
+    chunk_size: Annotated[str | None, typer.Option("--chunk-size")] = None,
     archive_path: Annotated[
         Path | None, typer.Option("--archive", help="Download archive path.")
     ] = None,
@@ -5420,7 +5746,7 @@ def video(
     """Download max-quality video."""
 
     configure_logging(verbose)
-    settings = _settings()
+    settings = _settings(json_output=json_output, progress_mode=progress_mode)
     archive_enabled, archive_file = _archive_settings(
         settings=settings,
         archive_path=archive_path,
@@ -5435,9 +5761,9 @@ def video(
         "cookies_file": cookies_file,
         "use_aria2": _use_aria2(settings, aria2),
         "download_engine": _download_engine(selected=download_engine, aria2=aria2),
-        "connections": connections,
-        "splits": splits,
-        "chunk_size": chunk_size,
+        "connections": settings.aria2_connections if connections is None else connections,
+        "splits": settings.aria2_splits if splits is None else splits,
+        "chunk_size": settings.aria2_chunk_size if chunk_size is None else chunk_size,
         "browser_cookies": browser_cookies,
         "playlist": playlist,
         "playlist_items": playlist_items,
@@ -5531,7 +5857,12 @@ def video(
     try:
         options = VideoDownloadOptions.model_validate(option_kwargs)
     except ValidationError as exc:
-        _handle_error(exc, verbose=verbose)
+        _handle_error(
+            exc,
+            verbose=verbose,
+            json_output=json_output,
+            ndjson_output=not json_output and progress_mode == ProgressMode.json,
+        )
         raise typer.Exit(1) from exc
     _ = yes
     _execute_options_or_exit(settings, options, HubKind.video)
@@ -5541,7 +5872,33 @@ def _file_options_or_exit(handler_verbose: bool, **values: object) -> FileDownlo
     try:
         return FileDownloadOptions.model_validate(values)
     except ValidationError as exc:
-        _handle_error(exc, verbose=handler_verbose)
+        _handle_error(
+            exc,
+            verbose=handler_verbose,
+            json_output=bool(values.get("json_output")),
+            ndjson_output=(
+                not bool(values.get("json_output"))
+                and values.get("progress_mode") == ProgressMode.json
+            ),
+        )
+        raise typer.Exit(1) from exc
+
+
+def _site_options_or_exit(
+    option_type: type[SiteDownloadOptions],
+    handler_verbose: bool,
+    machine_output: bool,
+    **values: object,
+) -> SiteDownloadOptions:
+    try:
+        return option_type.model_validate(values)
+    except ValidationError as exc:
+        _handle_error(
+            exc,
+            verbose=handler_verbose,
+            json_output=machine_output,
+            ndjson_output=(not machine_output and values.get("progress_mode") == ProgressMode.json),
+        )
         raise typer.Exit(1) from exc
 
 
@@ -5598,12 +5955,12 @@ def file_download(
         float | None,
         typer.Option("--connect-timeout", min=0, help="aria2/wget2 connection timeout."),
     ] = None,
-    connections: Annotated[int, typer.Option("--connections", min=1, max=64)] = 16,
-    splits: Annotated[int, typer.Option("--splits", min=1, max=64)] = 16,
+    connections: Annotated[int | None, typer.Option("--connections", min=1, max=64)] = None,
+    splits: Annotated[int | None, typer.Option("--splits", min=1, max=64)] = None,
     chunk_size: Annotated[
-        str,
+        str | None,
         typer.Option("--chunk-size", help="aria2 split size or wget2 chunk size."),
-    ] = "1M",
+    ] = None,
     overwrite: Annotated[bool, typer.Option("--overwrite", help="Replace existing file.")] = False,
     no_continue: Annotated[
         bool, typer.Option("--no-continue", help="Disable resume behavior.")
@@ -5792,7 +6149,7 @@ def file_download(
     """Download a direct HTTP/HTTPS file through native Python, aria2c, or wget2."""
 
     configure_logging(verbose)
-    settings = _settings()
+    settings = _settings(json_output=json_output, progress_mode=progress_mode)
     options = _file_options_or_exit(
         verbose,
         url=url,
@@ -5816,9 +6173,9 @@ def file_download(
         connect_timeout=(
             connect_timeout if connect_timeout is not None else settings.file_connect_timeout
         ),
-        connections=connections,
-        splits=splits,
-        chunk_size=chunk_size,
+        connections=settings.aria2_connections if connections is None else connections,
+        splits=settings.aria2_splits if splits is None else splits,
+        chunk_size=settings.aria2_chunk_size if chunk_size is None else chunk_size,
         overwrite=overwrite,
         continue_download=not no_continue,
         rate_limit=rate_limit,
@@ -5893,7 +6250,7 @@ def file_download(
     try:
         _execute_options_or_exit(settings, options, HubKind.file)
     except AtlasError as exc:
-        _handle_error(exc, verbose=verbose)
+        _handle_error(exc, verbose=verbose, json_output=json_output)
         raise typer.Exit(1) from exc
 
 
@@ -6182,7 +6539,10 @@ def site(
         typer.Option(
             "--max-files",
             min=1,
-            help="Fail adaptive scan if discovered items exceed this.",
+            help=(
+                "Hard item cap for supported exact directory indexes; "
+                "conventional recursive mirrors reject this option."
+            ),
         ),
     ] = None,
     max_total_size: Annotated[
@@ -6303,7 +6663,7 @@ def site(
     """Mirror a website with wget2 or wget."""
 
     configure_logging(verbose)
-    settings = _settings()
+    settings = _settings(json_output=json_output, progress_mode=progress_mode)
     site_url = url
     site_input_file = input_file
     input_file_only = False
@@ -6312,12 +6672,14 @@ def site(
             _handle_error(
                 AtlasError("atlas site from-file requires an input file path."),
                 verbose=verbose,
+                json_output=json_output,
             )
             raise typer.Exit(1)
         if input_file is not None and input_file != source:
             _handle_error(
                 AtlasError("Use either from-file INPUT or --input-file, not both."),
                 verbose=verbose,
+                json_output=json_output,
             )
             raise typer.Exit(1)
         site_url = base or str(source)
@@ -6327,6 +6689,7 @@ def site(
         _handle_error(
             AtlasError("A second positional input file is only valid with 'atlas site from-file'."),
             verbose=verbose,
+            json_output=json_output,
         )
         raise typer.Exit(1)
     try:
@@ -6339,9 +6702,12 @@ def site(
             domains=domains or settings.site_domains,
         )
     except AtlasError as exc:
-        _handle_error(exc, verbose=verbose)
+        _handle_error(exc, verbose=verbose, json_output=json_output)
         raise typer.Exit(1) from exc
-    options = SiteDownloadOptions(
+    options = _site_options_or_exit(
+        SiteDownloadOptions,
+        verbose,
+        json_output,
         url=site_url,
         output_dir=output_dir or settings.output_dir,
         backend=backend if backend != SiteBackendChoice.auto else settings.site_backend,
@@ -6574,7 +6940,10 @@ def dir(
         typer.Option(
             "--max-files",
             min=1,
-            help="Fail adaptive scan if discovered items exceed this.",
+            help=(
+                "Hard item cap for supported exact directory indexes; "
+                "conventional recursive mirrors reject this option."
+            ),
         ),
     ] = None,
     max_total_size: Annotated[
@@ -6625,7 +6994,7 @@ def dir(
     """Mirror an explicit open HTTP directory index or file tree."""
 
     configure_logging(verbose)
-    settings = _settings()
+    settings = _settings(json_output=json_output, progress_mode=progress_mode)
     try:
         resolved_span_hosts, resolved_domains = _mirror_scope_policy(
             url,
@@ -6636,9 +7005,12 @@ def dir(
             domains=None,
         )
     except AtlasError as exc:
-        _handle_error(exc, verbose=verbose)
+        _handle_error(exc, verbose=verbose, json_output=json_output)
         raise typer.Exit(1) from exc
-    options = DirectoryMirrorOptions(
+    options = _site_options_or_exit(
+        DirectoryMirrorOptions,
+        verbose,
+        json_output,
         url=url,
         output_dir=output_dir or settings.output_dir,
         backend=backend if backend != SiteBackendChoice.auto else settings.dir_backend,
@@ -6749,7 +7121,7 @@ def get(
     """Smart central hub for media, direct files, and explicit site mirrors."""
 
     configure_logging(verbose)
-    settings = _settings()
+    settings = _settings(json_output=json_output, progress_mode=progress_mode)
     try:
         _run_hub_get(
             settings,
@@ -6773,8 +7145,13 @@ def get(
             progress_mode=progress_mode,
             verbose=verbose,
         )
-    except AtlasError as exc:
-        _handle_error(exc, verbose=verbose)
+    except (AtlasError, ValidationError) as exc:
+        _handle_error(
+            exc,
+            verbose=verbose,
+            json_output=json_output,
+            ndjson_output=not json_output and progress_mode == ProgressMode.json,
+        )
         raise typer.Exit(1) from exc
 
 
@@ -6796,9 +7173,9 @@ def audio(
         DownloadEngineChoice | None,
         typer.Option("--download-engine", help="Downloader planner mode."),
     ] = None,
-    connections: Annotated[int, typer.Option("--connections", min=1, max=64)] = 16,
-    splits: Annotated[int, typer.Option("--splits", min=1, max=64)] = 16,
-    chunk_size: Annotated[str, typer.Option("--chunk-size")] = "1M",
+    connections: Annotated[int | None, typer.Option("--connections", min=1, max=64)] = None,
+    splits: Annotated[int | None, typer.Option("--splits", min=1, max=64)] = None,
+    chunk_size: Annotated[str | None, typer.Option("--chunk-size")] = None,
     archive_path: Annotated[
         Path | None, typer.Option("--archive", help="Download archive path.")
     ] = None,
@@ -7034,7 +7411,7 @@ def audio(
     """Extract audio."""
 
     configure_logging(verbose)
-    settings = _settings()
+    settings = _settings(json_output=json_output, progress_mode=progress_mode)
     archive_enabled, archive_file = _archive_settings(
         settings=settings,
         archive_path=archive_path,
@@ -7049,9 +7426,9 @@ def audio(
         "cookies_file": cookies_file,
         "use_aria2": _use_aria2(settings, aria2),
         "download_engine": _download_engine(selected=download_engine, aria2=aria2),
-        "connections": connections,
-        "splits": splits,
-        "chunk_size": chunk_size,
+        "connections": settings.aria2_connections if connections is None else connections,
+        "splits": settings.aria2_splits if splits is None else splits,
+        "chunk_size": settings.aria2_chunk_size if chunk_size is None else chunk_size,
         "browser_cookies": browser_cookies,
         "playlist": playlist,
         "playlist_items": playlist_items,
@@ -7141,7 +7518,12 @@ def audio(
     try:
         options = AudioDownloadOptions.model_validate(option_kwargs)
     except ValidationError as exc:
-        _handle_error(exc, verbose=verbose)
+        _handle_error(
+            exc,
+            verbose=verbose,
+            json_output=json_output,
+            ndjson_output=not json_output and progress_mode == ProgressMode.json,
+        )
         raise typer.Exit(1) from exc
     _ = yes
     _execute_options_or_exit(settings, options, HubKind.audio)
@@ -7203,16 +7585,20 @@ def playlist_command(
     """Download an explicit playlist as video or audio."""
 
     configure_logging(verbose)
-    settings = _settings()
+    settings = _settings(json_output=json_output, progress_mode=progress_mode)
     if not is_explicit_playlist_url(url):
         message = (
             "atlas playlist only accepts explicit playlist URLs. "
             "Use atlas video or atlas audio for watch URLs with list= or start_radio= parameters."
         )
-        _handle_error(AtlasError(message), verbose=verbose)
+        _handle_error(AtlasError(message), verbose=verbose, json_output=json_output)
         raise typer.Exit(1)
     try:
-        resolved_kind = _resolve_playlist_kind(kind, yes=yes, quiet=quiet)
+        resolved_kind = _resolve_playlist_kind(
+            kind,
+            yes=yes,
+            quiet=quiet or json_output or progress_mode == ProgressMode.json,
+        )
         if resolved_kind == BatchKind.audio:
             audio_options = AudioDownloadOptions.model_validate(
                 {
@@ -7292,7 +7678,12 @@ def playlist_command(
             }
         )
     except (ValidationError, AtlasError) as exc:
-        _handle_error(exc, verbose=verbose)
+        _handle_error(
+            exc,
+            verbose=verbose,
+            json_output=json_output,
+            ndjson_output=not json_output and progress_mode == ProgressMode.json,
+        )
         raise typer.Exit(1) from exc
     _execute_options_or_exit(settings, video_options, HubKind.video)
 
@@ -7322,7 +7713,7 @@ def info(
     """Show sanitized media metadata."""
 
     configure_logging(verbose)
-    settings = _settings()
+    settings = _settings(json_output=json_output)
     try:
         media = _probe(_engine(settings)).probe(
             InfoOptions(
@@ -7335,11 +7726,11 @@ def info(
             )
         )
     except AtlasError as exc:
-        _handle_error(exc, verbose=verbose)
+        _handle_error(exc, verbose=verbose, json_output=json_output)
         raise typer.Exit(1) from exc
 
     if json_output:
-        console.print_json(media.model_dump_json())
+        _print_json(media.model_dump(mode="json"))
         return
 
     _metadata_panel(
@@ -7398,11 +7789,12 @@ def formats(
     """List available formats."""
 
     configure_logging(verbose)
-    settings = _settings()
+    settings = _settings(json_output=json_output)
     if video_only and audio_only:
         _handle_error(
             AtlasError("Choose either --video-only or --audio-only, not both."),
             verbose=verbose,
+            json_output=json_output,
         )
         raise typer.Exit(1)
     try:
@@ -7417,7 +7809,7 @@ def formats(
             )
         )
     except AtlasError as exc:
-        _handle_error(exc, verbose=verbose)
+        _handle_error(exc, verbose=verbose, json_output=json_output)
         raise typer.Exit(1) from exc
 
     selected = sort_formats(
@@ -7425,7 +7817,7 @@ def formats(
         sort,
     )
     if json_output:
-        console.print_json(json.dumps([item.model_dump() for item in selected], default=str))
+        _print_json([item.model_dump(mode="json") for item in selected])
         return
 
     best_video, best_audio = _recommended_formats(items)
@@ -7555,28 +7947,56 @@ def batch(
     """Download URLs from a file with smart per-URL routing."""
 
     configure_logging(verbose)
-    settings = _settings()
+    settings = _settings(json_output=json_output, progress_mode=progress_mode)
+    resolved_progress_mode = resolve_progress_mode(
+        progress_mode,
+        console=console,
+        quiet=False,
+        json_output=json_output,
+    )
+    machine_progress = not json_output and resolved_progress_mode == ProgressMode.json
+    resolved_output_dir = output_dir or settings.output_dir
+    if not dry_run:
+        try:
+            _preflight_batch_artifact_directory(resolved_output_dir)
+        except AtlasError as exc:
+            _handle_error(
+                exc,
+                verbose=verbose,
+                json_output=json_output,
+                ndjson_output=machine_progress,
+            )
+            raise typer.Exit(1) from exc
     resolved_concurrency = concurrency or settings.batch_concurrency
     adaptive_plan = None
     adaptive_requested = adaptive or explain
     adaptive_per_host_concurrency: int | None = None
     if adaptive_requested:
-        adaptive_plan = _adaptive_batch_plan_from_file(
-            settings,
-            file=file,
-            kind=kind,
-            output_dir=output_dir or settings.output_dir,
-            backend=backend,
-            allow_sites=allow_sites,
-            allow_dirs=allow_dirs,
-            controls=default_adaptive_controls(
-                enabled=True,
-                max_concurrency=max_concurrency,
-                per_host_concurrency=per_host_concurrency,
-                politeness=politeness,
-                dry_run=dry_run,
-            ),
-        )
+        try:
+            adaptive_plan = _adaptive_batch_plan_from_file(
+                settings,
+                file=file,
+                kind=kind,
+                output_dir=resolved_output_dir,
+                backend=backend,
+                allow_sites=allow_sites,
+                allow_dirs=allow_dirs,
+                controls=default_adaptive_controls(
+                    enabled=True,
+                    max_concurrency=max_concurrency,
+                    per_host_concurrency=per_host_concurrency,
+                    politeness=politeness,
+                    dry_run=dry_run,
+                ),
+            )
+        except (AtlasError, ValidationError) as exc:
+            _handle_error(
+                exc,
+                verbose=verbose,
+                json_output=json_output,
+                ndjson_output=machine_progress,
+            )
+            raise typer.Exit(1) from exc
         if adaptive_plan is not None:
             adaptive_per_host_concurrency = adaptive_plan.per_host_concurrency
             if concurrency is None:
@@ -7595,7 +8015,12 @@ def batch(
     try:
         entries_for_names, _skipped_for_names = load_batch_file(file)
     except AtlasError as exc:
-        _handle_error(exc, verbose=verbose)
+        _handle_error(
+            exc,
+            verbose=verbose,
+            json_output=json_output,
+            ndjson_output=machine_progress,
+        )
         raise typer.Exit(1) from exc
     filename_overrides = _batch_file_filename_overrides(entries_for_names)
     adaptive_items_by_url = _adaptive_work_item_by_url(adaptive_plan)
@@ -7611,26 +8036,41 @@ def batch(
         progress_hooks: list[ProgressHook] | None,
         context: BatchItemContext | None = None,
     ) -> DownloadResult:
-        planned = _batch_hub_plan_from_url(
-            settings,
-            url=entry.url,
-            kind=kind,
-            output_dir=output_dir or settings.output_dir,
-            backend=backend,
-            dry_run=dry_run,
-            json_output=json_output,
-            verbose=verbose,
-            allow_sites=allow_sites,
-            allow_dirs=allow_dirs,
-            video_codec=video_codec,
-            audio_codec=codec,
-            audio_quality=audio_quality,
-            adaptive=adaptive_requested,
-            max_concurrency=max_concurrency,
-            per_host_concurrency=per_host_concurrency,
-            politeness=politeness,
-            explain=False,
-        )
+        try:
+            planned = _batch_hub_plan_from_url(
+                settings,
+                url=entry.url,
+                kind=kind,
+                output_dir=output_dir or settings.output_dir,
+                backend=backend,
+                dry_run=dry_run,
+                json_output=json_output,
+                verbose=verbose,
+                allow_sites=allow_sites,
+                allow_dirs=allow_dirs,
+                video_codec=video_codec,
+                audio_codec=codec,
+                audio_quality=audio_quality,
+                adaptive=adaptive_requested,
+                max_concurrency=max_concurrency,
+                per_host_concurrency=per_host_concurrency,
+                politeness=politeness,
+                explain=False,
+            )
+        except Exception as exc:
+            _emit_batch_result_event(
+                active_reporter,
+                entry,
+                DownloadResult(
+                    status=DownloadStatus.failed,
+                    url=entry.url,
+                    message=str(exc),
+                ),
+                adaptive_plan=adaptive_plan,
+                adaptive_scheduler=active_runtime_scheduler,
+                adaptive_items_by_url=adaptive_items_by_url,
+            )
+            raise
         if isinstance(planned, DownloadResult):
             _emit_batch_result_event(
                 active_reporter,
@@ -7765,7 +8205,7 @@ def batch(
 
     try:
         summary: BatchSummary
-        if dry_run:
+        if dry_run and not machine_progress:
             summary = run_batch_concurrent(
                 file,
                 kind,
@@ -7778,20 +8218,16 @@ def batch(
             summary = shared_summary if shared_summary is not None else run_runtime_batch()
         else:
             entries, _skipped = load_batch_file(file)
-            console.print(
-                Text(
-                    f"Batch {kind.value}: concurrency {resolved_concurrency}",
-                    style=ATLAS_MUTED_STYLE,
+            if not machine_progress:
+                console.print(
+                    Text(
+                        f"Batch {kind.value}: concurrency {resolved_concurrency}",
+                        style=ATLAS_MUTED_STYLE,
+                    )
                 )
-            )
             with _batch_progress_reporter(
                 concurrency=resolved_concurrency,
-                progress_mode=resolve_progress_mode(
-                    progress_mode,
-                    console=console,
-                    quiet=False,
-                    json_output=False,
-                ),
+                progress_mode=resolved_progress_mode,
                 total=len(entries),
                 work_context=_batch_work_context(
                     queue_count=len(entries),
@@ -7805,16 +8241,31 @@ def batch(
                 reporter.seed_entries(entries, kind=_batch_hub_kind(kind))
                 active_reporter = reporter
                 try:
-                    shared_summary = run_shared_batch(reporter)
-                    if shared_summary is None:
-                        reporter.operator_controller = batch_operator_controller
-                        summary = run_runtime_batch(reporter)
+                    if dry_run:
+                        summary = run_batch_concurrent(
+                            file,
+                            kind,
+                            handler,
+                            concurrency=resolved_concurrency,
+                            per_host_concurrency=adaptive_per_host_concurrency,
+                            control=batch_control,
+                        )
                     else:
-                        summary = shared_summary
+                        shared_summary = run_shared_batch(reporter)
+                        if shared_summary is None:
+                            reporter.operator_controller = batch_operator_controller
+                            summary = run_runtime_batch(reporter)
+                        else:
+                            summary = shared_summary
                 finally:
                     active_reporter = None
     except AtlasError as exc:
-        _handle_error(exc, verbose=verbose)
+        _handle_error(
+            exc,
+            verbose=verbose,
+            json_output=json_output,
+            ndjson_output=machine_progress,
+        )
         raise typer.Exit(1) from exc
 
     artifact_paths: dict[str, Path] = {}
@@ -7822,18 +8273,39 @@ def batch(
         try:
             artifact_paths = _write_batch_artifacts(
                 summary,
-                output_dir=output_dir or settings.output_dir,
+                output_dir=resolved_output_dir,
                 adaptive_plan=adaptive_plan,
                 source=str(file),
             )
-        except OSError as exc:
-            _handle_error(AtlasError(f"Could not write batch artifacts: {exc}"), verbose=verbose)
+        except (AtlasError, OSError) as exc:
+            artifact_error = (
+                exc
+                if isinstance(exc, AtlasError)
+                else AtlasError(f"Could not write batch artifacts: {exc}")
+            )
+            _handle_error(
+                artifact_error,
+                verbose=verbose,
+                json_output=json_output,
+                ndjson_output=machine_progress,
+                extra={"summary": summary.model_dump(mode="json")},
+            )
             raise typer.Exit(1) from exc
 
     if json_output:
-        console.print_json(summary.model_dump_json())
+        _print_json(summary.model_dump(mode="json"))
         if summary.failed:
             raise typer.Exit(1)
+        if summary.canceled:
+            raise typer.Exit(130)
+        return
+
+    if machine_progress:
+        _print_batch_terminal_event(summary)
+        if summary.failed:
+            raise typer.Exit(1)
+        if summary.canceled:
+            raise typer.Exit(130)
         return
 
     console.print(_batch_result_table(summary, kind=kind, width=console.width))
@@ -7842,6 +8314,8 @@ def batch(
         _print_artifact_panel(artifact_paths)
     if summary.failed:
         raise typer.Exit(1)
+    if summary.canceled:
+        raise typer.Exit(130)
 
 
 def _batch_result_display_message(result: BatchItemResult) -> str:
@@ -7921,7 +8395,7 @@ def _run_saved_batch_session(
     progress_mode: ProgressMode,
     verbose: bool,
 ) -> None:
-    settings = _settings()
+    settings = _settings(json_output=json_output, progress_mode=progress_mode)
     base_output = output_dir or settings.output_dir
     session_path = _resolve_batch_session_path(session, output_dir=base_output)
     payload, manifest = _batch_session_payloads(session_path)
@@ -8069,7 +8543,7 @@ def retry_command(
             verbose=verbose,
         )
     except AtlasError as exc:
-        _handle_error(exc, verbose=verbose)
+        _handle_error(exc, verbose=verbose, json_output=json_output)
         raise typer.Exit(1) from exc
 
 
@@ -8152,7 +8626,7 @@ def resume_command(
             verbose=verbose,
         )
     except AtlasError as exc:
-        _handle_error(exc, verbose=verbose)
+        _handle_error(exc, verbose=verbose, json_output=json_output)
         raise typer.Exit(1) from exc
 
 
@@ -8201,7 +8675,7 @@ def export_failed_command(
 
     configure_logging(verbose)
     try:
-        settings = _settings()
+        settings = _settings(json_output=json_output)
         mode = _retry_mode_from_flags(
             failed_only=False,
             checksum_failures_only=checksum_failures_only,
@@ -8220,16 +8694,14 @@ def export_failed_command(
                 force=force,
             )
         if json_output:
-            console.print_json(
-                json.dumps(
-                    {
-                        "mode": mode,
-                        "session": str(session_path),
-                        "output": str(output.expanduser()) if output is not None else None,
-                        "count": len(urls),
-                        "urls": urls,
-                    }
-                )
+            _print_json(
+                {
+                    "mode": mode,
+                    "session": str(session_path),
+                    "output": str(output.expanduser()) if output is not None else None,
+                    "count": len(urls),
+                    "urls": urls,
+                }
             )
             return
         if output is not None:
@@ -8246,7 +8718,7 @@ def export_failed_command(
         for url in urls:
             console.print(url)
     except AtlasError as exc:
-        _handle_error(exc, verbose=verbose)
+        _handle_error(exc, verbose=verbose, json_output=json_output)
         raise typer.Exit(1) from exc
 
 
@@ -8326,7 +8798,7 @@ def inspect_session_command(
 
     configure_logging(verbose)
     try:
-        settings = _settings()
+        settings = _settings(json_output=json_output)
         base_output = output_dir or settings.output_dir
         session_path = _resolve_batch_session_path(session, output_dir=base_output)
         payload, manifest = _batch_session_payloads(session_path)
@@ -8382,7 +8854,7 @@ def inspect_session_command(
         if actions:
             report["actions"] = actions
         if json_output:
-            console.print_json(json.dumps(report))
+            _print_json(report)
             return
         if copied_command is not None:
             status = "copied" if copied else "copy unavailable"
@@ -8422,7 +8894,7 @@ def inspect_session_command(
             manifest=manifest,
         )
     except AtlasError as exc:
-        _handle_error(exc, verbose=verbose)
+        _handle_error(exc, verbose=verbose, json_output=json_output)
         raise typer.Exit(1) from exc
 
 
@@ -8474,12 +8946,12 @@ def setup_command(
             media_only=media_only,
             mirrors=mirrors,
         )
-        settings = _settings()
+        settings = _settings(json_output=json_output)
         plan = build_setup_plan(settings, mode=mode)
         if install and no_install:
             raise AtlasError("Choose either --install or --no-install, not both.")
         if json_output:
-            console.print_json(json.dumps(_setup_plan_as_dict(plan)))
+            _print_json(_setup_plan_as_dict(plan))
             return
         _print_setup_plan(plan)
         if no_install:
@@ -8516,7 +8988,7 @@ def setup_command(
         if open_menu:
             _launch_menu(force=True)
     except (AtlasError, subprocess.CalledProcessError, RuntimeError) as exc:
-        _handle_error(exc, verbose=False)
+        _handle_error(exc, verbose=False, json_output=json_output)
         raise typer.Exit(1) from exc
 
 
@@ -8540,7 +9012,7 @@ def update_command(
     try:
         plan = build_update_plan()
         if json_output:
-            console.print_json(json.dumps(_update_plan_as_dict(plan)))
+            _print_json(_update_plan_as_dict(plan))
             return
         _print_update_plan(plan)
         if dry_run:
@@ -8551,7 +9023,7 @@ def update_command(
         if should_update:
             run_update_plan(plan)
     except (AtlasError, subprocess.CalledProcessError, RuntimeError) as exc:
-        _handle_error(exc, verbose=False)
+        _handle_error(exc, verbose=False, json_output=json_output)
         raise typer.Exit(1) from exc
 
 
@@ -8581,7 +9053,7 @@ def doctor(
 ) -> None:
     """Check runtime dependencies and writable paths."""
 
-    settings = _settings()
+    settings = _settings(json_output=json_output)
     plan_only = json_output or no_install
     report = run_doctor(settings, create_paths=False) if plan_only else run_doctor(settings)
     if network:
@@ -8589,15 +9061,13 @@ def doctor(
     network_failed = network and any(not check.ok for check in report.checks)
     if json_output and fix:
         plan = build_setup_plan(settings, mode=SetupMode.full)
-        console.print_json(
-            json.dumps(
-                {
-                    "doctor": report.model_dump(mode="json"),
-                    "setup_plan": _setup_plan_as_dict(plan),
-                }
-            )
+        _print_json(
+            {
+                "doctor": report.model_dump(mode="json"),
+                "setup_plan": _setup_plan_as_dict(plan),
+            }
         )
-        if not report.ok:
+        if not report.ok or network_failed:
             raise typer.Exit(1)
         return
     if json_output:
@@ -8605,7 +9075,7 @@ def doctor(
         if fix_certs:
             payload["certificate_repair"] = _certificate_repair_plan(report)
         output = payload if fix_certs or network else report.model_dump(mode="json")
-        console.print_json(json.dumps(output))
+        _print_json(output)
         if not report.ok or network_failed:
             raise typer.Exit(1)
         return

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from threading import Event, Lock
-from time import sleep
+from threading import Event, Lock, Timer
+from time import monotonic, sleep
+
+import pytest
 
 from atlas.adaptive import AdaptiveScheduler
 from atlas.batch import (
@@ -733,3 +735,177 @@ def test_run_batch_adaptive_skips_paused_host_without_blocking_queue(tmp_path: P
     assert not worker.is_alive()
     assert summaries
     assert summaries[0].succeeded == 2
+
+
+def test_run_batch_adaptive_skips_do_not_ramp_concurrency(tmp_path: Path) -> None:
+    batch_file = tmp_path / "urls.txt"
+    batch_file.write_text(
+        "\n".join(f"https://example.com/{index}" for index in range(8)),
+        encoding="utf-8",
+    )
+    scheduler = AdaptiveScheduler(
+        max_concurrency=6,
+        per_host_concurrency=6,
+        politeness=AdaptivePoliteness.normal,
+        min_concurrency=1,
+    )
+    scheduler.current_concurrency = 2
+
+    def handler(
+        entry: BatchEntry,
+        _progress_hooks: list[object] | None,
+    ) -> DownloadResult:
+        return DownloadResult(
+            status=DownloadStatus.skipped,
+            url=entry.url,
+            message="skipped by policy",
+        )
+
+    summary = run_batch_adaptive(
+        batch_file,
+        BatchKind.file,
+        handler,
+        scheduler=scheduler,
+    )
+
+    assert summary.succeeded == 0
+    assert summary.skipped == 8
+    assert scheduler.current_concurrency == 2
+
+
+def test_run_batch_adaptive_interrupt_cancels_work_and_releases_host_slots(
+    tmp_path: Path,
+) -> None:
+    batch_file = tmp_path / "urls.txt"
+    batch_file.write_text(
+        "https://example.com/one\nhttps://example.com/two\n",
+        encoding="utf-8",
+    )
+    scheduler = AdaptiveScheduler(
+        max_concurrency=2,
+        per_host_concurrency=2,
+        politeness=AdaptivePoliteness.normal,
+        min_concurrency=1,
+    )
+    scheduler.current_concurrency = 2
+    control = BatchControl()
+    second_started = Event()
+    second_canceled = Event()
+
+    def handler(
+        entry: BatchEntry,
+        _progress_hooks: list[object] | None,
+        context: BatchItemContext,
+    ) -> DownloadResult:
+        if entry.line_no == 1:
+            assert second_started.wait(1)
+            raise KeyboardInterrupt
+        second_started.set()
+        while not context.process_control.canceled:
+            sleep(0.001)
+        second_canceled.set()
+        raise RuntimeError("canceled")
+
+    with pytest.raises(KeyboardInterrupt):
+        run_batch_adaptive(
+            batch_file,
+            BatchKind.file,
+            handler,
+            scheduler=scheduler,
+            control=control,
+        )
+
+    assert second_canceled.wait(1)
+    assert control.snapshot()["active_lines"] == []
+    assert scheduler.can_start_for_host("example.com")
+
+
+def test_run_batch_concurrent_interrupt_waits_for_running_legacy_handler(
+    tmp_path: Path,
+) -> None:
+    batch_file = tmp_path / "urls.txt"
+    batch_file.write_text(
+        "https://example.com/one\nhttps://example.com/two\n",
+        encoding="utf-8",
+    )
+    second_started = Event()
+    release_second = Event()
+
+    def handler(
+        entry: BatchEntry,
+        _progress_hooks: list[object] | None,
+    ) -> DownloadResult:
+        if entry.line_no == 1:
+            assert second_started.wait(1)
+            raise KeyboardInterrupt
+        second_started.set()
+        assert release_second.wait(1)
+        return DownloadResult(status=DownloadStatus.success, url=entry.url, message="ok")
+
+    timer = Timer(0.15, release_second.set)
+    timer.start()
+    started = monotonic()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            run_batch_concurrent(
+                batch_file,
+                BatchKind.file,
+                handler,
+                concurrency=2,
+            )
+    finally:
+        timer.cancel()
+
+    assert monotonic() - started >= 0.1
+
+
+def test_run_batch_adaptive_interrupt_retains_host_slot_until_worker_stops(
+    tmp_path: Path,
+) -> None:
+    batch_file = tmp_path / "urls.txt"
+    batch_file.write_text(
+        "https://example.com/one\nhttps://example.com/two\n",
+        encoding="utf-8",
+    )
+    scheduler = AdaptiveScheduler(
+        max_concurrency=2,
+        per_host_concurrency=1,
+        politeness=AdaptivePoliteness.normal,
+        min_concurrency=1,
+    )
+    scheduler.current_concurrency = 2
+    second_started = Event()
+    release_second = Event()
+    slot_was_held = Event()
+
+    def handler(
+        entry: BatchEntry,
+        _progress_hooks: list[object] | None,
+    ) -> DownloadResult:
+        if entry.line_no == 1:
+            assert second_started.wait(1)
+            raise KeyboardInterrupt
+        second_started.set()
+        assert release_second.wait(1)
+        if not scheduler.can_start_for_host("two.example.com"):
+            slot_was_held.set()
+        return DownloadResult(status=DownloadStatus.success, url=entry.url, message="ok")
+
+    timer = Timer(0.15, release_second.set)
+    timer.start()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            run_batch_adaptive(
+                batch_file,
+                BatchKind.file,
+                handler,
+                scheduler=scheduler,
+                host_resolver=lambda entry: (
+                    "one.example.com" if entry.line_no == 1 else "two.example.com"
+                ),
+            )
+    finally:
+        timer.cancel()
+
+    assert slot_was_held.is_set()
+    assert scheduler.can_start_for_host("two.example.com")
