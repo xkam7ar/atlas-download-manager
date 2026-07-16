@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from urllib.error import URLError
 
 import pytest
 
+from atlas.aria2_rpc import Aria2RpcStartupError
 from atlas.backends import (
     FileDownloadEngine,
+    MirrorDownloadError,
     SiteMirrorEngine,
+    _curl_file_args,
+    _exact_directory_relative_url_path,
+    _write_http_metadata,
     filename_from_url,
     parse_wget2_stats_files,
     verify_checksum,
@@ -20,6 +26,7 @@ from atlas.models import (
     DirectFileProbe,
     DirectoryMirrorOptions,
     DownloadAttrMode,
+    DownloadResult,
     DownloadStatus,
     EngineKind,
     FileBackendChoice,
@@ -33,6 +40,7 @@ from atlas.models import (
     SiteBackendChoice,
     SiteDownloadOptions,
     VerifySigMode,
+    WorkItem,
 )
 from atlas.runner import ProcessCanceled, ProcessControl, SubprocessResult
 
@@ -289,6 +297,48 @@ def test_file_engine_subprocess_aria2_args_include_policy_options(
     assert "--uri-selector=adaptive" in args
 
 
+def test_file_engine_aria2_rpc_startup_fallback_runs_one_shot_download(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "archive.zip"
+    captured_args: list[str] = []
+
+    class FailedRpcSession:
+        @staticmethod
+        def redacted_command(executable: str = "aria2c", **_kwargs: object) -> list[str]:
+            return [executable, "--enable-rpc=true", "--rpc-secret=<redacted>"]
+
+        def __init__(self, **_kwargs: object) -> None:
+            return None
+
+        def download(self, *_args: object, **_kwargs: object) -> object:
+            raise Aria2RpcStartupError("RPC unavailable")
+
+    def fake_run_args_stream(args, *, on_line, timeout):
+        _ = on_line, timeout
+        captured_args.extend(args)
+        output.write_bytes(b"downloaded")
+        return SubprocessResult(args=list(args), returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.setattr("atlas.backends.Aria2RpcSession", FailedRpcSession)
+    monkeypatch.setattr("atlas.backends.run_args_stream", fake_run_args_stream)
+    options = FileDownloadOptions(
+        url="https://example.com/archive.zip",
+        output_dir=tmp_path,
+        backend=FileBackendChoice.aria2,
+    )
+
+    result = FileDownloadEngine().download(options)
+
+    assert result.status == DownloadStatus.success
+    assert "--enable-rpc=true" not in captured_args
+    assert "--rpc-secret=<redacted>" not in captured_args
+    assert captured_args[-1] == options.url
+    assert captured_args[captured_args.index("--out") + 1] == output.name
+
+
 def test_file_engine_auto_routes_metalink_to_aria2(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
     options = FileDownloadOptions(
@@ -423,9 +473,7 @@ def test_file_engine_retries_tls_chain_failure_with_verified_curl(
                         ),
                     )
                 )
-            raise EngineError(
-                "SSL/TLS handshake failure: unable to get local issuer certificate"
-            )
+            raise EngineError("SSL/TLS handshake failure: unable to get local issuer certificate")
 
     def fake_which(name: str) -> str | None:
         if name in {"aria2c", "curl"}:
@@ -474,6 +522,88 @@ def test_file_engine_retries_tls_chain_failure_with_verified_curl(
         ("done", EngineKind.curl, ProgressPhase.done),
     ]
     assert all(event.status not in {"error", "failed"} for event in events)
+
+
+def test_verified_curl_overwrite_does_not_resume_existing_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "archive.zip"
+    output.write_bytes(b"stale")
+    captured_args: list[str] = []
+
+    def fake_run_args_stream(args, *, on_line, timeout):
+        _ = on_line, timeout
+        captured_args.extend(args)
+        output.write_bytes(b"fresh")
+        return SubprocessResult(args=list(args), returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.setattr("atlas.backends.run_args_stream", fake_run_args_stream)
+    options = FileDownloadOptions(
+        url="https://example.com/archive.zip",
+        output_dir=tmp_path,
+        backend=FileBackendChoice.aria2,
+        continue_download=True,
+        overwrite=True,
+    )
+
+    result = FileDownloadEngine().download_with_verified_curl(
+        options,
+        output=output,
+        message="test fallback",
+    )
+
+    assert result.status == DownloadStatus.success
+    assert "--continue-at" not in captured_args
+    assert output.read_bytes() == b"fresh"
+
+
+def test_verified_curl_restarts_unvalidated_partial_output(tmp_path: Path) -> None:
+    output = tmp_path / "archive.zip"
+    output.write_bytes(b"partial")
+    options = FileDownloadOptions(
+        url="https://example.com/archive.zip",
+        output_dir=tmp_path,
+        continue_download=True,
+        probe=DirectFileProbe(
+            url="https://example.com/archive.zip",
+            content_length=100,
+            supports_ranges=True,
+            etag='"current"',
+        ),
+    )
+
+    args = _curl_file_args("/usr/bin/curl", options, output)
+
+    assert "--continue-at" not in args
+    assert not any("If-Range" in arg for arg in args)
+
+
+def test_verified_curl_resumes_only_with_matching_strong_validator(tmp_path: Path) -> None:
+    output = tmp_path / "archive.zip"
+    output.write_bytes(b"partial")
+    _write_http_metadata(
+        output,
+        url="https://example.com/archive.zip",
+        headers={"ETag": '"current"'},
+    )
+    options = FileDownloadOptions(
+        url="https://example.com/archive.zip",
+        output_dir=tmp_path,
+        continue_download=True,
+        probe=DirectFileProbe(
+            url="https://example.com/archive.zip",
+            content_length=100,
+            supports_ranges=True,
+            etag='"current"',
+        ),
+    )
+
+    args = _curl_file_args("/usr/bin/curl", options, output)
+
+    assert args[args.index("--continue-at") + 1] == "-"
+    assert 'If-Range: "current"' in args
 
 
 def test_file_engine_known_tls_probe_starts_directly_with_verified_curl(
@@ -526,6 +656,182 @@ def test_file_engine_known_tls_probe_starts_directly_with_verified_curl(
     ]
 
 
+def test_file_engine_hard_constraints_disable_preemptive_curl_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_native(
+        _self: FileDownloadEngine,
+        options: FileDownloadOptions,
+        _plan: object,
+        *,
+        progress_callback: object,
+        max_output_bytes: int | None,
+        required_url_scope: str | None,
+        deadline: float | None,
+    ) -> DownloadResult:
+        _ = progress_callback, deadline
+        seen.update(limit=max_output_bytes, scope=required_url_scope)
+        return DownloadResult(
+            status=DownloadStatus.success,
+            url=options.url,
+            message="native constraints preserved",
+        )
+
+    monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.setattr(FileDownloadEngine, "_download_native", fake_native)
+    monkeypatch.setattr(
+        FileDownloadEngine,
+        "_download_with_verified_curl_fallback",
+        lambda *_args, **_kwargs: pytest.fail("curl shortcut bypassed hard constraints"),
+    )
+    options = FileDownloadOptions(
+        url="https://example.com/root/archive.zip",
+        output_dir=tmp_path,
+        backend=FileBackendChoice.native,
+        probe=DirectFileProbe(
+            url="https://example.com/root/archive.zip",
+            error="TLS certificate verification failed",
+        ),
+    )
+
+    result = FileDownloadEngine().download(
+        options,
+        max_output_bytes=1024,
+        required_url_scope="https://example.com/root/",
+    )
+
+    assert result.status == DownloadStatus.success
+    assert seen == {"limit": 1024, "scope": "https://example.com/root/"}
+
+
+def test_file_engine_hard_constraints_disable_exception_curl_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fallback_called = False
+
+    def fail_native(*_args: object, **_kwargs: object) -> DownloadResult:
+        raise EngineError("SSL/TLS handshake failure: unable to get local issuer certificate")
+
+    def unexpected_fallback(*_args: object, **_kwargs: object) -> DownloadResult:
+        nonlocal fallback_called
+        fallback_called = True
+        raise AssertionError("curl fallback bypassed hard constraints")
+
+    monkeypatch.setattr(FileDownloadEngine, "_download_native", fail_native)
+    monkeypatch.setattr(
+        FileDownloadEngine,
+        "_download_with_curl_after_tls_failure",
+        unexpected_fallback,
+    )
+    options = FileDownloadOptions(
+        url="https://example.com/root/archive.zip",
+        output_dir=tmp_path,
+        backend=FileBackendChoice.native,
+    )
+
+    with pytest.raises(EngineError, match="SSL/TLS handshake failure"):
+        FileDownloadEngine().download(
+            options,
+            required_url_scope="https://example.com/root/",
+        )
+
+    assert fallback_called is False
+
+
+def test_native_file_engine_retries_transient_network_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    def flaky_urlopen(*_args: object, **_kwargs: object) -> _FakeResponse:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise URLError("temporary connection failure")
+        return _FakeResponse(b"ok", headers={"Content-Length": "2"})
+
+    monkeypatch.setattr("atlas.backends.urlopen", flaky_urlopen)
+    options = FileDownloadOptions(
+        url="http://files.example/archive.bin",
+        output_dir=tmp_path,
+        backend=FileBackendChoice.native,
+        filename="archive.bin",
+        max_tries=2,
+        retry_wait=0,
+    )
+
+    result = FileDownloadEngine().download(options)
+
+    assert result.status == DownloadStatus.success
+    assert attempts == 2
+    assert (tmp_path / "archive.bin").read_bytes() == b"ok"
+
+
+def test_native_file_engine_deadline_stops_slow_chunk_before_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"now": 0.0}
+
+    class SlowResponse(_FakeResponse):
+        def read(self, _size: int) -> bytes:
+            clock["now"] = 2.0
+            return b"late"
+
+    monkeypatch.setattr("atlas.backends.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        "atlas.backends.urlopen",
+        lambda *_args, **_kwargs: SlowResponse(
+            b"",
+            headers={"Content-Length": "4"},
+        ),
+    )
+    options = FileDownloadOptions(
+        url="http://files.example/archive.bin",
+        output_dir=tmp_path,
+        backend=FileBackendChoice.native,
+        filename="archive.bin",
+    )
+
+    with pytest.raises(EngineError, match="mirror max runtime"):
+        FileDownloadEngine().download(options, deadline=1.0)
+
+    assert (tmp_path / "archive.bin").read_bytes() == b""
+
+
+def test_native_rate_limit_cannot_sleep_past_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("atlas.backends.time.monotonic", lambda: 0.0)
+    monkeypatch.setattr(
+        "atlas.backends.time.sleep",
+        lambda _seconds: pytest.fail("rate limiter slept past hard deadline"),
+    )
+    monkeypatch.setattr(
+        "atlas.backends.urlopen",
+        lambda *_args, **_kwargs: _FakeResponse(
+            b"x",
+            headers={"Content-Length": "1"},
+        ),
+    )
+    options = FileDownloadOptions(
+        url="http://files.example/archive.bin",
+        output_dir=tmp_path,
+        backend=FileBackendChoice.native,
+        filename="archive.bin",
+        rate_limit="1",
+    )
+
+    with pytest.raises(EngineError, match="mirror max runtime"):
+        FileDownloadEngine().download(options, deadline=0.5)
+
+
 def test_file_engine_wget2_emits_progress_events(tmp_path: Path, monkeypatch) -> None:
     output = tmp_path / "archive.zip"
 
@@ -563,6 +869,26 @@ def test_file_engine_wget2_emits_progress_events(tmp_path: Path, monkeypatch) ->
     assert events[3].downloaded_bytes == 1024
 
 
+def test_file_engine_wget2_rejects_success_without_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_args_stream(args, *, on_line, timeout):
+        _ = on_line, timeout
+        return SubprocessResult(args=list(args), returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.setattr("atlas.backends.run_args_stream", fake_run_args_stream)
+    options = FileDownloadOptions(
+        url="https://example.com/archive.zip",
+        output_dir=tmp_path,
+        backend=FileBackendChoice.wget2,
+    )
+
+    with pytest.raises(EngineError, match="reported success but no regular output file"):
+        FileDownloadEngine().download(options)
+
+
 def test_native_resume_refuses_unverified_partial_file(
     tmp_path: Path,
     monkeypatch,
@@ -592,16 +918,23 @@ def test_native_resume_appends_only_after_range_confirmation(
 ) -> None:
     output = tmp_path / "archive.zip"
     output.write_bytes(b"hello ")
+    output.with_name("archive.zip.atlas-http.json").write_text(
+        '{"last_modified": "Wed, 21 Oct 2015 07:28:00 GMT"}\n',
+        encoding="utf-8",
+    )
     seen: dict[str, object] = {}
 
     def fake_urlopen(request, *, timeout):
         seen["range"] = request.headers.get("Range")
+        seen["if_range"] = request.headers.get("If-range")
+        seen["accept_encoding"] = request.headers.get("Accept-encoding")
         seen["timeout"] = timeout
         return _FakeResponse(
             b"world",
             status=206,
             headers={
                 "Content-Length": "5",
+                "Content-Range": "bytes 6-10/11",
                 "Last-Modified": "Wed, 21 Oct 2015 07:28:00 GMT",
             },
         )
@@ -624,7 +957,99 @@ def test_native_resume_appends_only_after_range_confirmation(
 
     assert result.status == DownloadStatus.success
     assert output.read_bytes() == b"hello world"
-    assert seen == {"range": "bytes=6-", "timeout": 12}
+    assert seen == {
+        "range": "bytes=6-",
+        "if_range": "Wed, 21 Oct 2015 07:28:00 GMT",
+        "accept_encoding": "identity",
+        "timeout": 12,
+    }
+
+
+def test_native_equal_length_without_identity_is_downloaded_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "archive.zip"
+    output.write_bytes(b"old")
+    output.with_name("archive.zip.atlas-http.json").write_text(
+        '{"etag": "\\"stored-only\\""}\n',
+        encoding="utf-8",
+    )
+    seen_ranges: list[str | None] = []
+
+    def fake_urlopen(request, *, timeout):
+        _ = timeout
+        seen_ranges.append(request.headers.get("Range"))
+        return _FakeResponse(b"new", headers={"Content-Length": "3"})
+
+    monkeypatch.setattr("atlas.backends.urlopen", fake_urlopen)
+    options = FileDownloadOptions(
+        url="https://example.com/archive.zip",
+        output_dir=tmp_path,
+        backend=FileBackendChoice.native,
+        probe=DirectFileProbe(
+            url="https://example.com/archive.zip",
+            content_length=3,
+            supports_ranges=True,
+        ),
+    )
+
+    result = FileDownloadEngine().download(options)
+
+    assert result.status == DownloadStatus.success
+    assert output.read_bytes() == b"new"
+    assert seen_ranges == [None]
+
+
+def test_native_resume_restarts_when_content_range_start_is_wrong(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "archive.zip"
+    output.write_bytes(b"hello ")
+    output.with_name("archive.zip.atlas-http.json").write_text(
+        '{"etag": "\\"v1\\""}\n',
+        encoding="utf-8",
+    )
+    seen_ranges: list[str | None] = []
+
+    def fake_urlopen(request, *, timeout):
+        _ = timeout
+        requested_range = request.headers.get("Range")
+        seen_ranges.append(requested_range)
+        if requested_range:
+            return _FakeResponse(
+                b"bad",
+                status=206,
+                headers={
+                    "Content-Length": "3",
+                    "Content-Range": "bytes 5-7/11",
+                    "ETag": '"v1"',
+                },
+            )
+        return _FakeResponse(
+            b"hello world",
+            headers={"Content-Length": "11", "ETag": '"v1"'},
+        )
+
+    monkeypatch.setattr("atlas.backends.urlopen", fake_urlopen)
+    options = FileDownloadOptions(
+        url="https://example.com/archive.zip",
+        output_dir=tmp_path,
+        backend=FileBackendChoice.native,
+        probe=DirectFileProbe(
+            url="https://example.com/archive.zip",
+            content_length=11,
+            supports_ranges=True,
+            etag='"v1"',
+        ),
+    )
+
+    result = FileDownloadEngine().download(options)
+
+    assert result.status == DownloadStatus.success
+    assert output.read_bytes() == b"hello world"
+    assert seen_ranges == ["bytes=6-", None]
 
 
 def test_native_timestamping_skips_current_local_file(
@@ -829,6 +1254,26 @@ def test_native_download_rejects_size_mismatch(
         FileDownloadEngine().download(options)
 
 
+def test_file_engine_rejects_known_download_larger_than_free_space(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    usage = type("DiskUsage", (), {"free": 1024})()
+    monkeypatch.setattr("atlas.backends.shutil.disk_usage", lambda _path: usage)
+    options = FileDownloadOptions(
+        url="https://example.com/archive.zip",
+        output_dir=tmp_path,
+        backend=FileBackendChoice.native,
+        probe=DirectFileProbe(
+            url="https://example.com/archive.zip",
+            content_length=2048,
+        ),
+    )
+
+    with pytest.raises(EngineError, match="Insufficient free space"):
+        FileDownloadEngine().download(options)
+
+
 def test_verify_checksum_accepts_matching_digest(tmp_path: Path) -> None:
     path = tmp_path / "sample.txt"
     path.write_text("hello\n", encoding="utf-8")
@@ -938,6 +1383,399 @@ def test_directory_engine_builds_bounded_file_tree_plan(
     assert plan.args.index("--level=2") > plan.args.index("--mirror")
     assert plan.args[-1] == options.url
     assert any("open HTTP directory" in warning for warning in plan.warnings)
+
+
+def test_directory_engine_downloads_exact_text_index_file_list(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[FileDownloadOptions] = []
+
+    def fake_download(
+        _self: FileDownloadEngine,
+        options: FileDownloadOptions,
+        **_kwargs: object,
+    ) -> DownloadResult:
+        seen.append(options)
+        options.output_dir.mkdir(parents=True, exist_ok=True)
+        (options.output_dir / str(options.filename)).write_text("ok", encoding="utf-8")
+        return DownloadResult(
+            status=DownloadStatus.success,
+            url=options.url,
+            message="saved",
+        )
+
+    monkeypatch.setattr(FileDownloadEngine, "download", fake_download)
+    options = DirectoryMirrorOptions(
+        url="https://files.example/root/",
+        output_dir=tmp_path / "mirror",
+        exact_directory_index=True,
+        exact_directory_items=(
+            WorkItem(
+                url="https://files.example/root/sub/readme.txt",
+                kind=HubKind.file,
+                filename="sub/readme.txt",
+            ),
+        ),
+    )
+
+    result = SiteMirrorEngine().mirror(options)
+
+    assert result.status == DownloadStatus.success
+    assert result.ydl_opts is not None
+    assert result.ydl_opts["backend"] == "native-exact-index"
+    assert seen[0].backend == FileBackendChoice.native
+    assert seen[0].output_dir == tmp_path / "mirror" / "sub"
+    assert seen[0].filename == "readme.txt"
+
+
+def test_directory_engine_cancels_during_exact_index_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = ProcessControl()
+
+    def fake_download(
+        _self: FileDownloadEngine,
+        options: FileDownloadOptions,
+        *,
+        progress_callback,
+        **_kwargs: object,
+    ) -> DownloadResult:
+        control.cancel("operator stop")
+        assert progress_callback is not None
+        progress_callback(
+            ProgressEvent(
+                engine=EngineKind.native,
+                status="downloading",
+                phase=ProgressPhase.download,
+                kind=HubKind.file,
+                filename=str(options.filename),
+                url=options.url,
+                downloaded_bytes=1,
+            )
+        )
+        return DownloadResult(
+            status=DownloadStatus.success,
+            url=options.url,
+            message="saved",
+        )
+
+    monkeypatch.setattr(FileDownloadEngine, "download", fake_download)
+    options = DirectoryMirrorOptions(
+        url="https://files.example/root/",
+        output_dir=tmp_path / "mirror",
+        exact_directory_index=True,
+        exact_directory_items=(
+            WorkItem(
+                url="https://files.example/root/readme.txt",
+                kind=HubKind.file,
+                filename="readme.txt",
+            ),
+        ),
+    )
+
+    with pytest.raises(MirrorDownloadError, match="Mirror canceled: operator stop"):
+        SiteMirrorEngine().mirror(options, progress_callback=lambda _event: None, control=control)
+
+
+def test_directory_engine_rejects_exact_index_symlink_escape(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    output = tmp_path / "mirror"
+    output.mkdir()
+    (output / "sub").symlink_to(outside, target_is_directory=True)
+    options = DirectoryMirrorOptions(
+        url="https://files.example/root/",
+        output_dir=output,
+        exact_directory_index=True,
+        exact_directory_items=(
+            WorkItem(
+                url="https://files.example/root/sub/readme.txt",
+                kind=HubKind.file,
+                filename="sub/readme.txt",
+            ),
+        ),
+    )
+
+    with pytest.raises(MirrorDownloadError, match="escapes through a symlink"):
+        SiteMirrorEngine().mirror(options)
+
+    assert not (outside / "readme.txt").exists()
+
+
+def test_directory_engine_rejects_exact_index_file_directory_collision(
+    tmp_path: Path,
+) -> None:
+    options = DirectoryMirrorOptions(
+        url="https://files.example/root/",
+        output_dir=tmp_path / "mirror",
+        exact_directory_index=True,
+        exact_directory_items=(
+            WorkItem(
+                url="https://files.example/root/bundle",
+                kind=HubKind.file,
+                filename="bundle",
+            ),
+            WorkItem(
+                url="https://files.example/root/bundle/readme.txt",
+                kind=HubKind.file,
+                filename="bundle/readme.txt",
+            ),
+        ),
+    )
+
+    with pytest.raises(MirrorDownloadError, match="collide as files and folders"):
+        SiteMirrorEngine().mirror(options)
+
+
+def test_directory_engine_rejects_unicode_normalization_collision(tmp_path: Path) -> None:
+    composed = "caf\N{LATIN SMALL LETTER E WITH ACUTE}.txt"
+    decomposed = "cafe\N{COMBINING ACUTE ACCENT}.txt"
+    options = DirectoryMirrorOptions(
+        url="https://files.example/root/",
+        output_dir=tmp_path / "mirror",
+        exact_directory_index=True,
+        exact_directory_items=(
+            WorkItem(
+                url=f"https://files.example/root/{composed}",
+                kind=HubKind.file,
+                filename=composed,
+            ),
+            WorkItem(
+                url=f"https://files.example/root/{decomposed}",
+                kind=HubKind.file,
+                filename=decomposed,
+            ),
+        ),
+    )
+
+    with pytest.raises(MirrorDownloadError, match="collide as files and folders"):
+        SiteMirrorEngine().mirror(options)
+
+
+def test_directory_engine_recomputes_exact_index_scope_and_redacts_url(
+    tmp_path: Path,
+) -> None:
+    options = DirectoryMirrorOptions(
+        url="https://files.example/root/",
+        output_dir=tmp_path / "mirror",
+        exact_directory_index=True,
+        exact_directory_items=(
+            WorkItem(
+                url=("https://evil.example/root/archive.bin?X-Amz-Signature=do-not-leak"),
+                kind=HubKind.file,
+                filename="archive.bin",
+                same_host=True,
+                external_host=False,
+            ),
+        ),
+    )
+
+    with pytest.raises(MirrorDownloadError, match="escaped the requested origin") as raised:
+        SiteMirrorEngine().mirror(options)
+
+    assert "do-not-leak" not in str(raised.value)
+    assert "<redacted>" in str(raised.value)
+
+
+def test_directory_engine_rejects_exact_index_redirect_outside_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "atlas.backends.urlopen",
+        lambda _request, *, timeout: _FakeResponse(
+            b"evil",
+            headers={"Content-Length": "4"},
+            url="https://evil.example/root/archive.bin",
+        ),
+    )
+    options = DirectoryMirrorOptions(
+        url="https://files.example/root/",
+        output_dir=tmp_path / "mirror",
+        exact_directory_index=True,
+        exact_directory_items=(
+            WorkItem(
+                url="https://files.example/root/archive.bin",
+                kind=HubKind.file,
+                filename="archive.bin",
+                content_length=4,
+            ),
+        ),
+    )
+
+    with pytest.raises(MirrorDownloadError, match="escaped the requested origin"):
+        SiteMirrorEngine().mirror(options)
+
+    assert not (tmp_path / "mirror" / "archive.bin").exists()
+
+
+def test_directory_engine_rejects_double_encoded_redirect_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "atlas.backends.urlopen",
+        lambda _request, *, timeout: _FakeResponse(
+            b"evil",
+            headers={"Content-Length": "4"},
+            url="https://files.example/root/%252e%252e/secret.bin",
+        ),
+    )
+    options = DirectoryMirrorOptions(
+        url="https://files.example/root/",
+        output_dir=tmp_path / "mirror",
+        exact_directory_index=True,
+        exact_directory_items=(
+            WorkItem(
+                url="https://files.example/root/archive.bin",
+                kind=HubKind.file,
+                filename="archive.bin",
+                content_length=4,
+            ),
+        ),
+    )
+
+    with pytest.raises(MirrorDownloadError, match="Unsafe directory index URL refused"):
+        SiteMirrorEngine().mirror(options)
+
+    assert not (tmp_path / "mirror" / "archive.bin").exists()
+
+
+def test_exact_directory_scope_preserves_valid_literal_percent_filename() -> None:
+    relative = _exact_directory_relative_url_path(
+        "https://files.example/root/",
+        "https://files.example/root/100%25-free.txt",
+    )
+
+    assert relative.as_posix() == "100%-free.txt"
+
+
+def test_directory_engine_enforces_exact_index_file_and_size_limits(tmp_path: Path) -> None:
+    items = (
+        WorkItem(
+            url="https://files.example/root/one.bin",
+            kind=HubKind.file,
+            filename="one.bin",
+            content_length=800,
+        ),
+        WorkItem(
+            url="https://files.example/root/two.bin",
+            kind=HubKind.file,
+            filename="two.bin",
+            content_length=800,
+        ),
+    )
+    base = {
+        "url": "https://files.example/root/",
+        "output_dir": tmp_path / "mirror",
+        "exact_directory_index": True,
+        "exact_directory_items": items,
+    }
+
+    with pytest.raises(MirrorDownloadError, match="exceeding max-files 1"):
+        SiteMirrorEngine().mirror(DirectoryMirrorOptions(**base, max_files=1))
+    with pytest.raises(MirrorDownloadError, match=r"exceeding.*total-size limit 1K"):
+        SiteMirrorEngine().mirror(DirectoryMirrorOptions(**base, max_total_size="1K"))
+
+
+def test_directory_engine_hard_caps_stale_exact_index_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "atlas.backends.urlopen",
+        lambda _request, *, timeout: _FakeResponse(
+            b"x" * 2048,
+            headers={"Content-Length": "512"},
+        ),
+    )
+    output = tmp_path / "mirror" / "archive.bin"
+    options = DirectoryMirrorOptions(
+        url="https://files.example/root/",
+        output_dir=output.parent,
+        max_total_size="1K",
+        exact_directory_index=True,
+        exact_directory_items=(
+            WorkItem(
+                url="https://files.example/root/archive.bin",
+                kind=HubKind.file,
+                filename="archive.bin",
+                content_length=512,
+            ),
+        ),
+    )
+
+    with pytest.raises(MirrorDownloadError, match="1024-byte output limit"):
+        SiteMirrorEngine().mirror(options)
+
+    assert output.stat().st_size <= 1024
+
+
+def test_directory_engine_refuses_unbounded_exact_index_when_size_limit_set(
+    tmp_path: Path,
+) -> None:
+    options = DirectoryMirrorOptions(
+        url="https://files.example/root/",
+        output_dir=tmp_path / "mirror",
+        max_total_size="1G",
+        exact_directory_index=True,
+        exact_directory_items=(
+            WorkItem(
+                url="https://files.example/root/unknown.bin",
+                kind=HubKind.file,
+                filename="unknown.bin",
+            ),
+        ),
+    )
+
+    with pytest.raises(MirrorDownloadError, match="limit cannot be guaranteed"):
+        SiteMirrorEngine().mirror(options)
+
+
+def test_directory_engine_checks_exact_index_free_space(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    usage = type("DiskUsage", (), {"free": 1000})()
+    monkeypatch.setattr("atlas.backends.shutil.disk_usage", lambda _path: usage)
+    options = DirectoryMirrorOptions(
+        url="https://files.example/root/",
+        output_dir=tmp_path / "mirror",
+        exact_directory_index=True,
+        exact_directory_items=(
+            WorkItem(
+                url="https://files.example/root/one.bin",
+                kind=HubKind.file,
+                filename="one.bin",
+                content_length=700,
+            ),
+            WorkItem(
+                url="https://files.example/root/two.bin",
+                kind=HubKind.file,
+                filename="two.bin",
+                content_length=700,
+            ),
+        ),
+    )
+
+    with pytest.raises(EngineError, match="Insufficient free space"):
+        SiteMirrorEngine().mirror(options)
+
+
+def test_directory_engine_refuses_non_http_exact_index_url(tmp_path: Path) -> None:
+    options = DirectoryMirrorOptions(
+        url="https://files.example/root/",
+        output_dir=tmp_path / "mirror",
+        exact_directory_index=True,
+        exact_directory_items=(
+            WorkItem(url="file:///etc/passwd", kind=HubKind.file, filename="passwd"),
+        ),
+    )
+
+    with pytest.raises(MirrorDownloadError, match="Unsafe directory index URL"):
+        SiteMirrorEngine().mirror(options)
 
 
 def test_site_engine_builds_wget2_policy_plan(tmp_path: Path, monkeypatch) -> None:
@@ -1232,6 +2070,48 @@ def test_site_mirror_stops_on_max_runtime(
         SiteMirrorEngine().mirror(options)
 
 
+def test_site_mirror_runtime_budget_includes_discovery_time(tmp_path: Path) -> None:
+    options = SiteDownloadOptions(
+        url="https://example.com/docs/",
+        output_dir=tmp_path,
+        backend=SiteBackendChoice.wget2,
+        max_runtime=5,
+        planning_runtime_seconds=5,
+    )
+
+    with pytest.raises(MirrorDownloadError, match="discovery used the available budget"):
+        SiteMirrorEngine().mirror(options)
+
+
+def test_site_mirror_timeout_preserves_wget2_stats(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
+
+    def timeout(args, **_kwargs):
+        for arg in args:
+            if arg.startswith("--stats-site=csv:"):
+                Path(arg.split(":", 1)[1]).write_text(
+                    "host,files\nexample.com,2\n",
+                    encoding="utf-8",
+                )
+        raise subprocess.TimeoutExpired(args, 1.5)
+
+    monkeypatch.setattr("atlas.backends.run_args_stream", timeout)
+    options = SiteDownloadOptions(
+        url="https://example.com/docs/",
+        output_dir=tmp_path / "mirror",
+        backend=SiteBackendChoice.wget2,
+        max_runtime=1.5,
+    )
+
+    with pytest.raises(EngineError, match="max runtime") as raised:
+        SiteMirrorEngine().mirror(options)
+
+    assert raised.value.stats["summary"]["site"]["urls"] == 1
+
+
 def test_site_mirror_reports_operator_cancellation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1240,6 +2120,12 @@ def test_site_mirror_reports_operator_cancellation(
 
     def canceled(args, *, on_line, timeout, control):
         _ = on_line, timeout
+        for arg in args:
+            if arg.startswith("--stats-site=csv:"):
+                Path(arg.split(":", 1)[1]).write_text(
+                    "host,files\nexample.com,1\n",
+                    encoding="utf-8",
+                )
         assert isinstance(control, ProcessControl)
         control.cancel("operator stop")
         raise ProcessCanceled(args, control.reason)
@@ -1252,7 +2138,7 @@ def test_site_mirror_reports_operator_cancellation(
     )
     events: list[ProgressEvent] = []
 
-    with pytest.raises(EngineError, match="Mirror canceled: operator stop"):
+    with pytest.raises(EngineError, match="Mirror canceled: operator stop") as raised:
         SiteMirrorEngine().mirror(
             options,
             progress_callback=events.append,
@@ -1260,6 +2146,89 @@ def test_site_mirror_reports_operator_cancellation(
         )
 
     assert [event.status for event in events] == ["starting", "canceled"]
+    assert raised.value.stats["summary"]["site"]["urls"] == 1
+
+
+def test_fresh_mirror_rejects_success_without_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.setattr(
+        "atlas.backends.run_args_stream",
+        lambda args, **_kwargs: SubprocessResult(
+            args=list(args),
+            returncode=0,
+            stdout="",
+            stderr="",
+        ),
+    )
+    options = DirectoryMirrorOptions(
+        url="https://example.com/docs/",
+        output_dir=tmp_path / "mirror",
+        backend=SiteBackendChoice.wget2,
+    )
+
+    with pytest.raises(EngineError, match="no downloaded payload"):
+        SiteMirrorEngine().mirror(options)
+
+
+def test_mirror_spider_does_not_require_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.setattr(
+        "atlas.backends.run_args_stream",
+        lambda args, **_kwargs: SubprocessResult(
+            args=list(args),
+            returncode=0,
+            stdout="",
+            stderr="",
+        ),
+    )
+    options = SiteDownloadOptions(
+        url="https://example.com/docs/",
+        output_dir=tmp_path / "mirror",
+        backend=SiteBackendChoice.wget2,
+        spider=True,
+    )
+
+    result = SiteMirrorEngine().mirror(options)
+
+    assert result.status == DownloadStatus.success
+    assert result.ydl_opts is not None
+    assert result.ydl_opts["payload_required"] is False
+
+
+def test_idempotent_mirror_with_existing_payload_is_skipped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "mirror"
+    output.mkdir()
+    (output / "index.html").write_text("stable", encoding="utf-8")
+    monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.setattr(
+        "atlas.backends.run_args_stream",
+        lambda args, **_kwargs: SubprocessResult(
+            args=list(args),
+            returncode=0,
+            stdout="",
+            stderr="",
+        ),
+    )
+    options = DirectoryMirrorOptions(
+        url="https://example.com/docs/",
+        output_dir=output,
+        backend=SiteBackendChoice.wget2,
+    )
+
+    result = SiteMirrorEngine().mirror(options)
+
+    assert result.status == DownloadStatus.skipped
+    assert result.ydl_opts is not None
+    assert result.ydl_opts["no_change"] is True
 
 
 def test_site_engine_input_file_only_plan_omits_positional_url(
@@ -1362,6 +2331,7 @@ def test_site_dry_run_can_plan_without_wget2(tmp_path: Path, monkeypatch) -> Non
 def test_site_engine_emits_wget_events(tmp_path: Path, monkeypatch) -> None:
     def fake_run_args_stream(args, *, on_line, timeout):
         on_line("index.html 50% [======>      ]")
+        (tmp_path / "index.html").write_text("downloaded", encoding="utf-8")
         return SubprocessResult(args=list(args), returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
@@ -1388,6 +2358,7 @@ def test_site_engine_parses_wget2_stats(tmp_path: Path, monkeypatch) -> None:
     def fake_run_args_stream(args, *, on_line, timeout):
         _ = timeout
         on_line("index.html 100% [============>]")
+        (tmp_path / "index.html").write_text("downloaded", encoding="utf-8")
         for arg in args:
             if arg.startswith("--stats-site=csv:"):
                 Path(arg.split(":", 1)[1]).write_text(
@@ -1446,6 +2417,7 @@ def test_site_engine_reports_wget2_stats_on_error(tmp_path: Path, monkeypatch) -
     assert "downloaded 1.0 KB before exit" in message
     assert "1 failed URL" in message
     assert "404 https://example.com/missing.pdf" in message
+    assert raised.value.stats["summary"]["site"]["failures"] == 1
 
 
 def test_site_engine_exports_browser_cookies_for_wget2(
@@ -1466,6 +2438,7 @@ def test_site_engine_exports_browser_cookies_for_wget2(
         cookie_arg = next(arg for arg in args if arg.startswith("--load-cookies="))
         cookie_path = Path(cookie_arg.split("=", 1)[1])
         assert cookie_path.read_text(encoding="utf-8").endswith("sid\tsecret\n")
+        (tmp_path / "index.html").write_text("downloaded", encoding="utf-8")
         return SubprocessResult(args=list(args), returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")

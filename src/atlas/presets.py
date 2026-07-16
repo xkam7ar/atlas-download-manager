@@ -10,6 +10,7 @@ from typing import Any, Protocol, cast
 from yt_dlp.utils import DateRange, download_range_func, match_filter_func, parse_duration
 
 from atlas.config import AtlasSettings
+from atlas.errors import PlanningError
 from atlas.models import (
     AudioCodec,
     AudioDownloadOptions,
@@ -20,7 +21,7 @@ from atlas.models import (
 )
 from atlas.planner import SmartPlanner
 from atlas.redaction import is_sensitive_key, text_contains_secret
-from atlas.urls import is_explicit_playlist_url
+from atlas.urls import is_explicit_playlist_url, is_youtube_collection_url
 
 ProgressHook = Callable[[dict[str, Any]], None]
 PostprocessorHook = Callable[[dict[str, Any]], None]
@@ -34,6 +35,7 @@ class YtdlpLogger(Protocol):
     def warning(self, msg: str) -> None: ...
 
     def error(self, msg: str) -> None: ...
+
 
 OUTTMPL = "%(uploader|unknown)s/%(upload_date>%Y-%m-%d|unknown)s - %(title).200B [%(id)s].%(ext)s"
 DEFAULT_VIDEO_FORMAT = "bestvideo*+bestaudio/best"
@@ -240,9 +242,7 @@ def _postprocessors_for_media(
 ) -> list[dict[str, Any]]:
     postprocessors: list[dict[str, Any]] = []
     if embed_metadata:
-        postprocessors.append(
-            {"key": "FFmpegMetadata", "add_chapters": True, "add_metadata": True}
-        )
+        postprocessors.append({"key": "FFmpegMetadata", "add_chapters": True, "add_metadata": True})
     if write_thumbnail and embed_thumbnail:
         postprocessors.append({"key": "EmbedThumbnail", "already_have_thumbnail": False})
     return postprocessors
@@ -264,8 +264,8 @@ def _base_download_opts(
         "continuedl": plan.continue_download,
         "overwrites": plan.overwrite,
         "ignoreerrors": "only_download" if plan.ignore_unavailable_playlist_entries else False,
-        "no_warnings": not plan.verbose,
-        "quiet": not plan.verbose,
+        "no_warnings": plan.json_output or not plan.verbose,
+        "quiet": plan.json_output or not plan.verbose,
         "noprogress": True,
         "windowsfilenames": not plan.restrict_filenames,
         "restrictfilenames": plan.restrict_filenames,
@@ -380,7 +380,18 @@ def _subtitle_opts(plan: DownloadPlan) -> dict[str, Any]:
 
 
 def _effective_playlist(url: str, requested: bool) -> bool:
-    return requested and is_explicit_playlist_url(url)
+    return requested and (is_explicit_playlist_url(url) or is_youtube_collection_url(url))
+
+
+def _has_finite_playlist_bound(playlist_items: str | None, playlist_end: int | None) -> bool:
+    if playlist_end is not None:
+        return True
+    if not playlist_items:
+        return False
+    return all(
+        "-" not in segment or bool(segment.partition("-")[2])
+        for segment in playlist_items.split(",")
+    )
 
 
 def build_video_opts(
@@ -452,12 +463,36 @@ class PresetBuilder:
 
 
 def build_info_opts(options: InfoOptions, logger: YtdlpLogger | None = None) -> dict[str, Any]:
+    effective_playlist = _effective_playlist(options.url, options.playlist)
+    if is_youtube_collection_url(options.url):
+        if not options.playlist:
+            raise PlanningError(
+                "This is a YouTube collection URL. Pass --playlist and a finite selection "
+                "bound such as --playlist-items 1-10 or --playlist-end 10."
+            )
+        if not _has_finite_playlist_bound(options.playlist_items, options.playlist_end):
+            raise PlanningError(
+                "YouTube collection probes require a finite selection bound such as "
+                "--playlist-items 1-10 or --playlist-end 10."
+            )
     opts: dict[str, Any] = {
-        "quiet": not options.verbose,
-        "no_warnings": not options.verbose,
+        "quiet": options.json_output or not options.verbose,
+        "no_warnings": options.json_output or not options.verbose,
         "skip_download": True,
-        "noplaylist": not _effective_playlist(options.url, options.playlist),
+        "noplaylist": not effective_playlist,
     }
+    if effective_playlist:
+        if options.playlist_items:
+            opts["playlist_items"] = options.playlist_items
+        if options.playlist_start is not None:
+            opts["playliststart"] = options.playlist_start
+        if options.playlist_end is not None:
+            opts["playlistend"] = options.playlist_end
+        if options.flat_playlist:
+            opts["extract_flat"] = "in_playlist"
+            opts["lazy_playlist"] = True
+    if options.socket_timeout is not None:
+        opts["socket_timeout"] = options.socket_timeout
     cookies = _cookies_from_browser(options.browser_cookies)
     if cookies:
         opts["cookiesfrombrowser"] = cookies

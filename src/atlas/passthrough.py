@@ -11,6 +11,7 @@ from typing import Any
 
 from atlas.errors import EngineError
 from atlas.runner import ProcessControl, SubprocessResult, run_args, run_args_stream
+from atlas.setup import install_hint_for_tool
 
 
 class BackendTool(StrEnum):
@@ -97,10 +98,4 @@ def _backend_executable(tool: BackendTool) -> list[str]:
 
 
 def _install_hint(tool: BackendTool) -> str:
-    if tool == BackendTool.aria2:
-        return "brew install aria2"
-    if tool == BackendTool.wget2:
-        return "brew install wget2"
-    if tool == BackendTool.wget:
-        return "brew install wget"
-    return "uv tool install ."
+    return install_hint_for_tool(tool.value)

@@ -23,7 +23,12 @@ from atlas.presets import (
     build_video_opts,
     redact_ydl_opts,
 )
-from atlas.urls import is_explicit_playlist_url
+from atlas.urls import (
+    YoutubeUrlKind,
+    classify_youtube_url,
+    is_explicit_playlist_url,
+    is_youtube_collection_url,
+)
 
 
 def test_video_preset_defaults(tmp_path: Path) -> None:
@@ -44,6 +49,24 @@ def test_video_preset_defaults(tmp_path: Path) -> None:
     assert opts["writethumbnail"] is True
     assert opts["download_archive"] == str(settings.archive_file)
     assert OUTTMPL in opts["outtmpl"]
+
+
+def test_json_media_preset_stays_quiet_even_when_verbose(tmp_path: Path) -> None:
+    settings = AtlasSettings(output_dir=tmp_path, archive_file=tmp_path / "archive.txt")
+    opts = build_video_opts(
+        VideoDownloadOptions(
+            url="https://example.com/watch?v=1",
+            output_dir=tmp_path,
+            archive_file=settings.archive_file,
+            json_output=True,
+            verbose=True,
+        ),
+        settings,
+    )
+
+    assert opts["quiet"] is True
+    assert opts["no_warnings"] is True
+    assert opts["noprogress"] is True
 
 
 def test_preset_builder_exposes_video_and_audio_opts(tmp_path: Path) -> None:
@@ -412,6 +435,42 @@ def test_info_options_include_cookie_file(tmp_path: Path) -> None:
     assert opts["cookiefile"] == str(cookie_file)
 
 
+def test_info_options_bound_and_flatten_youtube_collection_probe() -> None:
+    opts = build_info_opts(
+        InfoOptions(
+            url="https://www.youtube.com/@AveryYapps/videos",
+            playlist=True,
+            playlist_items="2-4",
+            playlist_start=2,
+            playlist_end=4,
+            socket_timeout=8,
+            flat_playlist=True,
+            verbose=True,
+            json_output=True,
+        )
+    )
+
+    assert opts["noplaylist"] is False
+    assert opts["playlist_items"] == "2-4"
+    assert opts["playliststart"] == 2
+    assert opts["playlistend"] == 4
+    assert opts["socket_timeout"] == 8
+    assert opts["extract_flat"] == "in_playlist"
+    assert opts["lazy_playlist"] is True
+    assert opts["quiet"] is True
+    assert opts["no_warnings"] is True
+
+
+def test_info_options_reject_unbounded_youtube_collection_probe() -> None:
+    with pytest.raises(PlanningError, match="finite selection bound"):
+        build_info_opts(
+            InfoOptions(
+                url="https://www.youtube.com/@AveryYapps/videos",
+                playlist=True,
+            )
+        )
+
+
 def test_explicit_youtube_playlist_url_can_enable_playlist(tmp_path: Path) -> None:
     settings = AtlasSettings(output_dir=tmp_path, archive_file=tmp_path / "archive.txt")
     options = VideoDownloadOptions(
@@ -448,3 +507,29 @@ def test_playlist_url_classifier() -> None:
         is False
     )
     assert is_explicit_playlist_url("https://youtu.be/abc123?list=PL123") is False
+
+
+@pytest.mark.parametrize(
+    ("url", "kind"),
+    [
+        ("https://www.youtube.com/playlist?list=PL123", YoutubeUrlKind.playlist),
+        (
+            "https://www.youtube.com/watch?v=abc&list=RDabc&start_radio=1",
+            YoutubeUrlKind.watch_playlist_context,
+        ),
+        ("https://youtu.be/abc123", YoutubeUrlKind.single),
+        ("https://www.youtube.com/@AveryYapps/videos", YoutubeUrlKind.collection),
+        (
+            "https://www.youtube.com/channel/UCU28LWFMn1GN0coMTBFTo2w/shorts",
+            YoutubeUrlKind.collection,
+        ),
+        ("https://www.youtube.com/feed/subscriptions", YoutubeUrlKind.collection),
+        ("https://example.com/channel/videos", YoutubeUrlKind.other),
+    ],
+)
+def test_youtube_url_classifier_distinguishes_collections(
+    url: str,
+    kind: YoutubeUrlKind,
+) -> None:
+    assert classify_youtube_url(url) == kind
+    assert is_youtube_collection_url(url) is (kind == YoutubeUrlKind.collection)

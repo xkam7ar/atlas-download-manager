@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import importlib.util
+import os
 import ssl
 import sys
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ from atlas.models import DoctorCheck, DoctorReport
 from atlas.network import FetchClient, FetchError, FetchOptions
 from atlas.paths import cache_dir, config_dir, data_dir, ensure_app_dirs, log_dir
 from atlas.runner import run_args
+from atlas.setup import install_hint_for_tool
 
 
 @dataclass(frozen=True)
@@ -134,7 +136,16 @@ def _ytdlp_version(module: ModuleType) -> str:
         return "unknown"
 
 
-def _writable_dir(path: Path) -> tuple[bool, str]:
+def _writable_dir(path: Path, *, mutate: bool = True) -> tuple[bool, str]:
+    if not mutate:
+        if path.exists():
+            ok = path.is_dir() and os.access(path, os.W_OK | os.X_OK)
+            return ok, str(path) if ok else f"not writable: {path}"
+        parent = path.parent
+        while not parent.exists() and parent != parent.parent:
+            parent = parent.parent
+        ok = parent.is_dir() and os.access(parent, os.W_OK | os.X_OK)
+        return ok, str(path) if ok else f"parent is not writable: {parent}"
     try:
         path.mkdir(parents=True, exist_ok=True)
         probe = path / ".atlas-write-test"
@@ -152,8 +163,13 @@ def _package_version() -> str:
         return __version__
 
 
-def run_doctor(settings: AtlasSettings) -> DoctorReport:
-    ensure_app_dirs()
+def run_doctor(
+    settings: AtlasSettings,
+    *,
+    create_paths: bool = True,
+) -> DoctorReport:
+    if create_paths:
+        ensure_app_dirs()
     checks: list[DoctorCheck] = []
 
     python_ok = sys.version_info >= (3, 12)
@@ -199,6 +215,19 @@ def run_doctor(settings: AtlasSettings) -> DoctorReport:
             else None,
         )
     )
+    mutagen_available = _module_available("mutagen")
+    checks.append(
+        DoctorCheck(
+            name="mutagen",
+            ok=mutagen_available,
+            detail="audio artwork embedding available" if mutagen_available else "not importable",
+            hint=(
+                "Reinstall atlas so its required mutagen dependency is present."
+                if not mutagen_available
+                else None
+            ),
+        )
+    )
 
     for tool in ("ffmpeg", "ffprobe"):
         version = _tool_version(tool)
@@ -208,7 +237,7 @@ def run_doctor(settings: AtlasSettings) -> DoctorReport:
                 ok=version is not None,
                 detail=version or "not found",
                 hint=(
-                    f"Install with `brew install ffmpeg` to provide {tool}."
+                    f"Install with `{install_hint_for_tool(tool)}` to provide {tool}."
                     if version is None
                     else None
                 ),
@@ -223,7 +252,8 @@ def run_doctor(settings: AtlasSettings) -> DoctorReport:
             required=False,
             detail=aria2_version or "not found",
             hint=(
-                "Optional: install with `brew install aria2` for segmented files, "
+                f"Optional: install with `{install_hint_for_tool('aria2c')}` for "
+                "segmented files, "
                 "Metalink manifests, and shared batch queues."
             ),
         )
@@ -234,9 +264,7 @@ def run_doctor(settings: AtlasSettings) -> DoctorReport:
             ok=aria2_version is not None,
             required=False,
             detail=(
-                "available via aria2c JSON-RPC"
-                if aria2_version is not None
-                else "aria2c not found"
+                "available via aria2c JSON-RPC" if aria2_version is not None else "aria2c not found"
             ),
             hint="Install `aria2c` to expand .meta4/.metalink files and queue file batches."
             if aria2_version is None
@@ -251,7 +279,9 @@ def run_doctor(settings: AtlasSettings) -> DoctorReport:
             ok=wget2_capabilities is not None,
             required=False,
             detail=wget2_capabilities.detail if wget2_capabilities else "not found",
-            hint="Optional: install with `brew install wget2` for website mirroring.",
+            hint=(
+                f"Optional: install with `{install_hint_for_tool('wget2')}` for website mirroring."
+            ),
         )
     )
     if wget2_capabilities is not None:
@@ -273,7 +303,10 @@ def run_doctor(settings: AtlasSettings) -> DoctorReport:
             ok=wget_version is not None,
             required=False,
             detail=wget_version or "not found",
-            hint="Optional: install with `brew install wget` for website mirroring fallback.",
+            hint=(
+                f"Optional: install with `{install_hint_for_tool('wget')}` for "
+                "website mirroring fallback."
+            ),
         )
     )
 
@@ -284,7 +317,7 @@ def run_doctor(settings: AtlasSettings) -> DoctorReport:
         ("log dir", log_dir()),
         ("output dir", settings.output_dir),
     ):
-        ok, detail = _writable_dir(directory)
+        ok, detail = _writable_dir(directory, mutate=create_paths)
         checks.append(
             DoctorCheck(
                 name=label,

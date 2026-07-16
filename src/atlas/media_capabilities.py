@@ -269,9 +269,7 @@ class MediaCapabilityResolver:
                 CapabilityStatus.fallback,
                 container="mp4",
                 format_sort=("ext:mp4:m4a", "res", "fps"),
-                warnings=(
-                    "No H.264 or HEVC MP4 stream was found; using the nearest MP4 source.",
-                ),
+                warnings=("No H.264 or HEVC MP4 stream was found; using the nearest MP4 source.",),
             )
         source = _best_under_height(self.catalog.video_formats, 1080) or _first(
             self.catalog.video_formats

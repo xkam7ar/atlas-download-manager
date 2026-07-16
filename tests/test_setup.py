@@ -8,11 +8,14 @@ import pytest
 
 from atlas.config import AtlasSettings
 from atlas.setup import (
+    PackageManager,
     SetupEnvironment,
     SetupMode,
     apply_setup_plan,
     build_setup_plan,
     build_update_plan,
+    detect_setup_environment,
+    install_hint_for_tool,
     selected_tools,
 )
 
@@ -142,7 +145,7 @@ def test_apply_setup_plan_runs_install_commands_when_requested(
     assert commands == [("/opt/homebrew/bin/brew", "install", "ffmpeg")]
 
 
-def test_no_homebrew_plan_is_manual_and_non_installing(tmp_path: Path) -> None:
+def test_missing_homebrew_plan_bootstraps_after_approval(tmp_path: Path) -> None:
     settings = AtlasSettings(output_dir=tmp_path / "out", archive_file=tmp_path / "archive.txt")
     env = SetupEnvironment(
         os_name="macOS",
@@ -156,11 +159,21 @@ def test_no_homebrew_plan_is_manual_and_non_installing(tmp_path: Path) -> None:
 
     plan = build_setup_plan(settings, env=env, which=lambda _name: None)
 
-    assert plan.can_install is False
-    assert plan.install_commands == ()
+    assert plan.can_install is True
+    assert plan.install_commands[0][:2] == ("/bin/bash", "-c")
+    assert plan.install_commands[1] == (
+        "/opt/homebrew/bin/brew",
+        "install",
+        "ffmpeg",
+        "aria2",
+        "wget2",
+        "wget",
+    )
     assert any("Homebrew/install/HEAD/install.sh" in command for command in plan.manual_commands)
-    assert "brew install ffmpeg aria2 wget2 wget" in plan.manual_commands
-    assert "Homebrew was not detected" in " ".join(plan.notes)
+    assert any(
+        command.endswith("brew install ffmpeg aria2 wget2 wget") for command in plan.manual_commands
+    )
+    assert "Homebrew will be installed" in " ".join(plan.notes)
 
 
 def test_linux_manual_plan_does_not_include_homebrew_installer(tmp_path: Path) -> None:
@@ -177,8 +190,179 @@ def test_linux_manual_plan_does_not_include_homebrew_installer(tmp_path: Path) -
 
     plan = build_setup_plan(settings, env=env, which=lambda _name: None)
 
-    assert any(command.startswith("sudo apt install") for command in plan.manual_commands)
+    assert any(command.startswith("sudo apt-get install") for command in plan.manual_commands)
     assert not any("Homebrew/install/HEAD" in command for command in plan.manual_commands)
+
+
+@pytest.mark.parametrize(
+    ("executable", "manager"),
+    [
+        ("apt-get", PackageManager.apt),
+        ("dnf", PackageManager.dnf),
+        ("pacman", PackageManager.pacman),
+    ],
+)
+def test_detect_setup_environment_prefers_native_linux_manager(
+    executable: str,
+    manager: PackageManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("atlas.setup._os_label", lambda: "Linux")
+    paths = {
+        executable: f"/usr/bin/{executable}",
+        "brew": "/home/linuxbrew/.linuxbrew/bin/brew",
+        "sudo": "/usr/bin/sudo",
+    }
+
+    environment = detect_setup_environment(
+        which=lambda name: paths.get(name),
+        is_root=False,
+    )
+
+    assert environment.package_manager == manager
+    assert environment.package_manager_path == f"/usr/bin/{executable}"
+    assert environment.elevation_tool == "/usr/bin/sudo"
+    assert environment.is_root is False
+
+
+def test_apt_plan_updates_metadata_and_installs_only_missing_packages(tmp_path: Path) -> None:
+    settings = AtlasSettings(output_dir=tmp_path / "out", archive_file=tmp_path / "archive.txt")
+    environment = SetupEnvironment(
+        os_name="Linux",
+        architecture="x86_64",
+        shell="bash",
+        package_manager=PackageManager.apt,
+        package_manager_path="/usr/bin/apt-get",
+        install_method="uv-tool",
+        atlas_executable="/home/user/.local/bin/atlas",
+        elevation_tool="/usr/bin/sudo",
+    )
+
+    plan = build_setup_plan(
+        settings,
+        env=environment,
+        which=lambda name: f"/usr/bin/{name}" if name in {"ffmpeg", "ffprobe"} else None,
+    )
+
+    assert plan.install_commands == (
+        ("/usr/bin/sudo", "/usr/bin/apt-get", "update"),
+        (
+            "/usr/bin/sudo",
+            "/usr/bin/apt-get",
+            "install",
+            "-y",
+            "aria2",
+            "wget2",
+            "wget",
+        ),
+    )
+
+
+def test_dnf_plan_uses_fedora_package_names_without_sudo_for_root(tmp_path: Path) -> None:
+    settings = AtlasSettings(output_dir=tmp_path / "out", archive_file=tmp_path / "archive.txt")
+    environment = SetupEnvironment(
+        os_name="Linux",
+        architecture="x86_64",
+        shell="bash",
+        package_manager=PackageManager.dnf,
+        package_manager_path="/usr/bin/dnf",
+        install_method="uv-tool",
+        atlas_executable="/root/.local/bin/atlas",
+        is_root=True,
+    )
+
+    plan = build_setup_plan(settings, env=environment, which=lambda _name: None)
+
+    assert plan.install_commands == (
+        (
+            "/usr/bin/dnf",
+            "install",
+            "-y",
+            "ffmpeg-free",
+            "aria2",
+            "wget2",
+            "wget1-wget",
+        ),
+    )
+
+
+def test_pacman_plan_bootstraps_linuxbrew_for_wget2(tmp_path: Path) -> None:
+    settings = AtlasSettings(output_dir=tmp_path / "out", archive_file=tmp_path / "archive.txt")
+    environment = SetupEnvironment(
+        os_name="Linux",
+        architecture="x86_64",
+        shell="bash",
+        package_manager=PackageManager.pacman,
+        package_manager_path="/usr/bin/pacman",
+        install_method="uv-tool",
+        atlas_executable="/home/user/.local/bin/atlas",
+        elevation_tool="/usr/bin/sudo",
+    )
+
+    plan = build_setup_plan(settings, env=environment, which=lambda _name: None)
+
+    assert plan.install_commands[0] == (
+        "/usr/bin/sudo",
+        "/usr/bin/pacman",
+        "-S",
+        "--needed",
+        "--noconfirm",
+        "ffmpeg",
+        "aria2",
+        "wget",
+        "base-devel",
+        "procps-ng",
+        "curl",
+        "file",
+        "git",
+    )
+    assert plan.install_commands[1][:2] == ("/bin/bash", "-c")
+    assert plan.install_commands[2] == (
+        "/home/linuxbrew/.linuxbrew/bin/brew",
+        "install",
+        "wget2",
+    )
+    assert "Linuxbrew" in " ".join(plan.notes)
+
+
+def test_native_linux_plan_requires_root_or_sudo(tmp_path: Path) -> None:
+    settings = AtlasSettings(output_dir=tmp_path / "out", archive_file=tmp_path / "archive.txt")
+    environment = SetupEnvironment(
+        os_name="Linux",
+        architecture="x86_64",
+        shell="bash",
+        package_manager=PackageManager.apt,
+        package_manager_path="/usr/bin/apt-get",
+        install_method="unknown",
+        atlas_executable=None,
+    )
+
+    plan = build_setup_plan(settings, env=environment, which=lambda _name: None)
+
+    assert plan.can_install is False
+    assert plan.install_commands == ()
+    assert any(command.startswith("sudo /usr/bin/apt-get") for command in plan.manual_commands)
+    assert "Root access or sudo" in " ".join(plan.notes)
+
+
+def test_install_hint_uses_detected_manager() -> None:
+    environment = SetupEnvironment(
+        os_name="Linux",
+        architecture="x86_64",
+        shell="bash",
+        package_manager=PackageManager.dnf,
+        package_manager_path="/usr/bin/dnf",
+        install_method="unknown",
+        atlas_executable=None,
+        elevation_tool="/usr/bin/sudo",
+    )
+
+    assert install_hint_for_tool("ffmpeg", environment=environment) == (
+        "sudo dnf install -y ffmpeg-free"
+    )
+    assert install_hint_for_tool("wget", environment=environment) == (
+        "sudo dnf install -y wget1-wget"
+    )
 
 
 def test_install_script_no_install_does_not_require_homebrew(tmp_path: Path) -> None:
@@ -199,8 +383,10 @@ def test_install_script_no_install_does_not_require_homebrew(tmp_path: Path) -> 
 
     output = result.stdout + result.stderr
     assert result.returncode == 0
-    assert "Homebrew was not found" in output
-    assert "atlas is not on PATH yet" in output
+    assert "Package manager: none" in output
+    assert "Homebrew/install/HEAD/install.sh" in output
+    assert "Plan only; no changes made." in output
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_update_plan_uses_install_method_specific_commands(

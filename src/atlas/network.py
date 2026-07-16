@@ -41,6 +41,10 @@ class FetchResponse:
     headers: dict[str, str]
     body: bytes
     warnings: tuple[str, ...] = ()
+    body_truncated: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "headers", _normalize_response_headers(self.headers))
 
 
 @dataclass(frozen=True)
@@ -104,7 +108,7 @@ class FetchClient:
                 and method.upper() == "GET"
                 and exc.failure.code == FetchErrorCode.tls_cert_verify_failed
             ):
-                fallback = self._get_with_tool(url, opts)
+                fallback = self._get_with_tool(url, opts, body_limit=body_limit)
                 if fallback is not None:
                     return FetchResponse(
                         url=fallback.url,
@@ -112,9 +116,8 @@ class FetchClient:
                         status_code=fallback.status_code,
                         headers=fallback.headers,
                         body=fallback.body,
-                        warnings=(
-                            "Python TLS verification failed; scanned using curl fallback.",
-                        ),
+                        warnings=("Python TLS verification failed; scanned using curl fallback.",),
+                        body_truncated=fallback.body_truncated,
                     )
             raise
 
@@ -137,12 +140,14 @@ class FetchClient:
                 timeout=options.timeout,
                 context=_ssl_context(options),
             ) as response:
+                raw_body = response.read(body_limit + 1) if body_limit > 0 else b""
                 return FetchResponse(
                     url=url,
                     final_url=response.geturl(),
                     status_code=getattr(response, "status", 200),
                     headers=dict(response.headers.items()),
-                    body=response.read(body_limit) if body_limit > 0 else b"",
+                    body=raw_body[:body_limit] if body_limit > 0 else b"",
+                    body_truncated=body_limit > 0 and len(raw_body) > body_limit,
                 )
         except HTTPError as exc:
             raise FetchError(
@@ -173,11 +178,17 @@ class FetchClient:
                 )
             ) from exc
 
-    def _get_with_tool(self, url: str, options: FetchOptions) -> FetchResponse | None:
+    def _get_with_tool(
+        self,
+        url: str,
+        options: FetchOptions,
+        *,
+        body_limit: int,
+    ) -> FetchResponse | None:
         curl = which("curl")
         if curl is None:
             return None
-        return _fetch_with_curl(curl, url, options)
+        return _fetch_with_curl(curl, url, options, body_limit=body_limit)
 
 
 def scan_error_code_from_fetch(code: FetchErrorCode) -> ScanErrorCode:
@@ -214,6 +225,19 @@ def _request_headers(options: FetchOptions) -> dict[str, str]:
     return headers
 
 
+def _normalize_response_headers(headers: dict[str, str]) -> dict[str, str]:
+    normalized: dict[str, str] = {}
+    for raw_name, value in headers.items():
+        name = raw_name.strip()
+        if not name:
+            continue
+        canonical = "-".join(part.capitalize() for part in name.split("-"))
+        if name.casefold() == "etag":
+            canonical = "ETag"
+        normalized[canonical] = value
+    return normalized
+
+
 def _failure_from_url_error(url: str, exc: URLError) -> FetchFailure:
     if _is_tls_certificate_error(exc):
         return FetchFailure(
@@ -241,7 +265,13 @@ def _is_tls_certificate_error(exc: BaseException) -> bool:
     )
 
 
-def _fetch_with_curl(curl: str, url: str, options: FetchOptions) -> FetchResponse | None:
+def _fetch_with_curl(
+    curl: str,
+    url: str,
+    options: FetchOptions,
+    *,
+    body_limit: int,
+) -> FetchResponse | None:
     with tempfile.TemporaryDirectory(prefix="atlas-fetch-") as tmp:
         tmp_path = Path(tmp)
         header_path = tmp_path / "headers.txt"
@@ -266,6 +296,15 @@ def _fetch_with_curl(curl: str, url: str, options: FetchOptions) -> FetchRespons
         ]
         for raw in options.headers:
             command.extend(["--header", raw])
+        if body_limit > 0:
+            command.extend(
+                [
+                    "--range",
+                    f"0-{body_limit}",
+                    "--max-filesize",
+                    str(body_limit + 1),
+                ]
+            )
         if options.proxy:
             command.extend(["--proxy", options.proxy])
         command.append(url)
@@ -273,7 +312,9 @@ def _fetch_with_curl(curl: str, url: str, options: FetchOptions) -> FetchRespons
             result = run_args(command, timeout=options.timeout + 5)
         except (OSError, TimeoutExpired):
             return None
-        if result.returncode != 0:
+        # curl exits 63 when --max-filesize stops a server that ignored Range.
+        # Preserve a bounded partial response so callers can reject it as truncated.
+        if result.returncode not in {0, 63}:
             return None
         lines = [line for line in result.stdout.splitlines() if line.strip()]
         final_url = lines[-2] if len(lines) >= 2 else url
@@ -281,12 +322,25 @@ def _fetch_with_curl(curl: str, url: str, options: FetchOptions) -> FetchRespons
             status_code = int(lines[-1]) if lines else 200
         except ValueError:
             status_code = 200
+        if body_path.exists() and body_limit > 0:
+            with body_path.open("rb") as body_file:
+                raw_body = body_file.read(body_limit + 1)
+        else:
+            raw_body = b""
+        response_headers = (
+            _parse_curl_headers(header_path.read_text(encoding="utf-8", errors="replace"))
+            if header_path.exists()
+            else {}
+        )
         return FetchResponse(
             url=url,
             final_url=final_url,
             status_code=status_code,
-            headers=_parse_curl_headers(header_path.read_text(encoding="utf-8", errors="replace")),
-            body=body_path.read_bytes(),
+            headers=response_headers,
+            body=raw_body[:body_limit] if body_limit > 0 else b"",
+            body_truncated=(
+                body_limit > 0 and (result.returncode == 63 or len(raw_body) > body_limit)
+            ),
         )
 
 

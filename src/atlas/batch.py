@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from inspect import Parameter, signature
 from pathlib import Path
-from threading import BoundedSemaphore, Condition, Lock
+from threading import Condition
 from typing import Any
 from urllib.parse import urlparse
 
@@ -54,7 +54,7 @@ class BatchOperatorResult:
 
 
 class BatchControl:
-    """Thread-safe operator controls checked before starting batch items."""
+    """Thread-safe operator controls for queued and controllable active items."""
 
     def __init__(self) -> None:
         self._condition = Condition()
@@ -120,6 +120,24 @@ class BatchControl:
                 ):
                     return None
                 self._condition.wait(timeout=0.1)
+
+    def start_is_blocked(self, entry: BatchEntry, *, host: str | None = None) -> bool:
+        """Return whether operator pause state currently blocks a pending item."""
+
+        with self._condition:
+            if self._cancel_reason_locked(entry) is not None:
+                return False
+            return (
+                self._global_paused
+                or entry.line_no in self._paused_lines
+                or (host is not None and host in self._paused_hosts)
+            )
+
+    def wait_for_change(self, timeout: float = 0.1) -> None:
+        """Wait briefly for an operator control state transition."""
+
+        with self._condition:
+            self._condition.wait(timeout=timeout)
 
     def register_active(
         self,
@@ -296,28 +314,55 @@ def run_batch_concurrent(
 
     results: list[BatchItemResult] = []
     worker_count = min(concurrency, len(entries))
-    guarded_handler = _host_guarded_entry_runner(
-        handler,
-        per_host_concurrency=per_host_concurrency,
-        host_resolver=host_resolver,
-        control=control,
-    )
-    if worker_count == 1:
-        results = [
-            guarded_handler(entry, progress_hook_factory)
-            for entry in entries
-        ]
-    else:
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            future_by_entry = {
-                executor.submit(
-                    guarded_handler,
-                    entry,
-                    progress_hook_factory,
-                ): entry
-                for entry in entries
-            }
-            for future in as_completed(future_by_entry):
+    unrestricted_queue = per_host_concurrency is None and control is None
+    pending = list(reversed(entries)) if unrestricted_queue else list(entries)
+    active: dict[Future[BatchItemResult], str] = {}
+    active_by_host: dict[str, int] = {}
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        while pending or active:
+            while pending and len(active) < worker_count:
+                selected_index = (
+                    len(pending) - 1
+                    if unrestricted_queue
+                    else _next_concurrent_entry_index(
+                        pending,
+                        active_by_host=active_by_host,
+                        per_host_concurrency=per_host_concurrency,
+                        host_resolver=host_resolver,
+                        control=control,
+                    )
+                )
+                if selected_index is None:
+                    break
+                entry = pending.pop(selected_index)
+                host = _resolved_entry_host(entry, host_resolver) or "unknown"
+                active_by_host[host] = active_by_host.get(host, 0) + 1
+                try:
+                    future = executor.submit(
+                        _run_batch_entry,
+                        entry,
+                        handler,
+                        progress_hook_factory,
+                        control,
+                        host,
+                    )
+                except BaseException:
+                    _release_concurrent_host(active_by_host, host)
+                    raise
+                active[future] = host
+            if not active:
+                if control is not None and _all_pending_entries_paused(
+                    pending,
+                    host_resolver=host_resolver,
+                    control=control,
+                ):
+                    control.wait_for_change()
+                    continue
+                raise BatchError("Batch scheduler could not start any pending URL")
+            done, _not_done = wait(active, return_when=FIRST_COMPLETED)
+            for future in done:
+                host = active.pop(future)
+                _release_concurrent_host(active_by_host, host)
                 results.append(future.result())
 
     for item in sorted(results, key=lambda result: result.entry.line_no):
@@ -361,6 +406,13 @@ def run_batch_adaptive(
                 control=control,
             )
             if not active:
+                if control is not None and _all_pending_entries_paused(
+                    pending,
+                    host_resolver=host_resolver,
+                    control=control,
+                ):
+                    control.wait_for_change()
+                    continue
                 raise BatchError("Adaptive batch scheduler could not start any pending URL")
             done, _not_done = wait(active, return_when=FIRST_COMPLETED)
             for future in done:
@@ -368,57 +420,42 @@ def run_batch_adaptive(
                 slot.release()
                 result = future.result()
                 results.append(result)
-                _record_adaptive_batch_result(scheduler, result)
+                _record_adaptive_batch_result(scheduler, result, host=slot.host)
 
     for item in sorted(results, key=lambda result: result.entry.line_no):
         _add_result(summary, item)
     return summary
 
 
-def _host_guarded_entry_runner(
-    handler: ConcurrentBatchHandler,
+def _next_concurrent_entry_index(
+    entries: list[BatchEntry],
     *,
+    active_by_host: dict[str, int],
     per_host_concurrency: int | None,
     host_resolver: BatchHostResolver | None,
     control: BatchControl | None,
-) -> Callable[[BatchEntry, BatchProgressHookFactory | None], BatchItemResult]:
-    if per_host_concurrency is None:
-        return lambda entry, progress_hook_factory: _run_batch_entry(
-            entry,
-            handler,
-            progress_hook_factory,
-            control=control,
-        )
+) -> int | None:
+    for index, entry in enumerate(entries):
+        host = _resolved_entry_host(entry, host_resolver) or "unknown"
+        if control is not None and control.start_is_blocked(entry, host=host):
+            continue
+        if per_host_concurrency is None or active_by_host.get(host, 0) < per_host_concurrency:
+            return index
+    return None
 
-    lock = Lock()
-    semaphores: dict[str, BoundedSemaphore] = {}
 
-    def run(
-        entry: BatchEntry,
-        progress_hook_factory: BatchProgressHookFactory | None,
-    ) -> BatchItemResult:
-        host = (host_resolver(entry) if host_resolver else _entry_host(entry)) or "unknown"
-        if control is not None:
-            reason = control.wait_for_start(entry, host=host)
-            if reason is not None:
-                return _canceled_batch_result(entry, reason)
-        with lock:
-            semaphore = semaphores.setdefault(host, BoundedSemaphore(per_host_concurrency))
-        with semaphore:
-            return _run_batch_entry(
-                entry,
-                handler,
-                progress_hook_factory,
-                control=control,
-                host=host,
-            )
-
-    return run
+def _release_concurrent_host(active_by_host: dict[str, int], host: str) -> None:
+    remaining = active_by_host[host] - 1
+    if remaining:
+        active_by_host[host] = remaining
+    else:
+        del active_by_host[host]
 
 
 @dataclass
 class _AdaptiveBatchSlot:
     context: AbstractContextManager[None]
+    host: str | None
 
     def release(self) -> None:
         self.context.__exit__(None, None, None)
@@ -442,6 +479,7 @@ def _submit_adaptive_ready_items(
             pending,
             scheduler=scheduler,
             host_resolver=host_resolver,
+            control=control,
         )
         if selected_index is None:
             return
@@ -461,7 +499,7 @@ def _submit_adaptive_ready_items(
         except BaseException:
             context.__exit__(None, None, None)
             raise
-        active[future] = _AdaptiveBatchSlot(context)
+        active[future] = _AdaptiveBatchSlot(context, host)
 
 
 def _next_adaptive_entry_index(
@@ -469,11 +507,30 @@ def _next_adaptive_entry_index(
     *,
     scheduler: AdaptiveScheduler,
     host_resolver: BatchHostResolver | None,
+    control: BatchControl | None,
 ) -> int | None:
     for index, entry in enumerate(entries):
-        if scheduler.can_start_for_host(_resolved_entry_host(entry, host_resolver)):
+        host = _resolved_entry_host(entry, host_resolver)
+        if control is not None and control.start_is_blocked(entry, host=host):
+            continue
+        if scheduler.can_start_for_host(host):
             return index
     return None
+
+
+def _all_pending_entries_paused(
+    entries: list[BatchEntry],
+    *,
+    host_resolver: BatchHostResolver | None,
+    control: BatchControl,
+) -> bool:
+    return bool(entries) and all(
+        control.start_is_blocked(
+            entry,
+            host=_resolved_entry_host(entry, host_resolver),
+        )
+        for entry in entries
+    )
 
 
 def _resolved_entry_host(
@@ -486,10 +543,11 @@ def _resolved_entry_host(
 def _record_adaptive_batch_result(
     scheduler: AdaptiveScheduler,
     result: BatchItemResult,
+    *,
+    host: str | None,
 ) -> None:
     if result.status == DownloadStatus.canceled:
         return
-    host = _entry_host(result.entry)
     if result.status in {DownloadStatus.success, DownloadStatus.dry_run, DownloadStatus.skipped}:
         scheduler.record_success(host=host)
         return

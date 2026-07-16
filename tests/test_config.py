@@ -153,9 +153,9 @@ def test_load_config_from_toml(tmp_path: Path) -> None:
                 "dir_if_modified_since = true",
                 "dir_timestamping = false",
                 "site_robots = false",
-                "site_domains = \"example.com\"",
+                'site_domains = "example.com"',
                 "site_max_files = 100",
-                "site_max_total_size = \"10M\"",
+                'site_max_total_size = "10M"',
                 "site_max_runtime = 300.0",
             ]
         ),

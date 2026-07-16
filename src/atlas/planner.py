@@ -21,13 +21,16 @@ from atlas.models import (
     VideoCodecChoice,
     VideoDownloadOptions,
 )
-from atlas.urls import is_explicit_playlist_url, is_watch_url_with_playlist_params
+from atlas.urls import (
+    is_explicit_playlist_url,
+    is_watch_url_with_playlist_params,
+    is_youtube_collection_url,
+)
 
 DEFAULT_VIDEO_FORMAT = "bestvideo*+bestaudio/best"
 DEFAULT_AUDIO_FORMAT = "bestaudio/best"
 DEFAULT_OUTTMPL = (
-    "%(uploader|unknown)s/%(upload_date>%Y-%m-%d|unknown)s - "
-    "%(title).200B [%(id)s].%(ext)s"
+    "%(uploader|unknown)s/%(upload_date>%Y-%m-%d|unknown)s - %(title).200B [%(id)s].%(ext)s"
 )
 
 
@@ -40,7 +43,7 @@ class SmartPlanner:
     def plan_video(self, request: VideoDownloadOptions) -> DownloadPlan:
         effective_playlist = _effective_playlist(request.url, request.playlist)
         container = _resolve_container(request.container, request.quality)
-        _validate_playlist_intent(request.url, request.playlist)
+        _validate_playlist_intent(request)
         _validate_video_intent(request, container)
         return DownloadPlan(
             url=request.url,
@@ -68,7 +71,7 @@ class SmartPlanner:
 
     def plan_audio(self, request: AudioDownloadOptions) -> DownloadPlan:
         effective_playlist = _effective_playlist(request.url, request.playlist)
-        _validate_playlist_intent(request.url, request.playlist)
+        _validate_playlist_intent(request)
         postprocessors: list[dict[str, object]] = []
         if not request.skip_download:
             postprocessors.append(
@@ -163,6 +166,7 @@ def _common_plan_kwargs(
         "sponsorblock_chapter_title": request.sponsorblock_chapter_title,
         "sponsorblock_api": request.sponsorblock_api,
         "playlist_url_detected": is_explicit_playlist_url(request.url),
+        "youtube_collection_url_detected": is_youtube_collection_url(request.url),
         "watch_playlist_params_detected": is_watch_url_with_playlist_params(request.url),
         "planner_notes": _planner_notes(request, effective_playlist),
         "playlist_items": request.playlist_items if effective_playlist else None,
@@ -172,6 +176,7 @@ def _common_plan_kwargs(
         "sub_lang": request.sub_lang,
         "embed_subs": request.embed_subs,
         "split_chapters": request.split_chapters,
+        "json_output": request.json_output,
         "verbose": request.verbose,
     }
 
@@ -206,17 +211,43 @@ def _validate_video_intent(request: VideoDownloadOptions, container: Container) 
         raise PlanningError("compatible quality can use auto, h264, or hevc video codecs.")
 
 
-def _validate_playlist_intent(url: str, requested: bool) -> None:
-    if requested or not is_explicit_playlist_url(url):
+def _validate_playlist_intent(
+    request: VideoDownloadOptions | AudioDownloadOptions,
+) -> None:
+    if is_explicit_playlist_url(request.url):
+        if request.playlist:
+            return
+        raise PlanningError(
+            "This is an explicit playlist URL. Use atlas playlist URL --type video|audio, "
+            "or pass --playlist to atlas video/audio after confirming playlist intent."
+        )
+    if not is_youtube_collection_url(request.url):
         return
-    raise PlanningError(
-        "This is an explicit playlist URL. Use atlas playlist URL --type video|audio, "
-        "or pass --playlist to atlas video/audio after confirming playlist intent."
-    )
+    if not request.playlist:
+        raise PlanningError(
+            "This is a YouTube collection URL. Pass --playlist and a finite selection bound "
+            "such as --playlist-items 1-10 or --playlist-end 10."
+        )
+    if not _has_finite_playlist_bound(request.playlist_items, request.playlist_end):
+        raise PlanningError(
+            "YouTube collection downloads require a finite selection bound such as "
+            "--playlist-items 1-10 or --playlist-end 10."
+        )
 
 
 def _effective_playlist(url: str, requested: bool) -> bool:
-    return requested and is_explicit_playlist_url(url)
+    return requested and (is_explicit_playlist_url(url) or is_youtube_collection_url(url))
+
+
+def _has_finite_playlist_bound(playlist_items: str | None, playlist_end: int | None) -> bool:
+    if playlist_end is not None:
+        return True
+    if not playlist_items:
+        return False
+    return all(
+        "-" not in segment or bool(segment.partition("-")[2])
+        for segment in playlist_items.split(",")
+    )
 
 
 def _planner_notes(
@@ -225,7 +256,10 @@ def _planner_notes(
 ) -> list[str]:
     notes: list[str] = []
     if effective_playlist:
-        notes.append("explicit playlist URL accepted")
+        if is_youtube_collection_url(request.url):
+            notes.append("bounded YouTube collection URL accepted")
+        else:
+            notes.append("explicit playlist URL accepted")
         if request.ignore_unavailable_playlist_entries:
             notes.append("removed or private playlist entries will be skipped")
     elif is_watch_url_with_playlist_params(request.url):

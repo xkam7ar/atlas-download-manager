@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import re
 import shutil
+from collections import deque
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
+from time import monotonic
+from urllib.parse import unquote, urlparse
 
 from atlas.adaptive import (
     AdaptiveScheduler,
@@ -33,6 +37,7 @@ from atlas.models import (
     SiteBackendChoice,
     SiteDownloadOptions,
     VideoDownloadOptions,
+    WorkItem,
 )
 from atlas.planner import SmartPlanner
 from atlas.redaction import redact_command_args
@@ -55,6 +60,14 @@ _SIZE_LIMIT_UNITS = {
     "G": 1024**3,
     "T": 1024**4,
 }
+_EXACT_DIRECTORY_SCAN_TYPES = {
+    "directory-style text index",
+    "directory-style CopyParty HTML index",
+}
+_EXACT_DIRECTORY_MAX_FILES = 2_000
+_EXACT_DIRECTORY_MAX_PAGES = 512
+
+
 @dataclass(frozen=True)
 class HubExecutionPlan:
     route: EngineRoute
@@ -724,8 +737,13 @@ class DownloadOptimizer:
         )
 
     def _optimize_site_options(self, options: SiteDownloadOptions) -> SiteDownloadOptions:
-        if not (options.adaptive or options.explain):
+        is_directory = isinstance(options, DirectoryMirrorOptions)
+        if not (options.adaptive or options.explain or (is_directory and not options.dry_run)):
             return options
+        planning_started = monotonic()
+        deadline = (
+            planning_started + options.max_runtime if options.max_runtime is not None else None
+        )
         controls = default_adaptive_controls(
             enabled=True,
             max_concurrency=options.max_concurrency,
@@ -733,24 +751,69 @@ class DownloadOptimizer:
             politeness=options.politeness,
             dry_run=options.dry_run,
         )
-        item = scan_site(options.url, dry_run=options.dry_run)
-        _enforce_mirror_scan_limits(options, item)
-        plan_kind = HubKind.dir if isinstance(options, DirectoryMirrorOptions) else HubKind.site
+        if deadline is None:
+            item = scan_site(options.url, dry_run=options.dry_run)
+        else:
+            item = scan_site(
+                options.url,
+                dry_run=options.dry_run,
+                timeout=_directory_scan_timeout(options, deadline),
+            )
+        exact_items: tuple[WorkItem, ...] | None = None
+        if isinstance(options, DirectoryMirrorOptions) and (
+            item.scan_type in _EXACT_DIRECTORY_SCAN_TYPES
+        ):
+            exact_items = _collect_exact_directory_items(options, item, deadline=deadline)
+        else:
+            _enforce_mirror_scan_limits(options, item)
+        planning_runtime_seconds = options.planning_runtime_seconds + max(
+            0.0,
+            monotonic() - planning_started,
+        )
+        if not (options.adaptive or options.explain) and exact_items is None:
+            return options.model_copy(update={"planning_runtime_seconds": planning_runtime_seconds})
+        plan_kind = HubKind.dir if is_directory else HubKind.site
         if plan_kind == HubKind.dir:
             item = item.model_copy(update={"kind": HubKind.dir})
-        plan_items = plan_items_from_site_scan(item, kind=plan_kind)
+        plan_items = (
+            list(exact_items)
+            if exact_items is not None
+            else plan_items_from_site_scan(item, kind=plan_kind)
+        )
         adaptive_plan = AdaptiveScheduler(
             max_concurrency=controls.max_concurrency,
             per_host_concurrency=controls.per_host_concurrency,
             politeness=controls.politeness,
         ).plan(plan_items, kind=plan_kind, backend=options.backend.value)
+        adaptive_plan = adaptive_plan.model_copy(
+            update={
+                "scan_status": item.scan_status,
+                "scan_type": item.scan_type,
+                "scan_counts": dict(item.scan_counts),
+                "scan_warnings": list(item.scan_warnings),
+                "scan_errors": list(item.scan_errors),
+            }
+        )
         wait_floor = {
             "normal": 1.0,
             "fast": 0.25,
             "aggressive": 0.0,
         }[options.politeness.value]
         wait = max(options.wait or 0.0, wait_floor)
-        return options.model_copy(update={"wait": wait, "adaptive_plan": adaptive_plan})
+        update: dict[str, object] = {
+            "wait": wait,
+            "adaptive_plan": adaptive_plan,
+            "planning_runtime_seconds": planning_runtime_seconds,
+        }
+        if exact_items is not None:
+            update.update(
+                {
+                    "exact_directory_index": True,
+                    "exact_directory_base_url": item.final_url or options.url,
+                    "exact_directory_items": exact_items,
+                }
+            )
+        return options.model_copy(update=update)
 
 
 def plan_as_dict(plan: OptimizedDownloadPlan) -> dict[str, object]:
@@ -772,20 +835,253 @@ def _redact_backend_args(args: list[object]) -> list[object]:
 
 def _enforce_mirror_scan_limits(options: SiteDownloadOptions, item: object) -> None:
     counts = getattr(item, "scan_counts", {}) or {}
-    discovered = int(counts.get("same_host") or 0)
+    selected_directory_items: list[WorkItem] | None = None
+    if isinstance(options, DirectoryMirrorOptions) and isinstance(item, WorkItem):
+        base_url = item.final_url or options.url
+        selected_directory_items = []
+        for candidate in item.discovered_work_items:
+            if (
+                candidate.kind == HubKind.dir
+                or candidate.external_host
+                or not candidate.same_host
+                or candidate.error is not None
+            ):
+                continue
+            relative_name = _directory_relative_name(base_url, candidate.url)
+            if _directory_item_selected(options, relative_name):
+                selected_directory_items.append(candidate)
+    discovered = (
+        len(selected_directory_items)
+        if selected_directory_items is not None
+        else int(counts.get("same_host") or 0)
+    )
     if options.max_files is not None and discovered > options.max_files:
         raise AtlasError(
             f"Mirror scan found {discovered} same-host items, exceeding --max-files "
             f"{options.max_files}. Narrow depth/scope or raise the limit."
         )
 
-    estimated = getattr(item, "scan_estimated_bytes", None)
+    estimated = (
+        (
+            sum(candidate.content_length or 0 for candidate in selected_directory_items)
+            if all(candidate.content_length is not None for candidate in selected_directory_items)
+            else None
+        )
+        if selected_directory_items is not None
+        else getattr(item, "scan_estimated_bytes", None)
+    )
     limit = _parse_size_limit(options.max_total_size or options.quota)
     if estimated is not None and limit is not None and estimated > limit:
         raise AtlasError(
             f"Mirror scan estimated {estimated} bytes, exceeding --max-total-size "
             f"{options.max_total_size or options.quota}. Narrow scope or raise the limit."
         )
+
+
+def _collect_exact_directory_items(
+    options: DirectoryMirrorOptions,
+    seed: WorkItem,
+    *,
+    deadline: float | None = None,
+) -> tuple[WorkItem, ...]:
+    """Build a bounded, same-host file list for supported plain-text indexes."""
+
+    base_url = seed.final_url or options.url
+    if deadline is None and options.max_runtime is not None:
+        deadline = monotonic() + options.max_runtime
+    pending: deque[tuple[WorkItem, int, bool]] = deque([(seed, 0, True)])
+    scheduled_directories = {seed.final_url or seed.url}
+    seen_directories: set[str] = set()
+    files: list[WorkItem] = []
+    while pending:
+        candidate, level, already_scanned = pending.popleft()
+        folder = (
+            candidate
+            if already_scanned
+            else scan_site(
+                candidate.url,
+                timeout=_directory_scan_timeout(options, deadline),
+            )
+        )
+        folder_url = folder.final_url or folder.url
+        if folder_url in seen_directories:
+            continue
+        seen_directories.add(folder_url)
+        if deadline is not None and monotonic() >= deadline:
+            raise AtlasError(
+                "Directory scan reached --max-runtime before the exact file list was complete."
+            )
+        if folder.scan_type not in _EXACT_DIRECTORY_SCAN_TYPES:
+            raise AtlasError(
+                f"Nested directory did not return a supported plain-text index: {folder_url}"
+            )
+        if folder.scan_counts.get("complete") == 0:
+            raise AtlasError(
+                "Directory index scan was truncated; refusing a partial exact-list download."
+            )
+        for item in folder.discovered_work_items:
+            if item.external_host or not item.same_host or item.error is not None:
+                continue
+            if item.kind == HubKind.dir:
+                if level + 1 < options.depth:
+                    child_url = item.final_url or item.url
+                    if child_url in scheduled_directories:
+                        continue
+                    if len(scheduled_directories) >= _EXACT_DIRECTORY_MAX_PAGES:
+                        raise AtlasError(
+                            "Directory index spans more than "
+                            f"{_EXACT_DIRECTORY_MAX_PAGES} directory pages; "
+                            "narrow depth or choose a more specific folder."
+                        )
+                    scheduled_directories.add(child_url)
+                    pending.append((item, level + 1, False))
+                continue
+            relative_name = _directory_relative_name(base_url, item.url)
+            if not _directory_item_selected(options, relative_name):
+                continue
+            files.append(item.model_copy(update={"filename": relative_name}))
+            if len(files) > _EXACT_DIRECTORY_MAX_FILES:
+                raise AtlasError(
+                    "Directory index contains more than 2,000 selected files; narrow the scope."
+                )
+
+    if not files:
+        raise AtlasError(
+            "The supported directory index contained no files matching the current "
+            "depth and filters."
+        )
+    if options.max_files is not None and len(files) > options.max_files:
+        raise AtlasError(
+            f"Directory index found {len(files)} selected files, exceeding --max-files "
+            f"{options.max_files}. Narrow depth/scope or raise the limit."
+        )
+    size_limit = _parse_size_limit(options.max_total_size or options.quota)
+    if size_limit is not None:
+        if any(item.content_length is None for item in files):
+            raise AtlasError(
+                "Directory index omitted one or more file sizes, so --max-total-size "
+                "cannot be guaranteed. Narrow the selection or remove that limit."
+            )
+        total = sum(item.content_length or 0 for item in files)
+        if total > size_limit:
+            raise AtlasError(
+                f"Directory index estimated {total} bytes, exceeding --max-total-size "
+                f"{options.max_total_size or options.quota}."
+            )
+    return tuple(files)
+
+
+def _directory_scan_timeout(
+    options: SiteDownloadOptions,
+    deadline: float | None,
+) -> float:
+    timeout = options.timeout if options.timeout and options.timeout > 0 else 10.0
+    if deadline is None:
+        return timeout
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise AtlasError(
+            "Directory scan reached --max-runtime before the exact file list was complete."
+        )
+    return min(timeout, remaining)
+
+
+def _directory_relative_name(base_url: str, item_url: str) -> str:
+    base = urlparse(base_url)
+    item = urlparse(item_url)
+    if _directory_url_origin(base_url) != _directory_url_origin(item_url):
+        raise AtlasError("Directory index tried to escape to another host.")
+    base_parts = _safe_url_path_parts(base.path)
+    item_parts = _safe_url_path_parts(item.path)
+    if item_parts[: len(base_parts)] != base_parts or len(item_parts) <= len(base_parts):
+        raise AtlasError("Directory index item escaped the requested folder.")
+    return "/".join(item_parts[len(base_parts) :])
+
+
+def _directory_url_origin(value: str) -> tuple[str, str, int]:
+    parsed = urlparse(value)
+    scheme = parsed.scheme.casefold()
+    if (
+        scheme not in {"http", "https"}
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise AtlasError("Directory index contains an unsafe URL origin.")
+    try:
+        host = parsed.hostname.rstrip(".").encode("idna").decode("ascii").casefold()
+        port = parsed.port or (443 if scheme == "https" else 80)
+    except (UnicodeError, ValueError) as exc:
+        raise AtlasError("Directory index contains an unsafe URL origin.") from exc
+    return scheme, host, port
+
+
+def _safe_url_path_parts(path: str) -> tuple[str, ...]:
+    parts: list[str] = []
+    for raw_part in path.split("/"):
+        if not raw_part:
+            continue
+        if re.search(r"%(?![0-9A-Fa-f]{2})", raw_part):
+            raise AtlasError("Directory index contains an unsafe path component.")
+        part = raw_part
+        for _ in range(8):
+            if re.search(r"%[0-9A-Fa-f]{2}", part) is None:
+                break
+            decoded = unquote(part)
+            if decoded == part:
+                break
+            part = decoded
+        else:
+            if re.search(r"%[0-9A-Fa-f]{2}", part):
+                raise AtlasError("Directory index contains an unsafe path component.")
+        if (
+            part in {".", ".."}
+            or "/" in part
+            or "\\" in part
+            or any(ord(char) < 32 or ord(char) == 127 for char in part)
+        ):
+            raise AtlasError("Directory index contains an unsafe path component.")
+        parts.append(part)
+    return tuple(parts)
+
+
+def _directory_item_selected(options: DirectoryMirrorOptions, relative_name: str) -> bool:
+    candidate = relative_name.casefold() if options.ignore_case else relative_name
+    basename = candidate.rsplit("/", 1)[-1]
+
+    def matches_globs(value: str | None) -> bool:
+        if not value:
+            return False
+        patterns: list[str] = []
+        for raw_pattern in value.split(","):
+            pattern = raw_pattern.strip()
+            if not pattern:
+                continue
+            patterns.append(pattern)
+            if not any(char in pattern for char in "*?[") and not any(
+                separator in pattern for separator in "/\\"
+            ):
+                patterns.append(f"*{pattern}" if pattern.startswith(".") else f"*.{pattern}")
+        if options.ignore_case:
+            patterns = [pattern.casefold() for pattern in patterns]
+        return any(
+            fnmatchcase(candidate, pattern) or fnmatchcase(basename, pattern)
+            for pattern in patterns
+        )
+
+    if options.accept and not matches_globs(options.accept):
+        return False
+    if matches_globs(options.reject):
+        return False
+    flags = re.IGNORECASE if options.ignore_case else 0
+    try:
+        if options.accept_regex and re.search(options.accept_regex, relative_name, flags) is None:
+            return False
+        if options.reject_regex and re.search(options.reject_regex, relative_name, flags):
+            return False
+    except re.error as exc:
+        raise AtlasError(f"Invalid directory filter regular expression: {exc}") from exc
+    return True
 
 
 def _parse_size_limit(value: str | None) -> int | None:

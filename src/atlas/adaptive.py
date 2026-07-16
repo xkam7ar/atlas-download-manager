@@ -10,10 +10,21 @@ from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from time import monotonic
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qsl, unquote, urljoin, urlparse
+from urllib.parse import parse_qsl, unquote, urlparse
 from urllib.request import Request, urlopen
 
-from atlas.directory_index import DirectoryEntry, parse_directory_index
+from atlas.directory_index import (
+    DirectoryEntry,
+    DirectoryIndex,
+    UnsupportedDirectoryIndexError,
+    decode_directory_body,
+    is_directory_self_href,
+    parse_directory_index,
+    resolve_directory_href,
+    same_http_origin,
+    same_http_resource,
+    url_within_directory_scope,
+)
 from atlas.file_probe import probe_direct_file, unprobed_direct_file, url_fingerprint
 from atlas.models import (
     AdaptiveDownloadPlan,
@@ -102,10 +113,7 @@ _MEDIA_EXTENSIONS = {
     ".avi",
 }
 _DIRECT_FILE_EXTENSIONS = (
-    _TINY_FILE_EXTENSIONS
-    | _SMALL_FILE_EXTENSIONS
-    | _LARGE_FILE_EXTENSIONS
-    | _MEDIA_EXTENSIONS
+    _TINY_FILE_EXTENSIONS | _SMALL_FILE_EXTENSIONS | _LARGE_FILE_EXTENSIONS | _MEDIA_EXTENSIONS
 )
 _SCAN_ESTIMATE_BY_CLASS = {
     FileSizeClass.tiny: 64 * 1024,
@@ -748,7 +756,13 @@ class _LinkParser(HTMLParser):
             return
         for name, value in attrs:
             if name.lower() == attr_name and value:
-                self.links.append(urljoin(self.base_url, value))
+                resolved = resolve_directory_href(self.base_url, value)
+                if (
+                    resolved is not None
+                    and not same_http_resource(self.base_url, resolved)
+                    and not is_directory_self_href(self.base_url, value, resolved)
+                ):
+                    self.links.append(resolved)
 
 
 def classify_file_size(content_length: int | None) -> FileSizeClass:
@@ -868,8 +882,31 @@ def scan_site(url: str, *, dry_run: bool = False, timeout: float = 10.0) -> Work
     content_type = headers.get("Content-Type")
     body = response.body
 
-    links = _extract_links(final_url or url, body, content_type)
-    directory_index = parse_directory_index(final_url or url, body, content_type=content_type)
+    links, html_links_truncated = _extract_links_with_status(
+        final_url or url,
+        body,
+        content_type,
+    )
+    parser_error: str | None = None
+    try:
+        directory_index = parse_directory_index(
+            final_url or url,
+            body,
+            content_type=content_type,
+        )
+    except UnsupportedDirectoryIndexError as exc:
+        parser_error = str(exc)
+        directory_index = DirectoryIndex(
+            source_url=final_url or url,
+            host=_host(final_url or url),
+            entries=(),
+            parser_name="unsupported-text",
+            complete=False,
+        )
+    if directory_index.entries and not links:
+        links = [entry.url for entry in directory_index.entries]
+    links_truncated = html_links_truncated or directory_index.truncated_reason == "entry-limit"
+    incomplete_scan = response.body_truncated or links_truncated
     robots_url, sitemap_urls = _robots_hints(final_url or url, timeout=timeout)
     source_host = _host(url)
     final_host = _host(final_url)
@@ -886,15 +923,56 @@ def scan_site(url: str, *, dry_run: bool = False, timeout: float = 10.0) -> Work
         links=links,
         items=discovered_items,
         content_type=content_type,
+        parser_name=directory_index.parser_name,
     )
+    if response.body_truncated:
+        scan_warnings.append(
+            "Scan body exceeded 512 KiB; results are partial and safety totals are incomplete."
+        )
+    if links_truncated:
+        scan_warnings.append(
+            "Link discovery exceeded 2,000 unique links; results are partial and "
+            "safety totals are incomplete."
+        )
     scan_warnings = [*response.warnings, *scan_warnings]
-    scan_type = _scan_type(url=final_url or url, content_type=content_type, counts=counts)
-    recommended_mode = _recommended_mode(scan_type=scan_type, counts=counts)
-    recommended_strategy = _recommended_strategy(counts)
-    estimated_bytes = _scan_estimated_bytes(discovered_items)
+    if incomplete_scan:
+        counts["complete"] = 0
+        if response.body_truncated:
+            counts["body_truncated"] = 1
+        if links_truncated:
+            counts["links_truncated"] = 1
+    scan_type = (
+        "unsupported text directory index"
+        if parser_error
+        else "directory-style text index"
+        if directory_index.parser_name == "copyparty-text"
+        else "directory-style CopyParty HTML index"
+        if directory_index.parser_name == "copyparty-html"
+        else _scan_type(url=final_url or url, content_type=content_type, counts=counts)
+    )
+    recommended_mode = (
+        "Directory scan unavailable for this text response"
+        if parser_error
+        else _recommended_mode(scan_type=scan_type, counts=counts)
+    )
+    recommended_strategy = (
+        "download as a direct file or use a supported directory index"
+        if parser_error
+        else _recommended_strategy(counts)
+    )
+    estimated_bytes = None if incomplete_scan else _scan_estimated_bytes(discovered_items)
     no_links = counts["links"] == 0 and counts["same_host"] == 0
     scan_errors = (
         [
+            {
+                "code": ScanErrorCode.parse_error.value,
+                "message": parser_error,
+                "url": final_url or url,
+                "recoverable": True,
+            }
+        ]
+        if parser_error
+        else [
             {
                 "code": ScanErrorCode.no_links.value,
                 "message": "No links found in fetched document",
@@ -906,10 +984,12 @@ def scan_site(url: str, *, dry_run: bool = False, timeout: float = 10.0) -> Work
         else []
     )
     scan_status = (
-        ScanStatus.empty
-        if no_links
+        ScanStatus.failed
+        if parser_error
         else ScanStatus.partial
-        if response.warnings
+        if incomplete_scan or response.warnings
+        else ScanStatus.empty
+        if no_links
         else ScanStatus.success
     )
     item = WorkItem(
@@ -957,6 +1037,7 @@ def scan_site(url: str, *, dry_run: bool = False, timeout: float = 10.0) -> Work
             etag=headers.get("ETag"),
             last_modified=headers.get("Last-Modified"),
         ),
+        error=parser_error,
     )
     return item
 
@@ -1028,22 +1109,31 @@ def plan_items_from_site_scan(seed: WorkItem, *, kind: HubKind) -> list[WorkItem
 
 
 def _extract_links(base_url: str, body: bytes, content_type: str | None) -> list[str]:
+    links, _truncated = _extract_links_with_status(base_url, body, content_type)
+    return links
+
+
+def _extract_links_with_status(
+    base_url: str,
+    body: bytes,
+    content_type: str | None,
+) -> tuple[list[str], bool]:
     if content_type and "html" not in content_type.lower():
-        return []
+        return [], False
     parser = _LinkParser(base_url)
     try:
-        parser.feed(body.decode("utf-8", errors="replace"))
+        parser.feed(decode_directory_body(body, content_type))
     except ValueError:
-        return []
-    return _dedupe(parser.links)[:MAX_DISCOVERED_LINKS]
+        return [], False
+    links = _dedupe(parser.links)
+    return links[:MAX_DISCOVERED_LINKS], len(links) > MAX_DISCOVERED_LINKS
 
 
 def _discovered_work_items(seed_url: str, links: list[str]) -> list[WorkItem]:
-    seed_host = _host(seed_url)
     items: list[WorkItem] = []
     for link in links:
         host = _host(link)
-        same_host = not (seed_host and host and seed_host != host)
+        same_host = same_http_origin(seed_url, link)
         parent_skipped = same_host and _is_parent_directory_link(seed_url, link)
         extension = _extension_from_url(link)
         kind = _kind_for_link(link, extension=extension)
@@ -1088,11 +1178,10 @@ def _discovered_work_items_from_directory_entries(
     seed_url: str,
     entries: Iterable[DirectoryEntry],
 ) -> list[WorkItem]:
-    seed_host = _host(seed_url)
     items: list[WorkItem] = []
     for entry in entries:
         host = _host(entry.url)
-        same_host = not (seed_host and host and seed_host != host)
+        same_host = same_http_origin(seed_url, entry.url)
         parent_skipped = entry.parent or (
             same_host and _is_parent_directory_link(seed_url, entry.url)
         )
@@ -1101,15 +1190,17 @@ def _discovered_work_items_from_directory_entries(
         if size_class == FileSizeClass.unknown:
             size_class = _estimated_size_class_for_extension(entry.extension, kind=kind)
         bucket = _bucket_for_scan_item(kind, size_class)
-        error = None
-        if not same_host:
+        error = entry.skipped_reason
+        if error is None and not same_host:
             error = "external link skipped by default"
-        elif parent_skipped:
+        elif error is None and parent_skipped:
             error = "parent directory link skipped by no-parent policy"
         notes = [
             "visible directory index row",
             f"entry kind: {entry.kind}",
         ]
+        if entry.parent:
+            notes.append("parent directory entry")
         if entry.visible_size is not None:
             notes.append("visible size from index")
         if entry.last_modified is not None:
@@ -1198,6 +1289,7 @@ def _scan_warnings(
     links: list[str],
     items: list[WorkItem],
     content_type: str | None,
+    parser_name: str,
 ) -> list[str]:
     warnings: list[str] = []
     if _missing_trailing_slash_redirect(seed_url, final_url):
@@ -1225,7 +1317,12 @@ def _scan_warnings(
         warnings.append(
             "Many external links were skipped by default; keep same-host unless intentional."
         )
-    if content_type and "html" not in content_type.lower() and links:
+    if (
+        content_type
+        and "html" not in content_type.lower()
+        and links
+        and parser_name != "copyparty-text"
+    ):
         warnings.append(
             "Non-HTML content produced links; verify parser assumptions before mirroring."
         )
@@ -1311,9 +1408,18 @@ def _recommended_strategy(counts: dict[str, int]) -> str:
 
 def _scan_estimated_bytes(items: list[WorkItem]) -> int | None:
     estimates = [
-        _SCAN_ESTIMATE_BY_CLASS[item.size_class]
+        (
+            item.content_length
+            if item.content_length is not None
+            else _SCAN_ESTIMATE_BY_CLASS[item.size_class]
+        )
         for item in items
-        if item.same_host and item.size_class in _SCAN_ESTIMATE_BY_CLASS
+        if (
+            item.same_host
+            and not item.external_host
+            and item.error is None
+            and item.size_class in _SCAN_ESTIMATE_BY_CLASS
+        )
     ]
     if not estimates:
         return None
@@ -1382,14 +1488,7 @@ def _scan_decision(kind: HubKind, bucket: WorkBucket, *, same_host: bool) -> str
 
 
 def _is_parent_directory_link(seed_url: str, link: str) -> bool:
-    seed = urlparse(seed_url)
-    parsed = urlparse(link)
-    if seed.hostname != parsed.hostname:
-        return False
-    seed_dir = _directory_scope(seed.path)
-    link_path = parsed.path or "/"
-    link_dir = _directory_scope(link_path)
-    return seed_dir != "/" and link_dir != seed_dir and seed_dir.startswith(link_dir)
+    return same_http_origin(seed_url, link) and not url_within_directory_scope(seed_url, link)
 
 
 def _directory_scope(path: str) -> str:

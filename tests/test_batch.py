@@ -267,9 +267,7 @@ def test_batch_operator_controller_rejects_unfocused_actions() -> None:
 
 def test_batch_operator_controller_keys_match_visible_keymap() -> None:
     visible_live_keys = {
-        action.key
-        for action in DEFAULT_OPERATOR_KEYMAP.actions
-        if action.scope == "live"
+        action.key for action in DEFAULT_OPERATOR_KEYMAP.actions if action.scope == "live"
     }
 
     assert {"g", "h", "s", "x", "X"}.issubset(visible_live_keys)
@@ -389,6 +387,120 @@ def test_run_batch_concurrent_enforces_per_host_cap(tmp_path: Path) -> None:
 
     assert summary.succeeded == 3
     assert max_by_host["same.example"] == 1
+
+
+def test_run_batch_concurrent_does_not_starve_other_hosts(tmp_path: Path) -> None:
+    batch_file = tmp_path / "urls.txt"
+    batch_file.write_text(
+        "\n".join(
+            [
+                "https://busy.example/one",
+                "https://busy.example/two",
+                "https://busy.example/three",
+                "https://healthy.example/one",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    healthy_started = Event()
+
+    def handler(
+        entry: BatchEntry,
+        _progress_hooks: list[object] | None,
+    ) -> DownloadResult:
+        if entry.line_no == 1:
+            assert healthy_started.wait(0.5), "healthy host was starved by blocked busy workers"
+        elif "healthy.example" in entry.url:
+            healthy_started.set()
+        return DownloadResult(status=DownloadStatus.success, url=entry.url, message="ok")
+
+    summary = run_batch_concurrent(
+        batch_file,
+        BatchKind.file,
+        handler,
+        concurrency=3,
+        per_host_concurrency=1,
+    )
+
+    assert summary.succeeded == 4
+    assert summary.failed == 0
+
+
+def test_run_batch_concurrent_never_parks_workers_on_host_waiters(tmp_path: Path) -> None:
+    batch_file = tmp_path / "urls.txt"
+    batch_file.write_text(
+        "\n".join(
+            [
+                *(f"https://busy.example/{index}" for index in range(3)),
+                *(f"https://healthy.example/{index}" for index in range(3)),
+                *(f"https://other.example/{index}" for index in range(3)),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    last_healthy_started = Event()
+
+    def handler(
+        entry: BatchEntry,
+        _progress_hooks: list[object] | None,
+    ) -> DownloadResult:
+        if entry.line_no == 1:
+            assert last_healthy_started.wait(0.5), "host waiters occupied every worker"
+        elif entry.line_no == 6:
+            last_healthy_started.set()
+        return DownloadResult(status=DownloadStatus.success, url=entry.url, message="ok")
+
+    summary = run_batch_concurrent(
+        batch_file,
+        BatchKind.file,
+        handler,
+        concurrency=3,
+        per_host_concurrency=1,
+    )
+
+    assert summary.succeeded == 9
+    assert summary.failed == 0
+
+
+def test_run_batch_concurrent_skips_paused_line_without_blocking_queue(tmp_path: Path) -> None:
+    batch_file = tmp_path / "urls.txt"
+    batch_file.write_text("https://one.example\nhttps://two.example\n", encoding="utf-8")
+    control = BatchControl()
+    control.pause_line(1)
+    second_started = Event()
+
+    def handler(
+        entry: BatchEntry,
+        _progress_hooks: list[object] | None,
+    ) -> DownloadResult:
+        if entry.line_no == 2:
+            second_started.set()
+        return DownloadResult(status=DownloadStatus.success, url=entry.url, message="ok")
+
+    from threading import Thread
+
+    summaries: list[object] = []
+    worker = Thread(
+        target=lambda: summaries.append(
+            run_batch_concurrent(
+                batch_file,
+                BatchKind.file,
+                handler,
+                concurrency=1,
+                control=control,
+            )
+        )
+    )
+    worker.start()
+    try:
+        assert second_started.wait(0.5), "paused line blocked a runnable line"
+    finally:
+        control.resume_line(1)
+        worker.join(1)
+
+    assert not worker.is_alive()
+    assert summaries
+    assert summaries[0].succeeded == 2
 
 
 def test_run_batch_adaptive_ramps_up_runtime_starts(tmp_path: Path) -> None:
@@ -538,3 +650,86 @@ def test_run_batch_adaptive_backoff_updates_erroring_host_cap(tmp_path: Path) ->
     assert summary.failed == 1
     assert scheduler.host_cap("busy.example") == 2
     assert scheduler.host_cap("healthy.example") == 4
+
+
+def test_run_batch_adaptive_attributes_backoff_to_resolved_host(tmp_path: Path) -> None:
+    batch_file = tmp_path / "urls.txt"
+    batch_file.write_text("https://origin.example/file.txt\n", encoding="utf-8")
+    scheduler = AdaptiveScheduler(
+        max_concurrency=4,
+        per_host_concurrency=4,
+        politeness=AdaptivePoliteness.fast,
+        min_concurrency=1,
+    )
+
+    def handler(
+        entry: BatchEntry,
+        _progress_hooks: list[object] | None,
+    ) -> DownloadResult:
+        return DownloadResult(
+            status=DownloadStatus.failed,
+            url=entry.url,
+            message="503 Service Unavailable",
+        )
+
+    summary = run_batch_adaptive(
+        batch_file,
+        BatchKind.file,
+        handler,
+        scheduler=scheduler,
+        host_resolver=lambda _entry: "cdn.example",
+    )
+
+    assert summary.failed == 1
+    assert scheduler.host_cap("cdn.example") == 2
+    assert scheduler.host_cap("origin.example") == 4
+
+
+def test_run_batch_adaptive_skips_paused_host_without_blocking_queue(tmp_path: Path) -> None:
+    batch_file = tmp_path / "urls.txt"
+    batch_file.write_text(
+        "https://paused.example/one\nhttps://healthy.example/two\n",
+        encoding="utf-8",
+    )
+    scheduler = AdaptiveScheduler(
+        max_concurrency=1,
+        per_host_concurrency=1,
+        politeness=AdaptivePoliteness.normal,
+        min_concurrency=1,
+    )
+    control = BatchControl()
+    control.pause_host("paused.example")
+    healthy_started = Event()
+
+    def handler(
+        entry: BatchEntry,
+        _progress_hooks: list[object] | None,
+    ) -> DownloadResult:
+        if "healthy.example" in entry.url:
+            healthy_started.set()
+        return DownloadResult(status=DownloadStatus.success, url=entry.url, message="ok")
+
+    from threading import Thread
+
+    summaries: list[object] = []
+    worker = Thread(
+        target=lambda: summaries.append(
+            run_batch_adaptive(
+                batch_file,
+                BatchKind.file,
+                handler,
+                scheduler=scheduler,
+                control=control,
+            )
+        )
+    )
+    worker.start()
+    try:
+        assert healthy_started.wait(0.5), "paused host blocked a runnable host"
+    finally:
+        control.resume_host("paused.example")
+        worker.join(1)
+
+    assert not worker.is_alive()
+    assert summaries
+    assert summaries[0].succeeded == 2

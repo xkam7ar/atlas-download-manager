@@ -7,7 +7,7 @@ import re
 from typing import Any
 
 from yt_dlp import YoutubeDL
-from yt_dlp.utils import DownloadError, ExtractorError
+from yt_dlp.utils import DownloadError, ExtractorError, MaxDownloadsReached
 
 from atlas.config import AtlasSettings
 from atlas.errors import EngineError
@@ -188,9 +188,50 @@ class YtdlpEngine:
         return self._download(options.url, ydl_opts)
 
     def _download(self, url: str, ydl_opts: dict[str, Any]) -> DownloadResult:
+        max_downloads = ydl_opts.get("max_downloads")
+        requested_limit = (
+            max_downloads
+            if isinstance(max_downloads, int) and not isinstance(max_downloads, bool)
+            else None
+        )
+        finished_downloads: set[tuple[object, ...]] = set()
+
+        def track_finished(event: dict[str, Any]) -> None:
+            if event.get("status") != "finished":
+                return
+            info = event.get("info_dict")
+            if isinstance(info, dict):
+                key = (
+                    info.get("id"),
+                    info.get("playlist_index"),
+                    info.get("section_number"),
+                    info.get("section_start"),
+                    info.get("section_end"),
+                )
+                if key[0] is not None:
+                    finished_downloads.add(key)
+                    return
+            filename = event.get("filename")
+            if filename is not None:
+                finished_downloads.add((filename,))
+
+        download_opts = dict(ydl_opts)
+        if requested_limit is not None:
+            hooks = list(download_opts.get("progress_hooks") or [])
+            hooks.append(track_finished)
+            download_opts["progress_hooks"] = hooks
         try:
-            with YoutubeDL(ydl_opts) as ydl:
+            with YoutubeDL(download_opts) as ydl:
                 code = ydl.download([url])
+        except MaxDownloadsReached as exc:
+            if requested_limit is None or len(finished_downloads) < requested_limit:
+                raise EngineError(clean_ytdlp_error_message(exc)) from exc
+            noun = "download" if requested_limit == 1 else "downloads"
+            return DownloadResult(
+                status=DownloadStatus.success,
+                url=url,
+                message=(f"Requested download limit reached; {requested_limit} {noun} complete."),
+            )
         except (DownloadError, ExtractorError) as exc:
             raise EngineError(clean_ytdlp_error_message(exc)) from exc
         except Exception as exc:

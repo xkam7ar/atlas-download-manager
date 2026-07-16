@@ -47,7 +47,7 @@ def directory_scan_result_from_work_item(scan: WorkItem) -> DirectoryScanResult:
         files=tuple(entry for entry in index.files if entry.kind != "html"),
         folders=index.folders,
         html_pages=tuple(entry for entry in index.files if entry.kind == "html"),
-        skipped=index.parents,
+        skipped=index.skipped,
         errors=errors,
         warnings=tuple(scan.scan_warnings),
     )

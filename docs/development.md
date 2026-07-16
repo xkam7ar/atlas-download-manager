@@ -14,7 +14,8 @@ This page is for contributors working in the local checkout.
 - optional `wget2` for direct-file and website-mirror workflows
 - optional `wget` as a website-mirror fallback
 
-Install the common local tools on macOS:
+Install the common local tools with `atlas setup --full --install`, or directly
+on macOS:
 
 ```bash
 brew install ffmpeg aria2 wget2 wget
@@ -46,8 +47,10 @@ Run before claiming work is complete:
 
 ```bash
 uv run pytest
-uv run ruff check src/atlas tests
-uv run mypy
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src
+sh -n install.sh
 uv build
 git diff --check
 ```
@@ -88,11 +91,14 @@ src/atlas/
   directory_explorer.py
   adaptive.py
   progress.py
+  progress_events.py
   theme.py
   views.py
   formats.py
   config.py
   paths.py
+  private_files.py
+  redaction.py
   doctor.py
   setup.py
   preflight.py
@@ -130,6 +136,9 @@ Minimum review loop:
 7. Run `rg` drift checks for renamed commands, stale launcher labels, old scan
    state text, stale backend names, and old
    safety language before finishing.
+8. Run `uv run pytest tests/test_documentation.py -q`. The documentation tests
+   verify local links/fragments, balanced fences, top-level command coverage,
+   config-field coverage, and the documented source-module inventory.
 
 ## Adding a command
 
@@ -187,7 +196,7 @@ dist/atlas-0.1.0-py3-none-any.whl
 Installer and packaging checks:
 
 ```bash
-zsh -n install.sh
+sh -n install.sh
 ruby -c packaging/homebrew/atlas.rb
 ./install.sh --no-install --no-menu --yes
 uv run atlas setup --json
@@ -223,10 +232,14 @@ uv run atlas video "https://example.com/watch?v=1" --subtitle-only --dry-run --j
 uv run atlas audio "https://example.com/watch?v=1" --dry-run --json
 uv run atlas audio "https://example.com/watch?v=1" --info-only --dry-run --json
 uv run atlas playlist "https://www.youtube.com/playlist?list=PL123" --type audio --dry-run
+uv run atlas video "$CHANNEL_URL" --playlist --playlist-items 1 --dry-run --json
+# Expected to fail: collection intent is unbounded.
+uv run atlas video "$CHANNEL_URL" --playlist --dry-run --json
 uv run atlas get "https://example.com/archive.zip" --kind file --backend wget2 --dry-run --json
 uv run atlas file "https://example.com/archive.zip" --adaptive --explain --json
 uv run atlas site "https://example.com/docs/" --backend wget2 --depth 1 --same-host-only --max-runtime 60 --dry-run
 uv run atlas dir "https://example.com/files/" --backend wget2 --same-host-only --max-files 100 --adaptive --explain --json
+uv run atlas dir "https://example.com/files/" --same-host-only --max-files 10 --max-total-size 100M --dry-run --json
 uv run atlas batch /tmp/urls.txt --kind file --adaptive --explain --json
 uv run atlas batch /tmp/urls.txt --kind file --adaptive --progress json
 uv run atlas wget2 --dry-run -- --version
@@ -238,16 +251,26 @@ For live downloader smoke tests, prefer small bounded fixtures first:
 
 - one tiny direct file
 - one medium ranged direct file
-- one small open-directory mirror with `--accept`
+- one small authorized open-directory mirror with explicit suffix, depth,
+  file-count, total-size, runtime, and temporary-output bounds
 - one batch that includes duplicate basenames
+
+Use a disposable output and clean it after the bounded directory check:
+
+```bash
+tmp_dir="$(mktemp -d)"
+uv run atlas dir "$AUTHORIZED_DIRECTORY_URL" --accept pdf --depth 1 \
+  --max-files 2 --max-total-size 10M --max-runtime 60 --output "$tmp_dir"
+rm -rf "$tmp_dir"
+```
 
 After downloader changes, run the full quality gate plus focused CLI/backend
 tests for the touched path. Useful focused commands include:
 
 ```bash
 uv run pytest tests/test_backends.py tests/test_cli.py tests/test_progress.py tests/test_adaptive.py tests/test_optimizer.py -q
-uv run ruff check src/atlas tests
-uv run mypy
+uv run ruff check .
+uv run mypy src
 ```
 
 ## Related

@@ -21,13 +21,10 @@ def test_signed_urls_are_sensitive(url: str) -> None:
 
 def test_url_redaction_retains_safe_context() -> None:
     redacted = redact_url(
-        "https://user:password@cdn.example/releases/file.iso?"
-        "X-Amz-Signature=TOPSECRET&part=3"
+        "https://user:password@cdn.example/releases/file.iso?X-Amz-Signature=TOPSECRET&part=3"
     )
 
-    assert redacted == (
-        "https://cdn.example/releases/file.iso?X-Amz-Signature=<redacted>&part=3"
-    )
+    assert redacted == ("https://cdn.example/releases/file.iso?X-Amz-Signature=<redacted>&part=3")
     assert "user" not in redacted
     assert "password" not in redacted
     assert "TOPSECRET" not in redacted

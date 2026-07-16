@@ -93,6 +93,8 @@ Playlist downloads can be large. `atlas` is deliberately conservative:
 - Watch URLs with playlist/radio query parameters are treated as single videos.
 - `atlas playlist` accepts only explicit playlist URLs.
 - Playlist ranges are available for deliberate limits.
+- YouTube channel/tab collections require playlist intent and a finite item/end
+  bound before probing or downloading.
 
 Use:
 
@@ -104,6 +106,12 @@ or:
 
 ```bash
 atlas playlist PLAYLIST_URL --playlist-start 1 --playlist-end 25
+```
+
+For a bounded channel tab:
+
+```bash
+atlas video "https://www.youtube.com/@example/videos" --playlist --playlist-items 1
 ```
 
 ## Network courtesy

@@ -4,14 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from urllib.parse import urlsplit
 
-from atlas.directory_index import DirectoryIndex
+from atlas.directory_index import DirectoryEntry, DirectoryIndex
 from atlas.directory_tree import DirectoryTree
 from atlas.models import ScanStatus
 
 
 class DirectoryExplorerAction(StrEnum):
     everything = "everything"
+    open_folder = "folder"
+    # Compatibility alias for callers that persisted the original action value.
     folder = "folder"
     folders = "folders"
     visible_files = "visible_files"
@@ -48,20 +51,24 @@ def directory_explorer_actions(
     if status == ScanStatus.failed:
         return (DirectoryExplorerAction.back, DirectoryExplorerAction.quit)
 
-    actions: list[DirectoryExplorerAction] = [DirectoryExplorerAction.everything]
-    if index.folders:
-        actions.extend(
-            [
-                DirectoryExplorerAction.folder,
-                DirectoryExplorerAction.folders,
-            ]
-        )
+    actions: list[DirectoryExplorerAction] = []
+    safe_folders = _same_origin_folders(index)
+    if safe_folders:
+        actions.append(DirectoryExplorerAction.open_folder)
     if _has_downloadable_visible_files(index):
         actions.append(DirectoryExplorerAction.visible_files)
+    if safe_folders or _has_downloadable_visible_files(index):
+        actions.append(DirectoryExplorerAction.everything)
+    if safe_folders:
+        actions.extend(
+            [
+                DirectoryExplorerAction.folders,
+                DirectoryExplorerAction.tree,
+                DirectoryExplorerAction.deep_scan,
+            ]
+        )
     actions.extend(
         [
-            DirectoryExplorerAction.tree,
-            DirectoryExplorerAction.deep_scan,
             DirectoryExplorerAction.offline_site,
             DirectoryExplorerAction.back,
             DirectoryExplorerAction.quit,
@@ -71,4 +78,30 @@ def directory_explorer_actions(
 
 
 def _has_downloadable_visible_files(index: DirectoryIndex) -> bool:
-    return any(entry.kind in {"file", "unknown"} and not entry.parent for entry in index.files)
+    return any(
+        entry.kind == "file" and not entry.parent and _entry_is_same_origin(index, entry.url)
+        for entry in index.files
+    )
+
+
+def _same_origin_folders(index: DirectoryIndex) -> tuple[DirectoryEntry, ...]:
+    return tuple(entry for entry in index.folders if _entry_is_same_origin(index, entry.url))
+
+
+def _entry_is_same_origin(index: DirectoryIndex, url: str) -> bool:
+    source_origin = _origin(index.source_url)
+    return source_origin is not None and _origin(url) == source_origin
+
+
+def _origin(url: str) -> tuple[str, str, int | None] | None:
+    parsed = urlsplit(url)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or parsed.hostname is None:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if (scheme, port) in {("http", 80), ("https", 443)}:
+        port = None
+    return scheme, parsed.hostname.lower(), port

@@ -9,6 +9,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -16,7 +17,7 @@ from enum import StrEnum
 from functools import partial
 from pathlib import Path
 from typing import Protocol, cast
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
 from uuid import uuid4
 
 from pydantic import ValidationError
@@ -33,7 +34,14 @@ from atlas.directory_explorer import (
 from atlas.directory_explorer import (
     directory_explorer_actions,
 )
-from atlas.directory_index import DirectoryEntry, DirectoryIndex, directory_index_from_work_item
+from atlas.directory_index import (
+    DirectoryEntry,
+    DirectoryIndex,
+    directory_index_from_work_item,
+    safe_directory_display_name,
+    same_http_origin,
+    url_within_directory_scope,
+)
 from atlas.errors import AtlasError
 from atlas.formats import format_bytes, format_duration
 from atlas.media_capabilities import (
@@ -329,6 +337,7 @@ MENU_CAPABILITIES: tuple[MenuCapability, ...] = (
 SCRIPT_ONLY_COMMANDS = frozenset({"get", "menu"})
 _MENU_REDRAW_ATTR = "_atlas_menu_redraw"
 _DIRECTORY_FILE_PREVIEW_LIMIT = 8
+_DIRECTORY_SCAN_PAGE_LIMIT = 100
 
 
 def menu_capability_command_names(*, include_advanced: bool = True) -> set[str]:
@@ -966,8 +975,7 @@ def _print_setup_gate(console: Console, statuses: Sequence[RuntimeToolStatus]) -
     console.print()
     console.print(Text("Recommended action", style=ATLAS_ACTIVE_STYLE))
     console.print(
-        "  Install full runtime: "
-        + visual_join(("ffmpeg", "ffprobe", "aria2c", "wget2", "wget"))
+        "  Install full runtime: " + visual_join(("ffmpeg", "ffprobe", "aria2c", "wget2", "wget"))
     )
     console.print()
 
@@ -1023,7 +1031,6 @@ def _print_launcher(console: Console, settings: AtlasSettings) -> None:
 
 
 def _menu_footer(*, multi: bool = False, back: str = "quit") -> Text:
-    _ = back
     move = "↑/↓" if visual_options().unicode else "up/down"
     footer = Text()
     footer.append(move, style=ATLAS_MUTED_STYLE)
@@ -1037,9 +1044,9 @@ def _menu_footer(*, multi: bool = False, back: str = "quit") -> Text:
         footer.append("enter", style=ATLAS_MUTED_STYLE)
         footer.append(" select   ")
     footer.append("type", style=ATLAS_MUTED_STYLE)
-    footer.append(" filter   ")
+    footer.append(" to filter   ")
     footer.append("ctrl-c", style=ATLAS_MUTED_STYLE)
-    footer.append(" cancel")
+    footer.append(f" {back}")
     return footer
 
 
@@ -1190,7 +1197,7 @@ def _print_explicit_playlist_prompt(console: Console, url: str) -> None:
 
 
 def _directory_footer(*, multi: bool = False) -> Text:
-    return _menu_footer(multi=multi)
+    return _menu_footer(multi=multi, back="back")
 
 
 def _render_menu_context_card(
@@ -1201,11 +1208,20 @@ def _render_menu_context_card(
     style_name: str = ATLAS_PANEL_STYLE,
 ) -> None:
     console = ensure_atlas_theme(console)
-    table = Table.grid(padding=(0, 2))
-    table.add_column(style=ATLAS_MUTED_STYLE, no_wrap=True)
-    table.add_column(ratio=1)
-    for label, value in rows:
-        table.add_row(label, value)
+    narrow = console.width < 40
+    table = Table.grid(padding=(0, 0) if narrow else (0, 2), expand=narrow)
+    if narrow:
+        table.add_column(ratio=1, overflow="fold")
+        for label, value in rows:
+            table.add_row(Text(label, style=ATLAS_MUTED_STYLE))
+            indented = Text("  ")
+            indented.append_text(Text.from_markup(value))
+            table.add_row(indented)
+    else:
+        table.add_column(style=ATLAS_MUTED_STYLE, no_wrap=True)
+        table.add_column(ratio=1)
+        for label, value in rows:
+            table.add_row(label, value)
     console.print(
         Panel(
             table,
@@ -1781,9 +1797,7 @@ def _print_media_profile_context(
         _print_plain_section(
             console,
             "Playlist detected",
-            (
-                "Only this video will be downloaded. Use Download playlist to fetch all items.",
-            ),
+            ("Only this video will be downloaded. Use Download playlist to fetch all items.",),
             style_name=ATLAS_WARNING_STYLE,
         )
     _print_plain_section(
@@ -4289,11 +4303,16 @@ def _completion_loop(
         _print_completion_summary(console, saved_paths, primary_path, plan=plan, media=media)
     while True:
         choices: list[MenuChoice] = []
-        if primary_path is not None:
+        if primary_path is not None and _path_launch_available():
+            open_label = (
+                "Open folder"
+                if _completion_target_is_directory(primary_path, plan=plan)
+                else "Open file"
+            )
             choices.extend(
                 [
-                    MenuChoice("Reveal in Finder", CompletionChoice.reveal),
-                    MenuChoice("Open file", CompletionChoice.open),
+                    MenuChoice("Show in folder", CompletionChoice.reveal),
+                    MenuChoice(open_label, CompletionChoice.open),
                 ]
             )
         choices.extend(
@@ -4308,13 +4327,27 @@ def _completion_loop(
             return CompletionChoice.back
         if selected == CompletionChoice.reveal:
             if primary_path is not None:
-                _reveal_path(primary_path)
+                error = _reveal_path(primary_path)
+                if error and console is not None:
+                    console.print(Text(error, style=ATLAS_ERROR_STYLE))
             continue
         if selected == CompletionChoice.open:
             if primary_path is not None:
-                _open_path(primary_path)
+                error = _open_path(primary_path)
+                if error and console is not None:
+                    console.print(Text(error, style=ATLAS_ERROR_STYLE))
             continue
         return selected
+
+
+def _completion_target_is_directory(
+    path: Path,
+    *,
+    plan: HubExecutionPlan | None,
+) -> bool:
+    if plan is not None and plan.route.kind in {HubKind.dir, HubKind.site}:
+        return True
+    return path.is_dir()
 
 
 def _print_completion_summary(
@@ -4750,20 +4783,49 @@ def _batch_file_plan_flow(
                 },
             )
             continue
-        actions.run_batch(
-            file,
-            kind=kind,
-            concurrency=concurrency,
-            allow_sites=allow_sites,
-            allow_dirs=allow_dirs,
-            video_codec=video_codec,
-            audio_codec=audio_codec,
-            audio_quality=audio_quality,
-            dry_run=selected == PlanMenuChoice.dry_run,
-        )
+        try:
+            actions.run_batch(
+                file,
+                kind=kind,
+                concurrency=concurrency,
+                allow_sites=allow_sites,
+                allow_dirs=allow_dirs,
+                video_codec=video_codec,
+                audio_codec=audio_codec,
+                audio_quality=audio_quality,
+                dry_run=selected == PlanMenuChoice.dry_run,
+            )
+        except Exception as exc:
+            if not isinstance(exc, AtlasError) and not _is_command_exit(exc):
+                raise
+            detail = str(exc).strip()
+            if not detail:
+                status = getattr(exc, "exit_code", 1)
+                detail = f"Batch finished with unsuccessful items (status {status})."
+            recovery = _prompt_plan_recovery(
+                prompts,
+                console,
+                AtlasError(detail),
+                stage="Batch interrupted",
+            )
+            if recovery == PlanRecoveryChoice.quit:
+                return CompletionChoice.quit
+            if recovery == PlanRecoveryChoice.back:
+                return CompletionChoice.back
+            if recovery == PlanRecoveryChoice.doctor:
+                actions.run_doctor()
+            continue
         if selected == PlanMenuChoice.dry_run:
             continue
-        return _completion_loop(prompts, [])
+        return _completion_loop(
+            prompts,
+            [settings.output_dir],
+            console=console,
+        )
+
+
+def _is_command_exit(exc: Exception) -> bool:
+    return exc.__class__.__name__ == "Exit" and hasattr(exc, "exit_code")
 
 
 def _batch_pasted_urls_flow(
@@ -4991,10 +5053,9 @@ def _scan_failed_flow(
                 "Scan failed",
                 [
                     MenuChoice("Retry scan", ScanFailedChoice.retry),
-                    MenuChoice("Doctor check", ScanFailedChoice.doctor),
-                    MenuChoice("Backend fetch", ScanFailedChoice.backend_scan),
+                    MenuChoice("Run network diagnostics", ScanFailedChoice.doctor),
                     MenuChoice(
-                        "Continue as mirror",
+                        "Plan bounded mirror without scan",
                         ScanFailedChoice.backend_mirror,
                     ),
                     MenuChoice("Error details", ScanFailedChoice.details),
@@ -5034,8 +5095,8 @@ def _scan_empty_flow(
                 "No links found",
                 [
                     MenuChoice("Retry scan", ScanEmptyChoice.retry),
-                    MenuChoice("Treat as website", ScanEmptyChoice.website),
-                    MenuChoice("This page only", ScanEmptyChoice.file),
+                    MenuChoice("Plan offline website mirror", ScanEmptyChoice.website),
+                    MenuChoice("Download this URL only", ScanEmptyChoice.file),
                     MenuChoice("Back", ScanEmptyChoice.back),
                 ],
             ),
@@ -5062,21 +5123,38 @@ def _directory_explorer_flow(
     scan: WorkItem,
     directory_index: DirectoryIndex,
 ) -> FlowResult:
+    history: list[tuple[WorkItem, DirectoryIndex]] = []
+    current_scan = scan
+    current_index = directory_index
     while True:
-        _print_directory_explorer(console, scan, directory_index)
+        _print_directory_explorer(
+            console,
+            current_scan,
+            current_index,
+            navigation_depth=len(history),
+            scan_depth=settings.dir_depth,
+        )
         selected = cast(
             DirectoryExplorerChoice | None,
             prompts.select(
-                "What would you like to do?",
-                _directory_explorer_choices(directory_index, status=scan.scan_status),
+                "Directory actions",
+                _directory_explorer_choices(
+                    current_index,
+                    status=current_scan.scan_status,
+                    scan_depth=settings.dir_depth,
+                    has_parent=bool(history),
+                ),
             ),
         )
         if selected in {None, DirectoryExplorerChoice.back}:
+            if history:
+                current_scan, current_index = history.pop()
+                continue
             return FlowResult.back
         if selected == DirectoryExplorerChoice.quit:
             return FlowResult.quit
         if selected == DirectoryExplorerChoice.tree:
-            _print_directory_tree(console, directory_index)
+            _print_directory_tree(console, current_index)
             _view_only_back(prompts, message="Back")
             continue
         if selected == DirectoryExplorerChoice.offline_site:
@@ -5084,7 +5162,7 @@ def _directory_explorer_flow(
                 actions,
                 prompts,
                 console,
-                _offline_site_scan_options(settings, scan.url),
+                _offline_site_scan_options(settings, current_scan.url),
                 HubKind.site,
             )
             return FlowResult.quit if plan_result == CompletionChoice.quit else FlowResult.back
@@ -5094,7 +5172,7 @@ def _directory_explorer_flow(
                 actions,
                 prompts,
                 console,
-                directory_index,
+                current_index,
             )
         if selected == DirectoryExplorerChoice.everything:
             return _directory_deep_scan_flow(
@@ -5102,33 +5180,55 @@ def _directory_explorer_flow(
                 actions,
                 prompts,
                 console,
-                scan,
-                [scan.final_url or scan.url],
+                current_scan,
+                [current_scan.final_url or current_scan.url],
             )
         if selected == DirectoryExplorerChoice.deep_scan:
-            roots = [entry.url for entry in directory_index.folders] or [scan.final_url or scan.url]
+            roots = [entry.url for entry in _directory_folders(current_index)]
             return _directory_deep_scan_flow(
                 settings,
                 actions,
                 prompts,
                 console,
-                scan,
+                current_scan,
                 roots,
             )
-        if selected == DirectoryExplorerChoice.folder:
-            folder = _select_directory_folder(prompts, console, directory_index)
+        if selected == DirectoryExplorerChoice.open_folder:
+            folder = _select_directory_folder(prompts, console, current_index)
             if folder is None:
                 continue
-            return _directory_deep_scan_flow(
-                settings,
-                actions,
-                prompts,
-                console,
-                scan,
-                [folder.url],
-            )
+            child_scan: WorkItem | None = None
+            while child_scan is None:
+                candidate = _with_menu_status(
+                    console,
+                    "Opening folder",
+                    partial(actions.scan_url, folder.url),
+                )
+                if not _directory_scan_result_is_safe(candidate, scope_root=folder.url):
+                    console.print(
+                        f"[{ATLAS_WARNING_STYLE}]Folder redirect left the selected origin or "
+                        "folder. Atlas stayed in the current directory."
+                        f"[/{ATLAS_WARNING_STYLE}]"
+                    )
+                    _view_only_back(prompts, message="Back to directory")
+                    break
+                if not _scan_failed(candidate):
+                    child_scan = candidate
+                    break
+                failed_result = _scan_failed_flow(settings, actions, prompts, console, candidate)
+                if failed_result == FlowResult.retry:
+                    continue
+                if failed_result == FlowResult.quit:
+                    return FlowResult.quit
+                break
+            if child_scan is None:
+                continue
+            history.append((current_scan, current_index))
+            current_scan = child_scan
+            current_index = directory_index_from_work_item(child_scan)
+            continue
         if selected == DirectoryExplorerChoice.folders:
-            folders = _select_directory_folders(prompts, console, directory_index)
+            folders = _select_directory_folders(prompts, console, current_index)
             if folders is None:
                 continue
             if not folders:
@@ -5141,13 +5241,13 @@ def _directory_explorer_flow(
                 actions,
                 prompts,
                 console,
-                scan,
+                current_scan,
                 [folder.url for folder in folders],
             )
 
 
 def _scan_looks_like_directory_index(scan: WorkItem, directory_index: DirectoryIndex) -> bool:
-    if not directory_index.folders:
+    if not _directory_folders(directory_index):
         return False
     scan_type = (scan.scan_type or "").lower()
     if "directory" in scan_type or "index" in scan_type:
@@ -5159,16 +5259,21 @@ def _directory_explorer_choices(
     directory_index: DirectoryIndex,
     *,
     status: ScanStatus,
+    scan_depth: int | None = None,
+    has_parent: bool = False,
 ) -> list[MenuChoice]:
+    bounded_scan = "Scan this folder and children"
+    if scan_depth is not None:
+        bounded_scan = f"{bounded_scan} (depth {scan_depth})"
     labels = {
-        DirectoryExplorerChoice.everything: "Everything under this folder",
-        DirectoryExplorerChoice.folder: "Choose one specific folder",
-        DirectoryExplorerChoice.folders: "Choose multiple folders",
-        DirectoryExplorerChoice.visible_files: "Only visible files at this level",
-        DirectoryExplorerChoice.tree: "Browse full folder tree first",
-        DirectoryExplorerChoice.deep_scan: "Deep scan selected folders first",
-        DirectoryExplorerChoice.offline_site: "Treat as offline website instead",
-        DirectoryExplorerChoice.back: "Back",
+        DirectoryExplorerChoice.everything: bounded_scan,
+        DirectoryExplorerChoice.open_folder: "Open a folder",
+        DirectoryExplorerChoice.folders: "Scan selected folders",
+        DirectoryExplorerChoice.visible_files: "Choose files at this level",
+        DirectoryExplorerChoice.tree: "View folders at this level",
+        DirectoryExplorerChoice.deep_scan: "Scan visible subfolders only",
+        DirectoryExplorerChoice.offline_site: "Plan offline website mirror instead",
+        DirectoryExplorerChoice.back: "Up to parent folder" if has_parent else "Back",
         DirectoryExplorerChoice.quit: "Quit",
     }
     return [
@@ -5184,38 +5289,49 @@ def _print_directory_explorer(
     console: Console,
     scan: WorkItem,
     directory_index: DirectoryIndex,
+    *,
+    navigation_depth: int = 0,
+    scan_depth: int | None = None,
 ) -> None:
     _refresh_menu_screen(console)
+    folders = _directory_folders(directory_index)
+    visible_files = tuple(_downloadable_entries_from_directory_index(directory_index))
     visible = _menu_separator().join(
         (
-            f"{len(directory_index.folders):,} folders",
-            f"{len(directory_index.files):,} files",
+            f"{len(folders):,} folders",
+            f"{len(visible_files):,} files",
         )
+    )
+    rows = [
+        (
+            "Location",
+            escape(redact_text(_compact_url_label(scan.final_url or scan.url))),
+        ),
+        (
+            "Navigation",
+            "root folder" if navigation_depth == 0 else f"{navigation_depth} level(s) below root",
+        ),
+        ("Scope", visual_join(("same origin", "no parent"))),
+    ]
+    if scan_depth is not None:
+        rows.append(("Scan depth", f"up to {scan_depth} folder level(s)"))
+    rows.extend(
+        [
+            ("Visible", visible),
+            ("Visible size", _directory_visible_size_label(scan, directory_index)),
+        ]
     )
     _render_menu_context_card(
         console,
         "Browse Directory",
-        (
-            ("Seed", escape(scan.final_url or scan.url)),
-            ("Scope", visual_join(("same host", "no parent"))),
-            ("Visible", visible),
-            (
-                "Estimated",
-                f"~{format_bytes(scan.scan_estimated_bytes)}"
-                if scan.scan_estimated_bytes is not None
-                else "unknown",
-            ),
-        ),
+        rows,
     )
-    folder_limit = _directory_folder_preview_limit(console, directory_index.folders)
+    folder_limit = _directory_folder_preview_limit(console, folders)
     _print_directory_folder_preview(
         console,
-        f"Folders ({len(directory_index.folders):,})",
-        directory_index.folders,
+        f"Folders ({len(folders):,})",
+        folders,
         limit=folder_limit,
-    )
-    visible_files = tuple(
-        entry for entry in directory_index.files if _directory_entry_is_downloadable(entry)
     )
     if visible_files:
         _print_directory_file_preview(
@@ -5227,6 +5343,22 @@ def _print_directory_explorer(
     if scan.scan_warnings:
         _print_directory_warnings(console, scan.scan_warnings)
     console.print(_directory_footer())
+
+
+def _directory_visible_size_label(scan: WorkItem, directory_index: DirectoryIndex) -> str:
+    if scan.scan_estimated_bytes is not None:
+        return f"~{format_bytes(scan.scan_estimated_bytes)}"
+    visible_entries = tuple(
+        entry
+        for entry in directory_index.entries
+        if not entry.parent and _directory_entry_is_in_scope(directory_index, entry)
+    )
+    known_bytes = sum(entry.visible_size or 0 for entry in visible_entries)
+    if not known_bytes:
+        return "unknown"
+    has_unknown = any(entry.visible_size is None for entry in visible_entries)
+    prefix = "at least " if has_unknown else "~"
+    return f"{prefix}{format_bytes(known_bytes)}"
 
 
 def _directory_folder_preview_limit(
@@ -5254,9 +5386,17 @@ def _print_directory_folder_preview(
     table.add_column(ratio=1, overflow="ellipsis", no_wrap=True)
     table.add_column(style=ATLAS_MUTED_STYLE, no_wrap=True)
     for entry in entries[:limit]:
+        details = visual_join(
+            detail
+            for detail in (
+                _directory_entry_modified_label(entry),
+                _directory_entry_size_label(entry),
+            )
+            if detail != "-"
+        )
         table.add_row(
-            _directory_entry_name(entry),
-            _directory_entry_modified_label(entry),
+            Text(_directory_entry_name(entry)),
+            details or "-",
         )
     remaining = len(entries) - limit
     if remaining > 0:
@@ -5282,11 +5422,11 @@ def _print_directory_file_preview(
     table = Table.grid(expand=True)
     table.add_column(ratio=1, overflow="ellipsis", no_wrap=True)
     for entry in entries[:limit]:
-        table.add_row(_directory_entry_name(entry))
+        table.add_row(Text(_directory_entry_name(entry)))
     remaining = len(entries) - limit
     if remaining > 0:
         note = Text(
-            f"showing first {limit:,} of {len(entries):,}; use / to filter",
+            f"showing first {limit:,} of {len(entries):,}; choose files to search all",
             style=ATLAS_MUTED_STYLE,
         )
         _render_menu_section(console, title, Group(table, note))
@@ -5309,8 +5449,9 @@ def _print_directory_tree(console: Console, directory_index: DirectoryIndex) -> 
     _refresh_menu_screen(console)
     branch = "├──" if visual_options().unicode else "|--"
     last = "└──" if visual_options().unicode else "`--"
-    lines = [directory_index.source_url.rstrip("/") + "/"]
-    folders = directory_index.folders
+    source = redact_text(_compact_url_label(directory_index.source_url)).rstrip("/") + "/"
+    lines = [source]
+    folders = _directory_folders(directory_index)
     for index, entry in enumerate(folders):
         connector = last if index == len(folders) - 1 else branch
         lines.append(f"{connector} {_directory_entry_name(entry)}")
@@ -5333,17 +5474,17 @@ def _select_directory_folder(
 ) -> DirectoryEntry | None:
     _print_directory_picker_context(
         console,
-        "Choose one specific folder",
+        "Open folder",
         directory_index,
-        "Select one visible folder to deep scan.",
+        "Select a visible folder to open. No download starts.",
         multi=False,
     )
     choices = [
         MenuChoice(_directory_entry_choice_label(entry), entry)
-        for entry in directory_index.folders
+        for entry in _directory_folders(directory_index)
     ]
     choices.append(MenuChoice("Back", None))
-    return cast(DirectoryEntry | None, prompts.select("Folder", choices))
+    return cast(DirectoryEntry | None, prompts.select("Open folder", choices))
 
 
 def _select_directory_folders(
@@ -5353,16 +5494,16 @@ def _select_directory_folders(
 ) -> list[DirectoryEntry] | None:
     _print_directory_picker_context(
         console,
-        "Choose multiple folders",
+        "Scan selected folders",
         directory_index,
-        "Select one or more visible folders to deep scan.",
+        "Select visible folders to scan. Download starts only after plan review.",
         multi=True,
     )
     selected = prompts.multi_select(
         "Folders",
         [
             MenuChoice(_directory_entry_choice_label(entry), entry)
-            for entry in directory_index.folders
+            for entry in _directory_folders(directory_index)
         ],
     )
     if selected is None:
@@ -5378,9 +5519,9 @@ def _select_directory_files(
 ) -> list[DirectoryEntry] | None:
     _print_directory_picker_context(
         console,
-        "Only visible files at this level",
+        "Choose files at this level",
         directory_index,
-        "Search and select root-level files from this folder.",
+        "Search and select visible files. Download starts only after plan review.",
         multi=True,
     )
     selected = prompts.multi_select(
@@ -5405,13 +5546,19 @@ def _print_directory_picker_context(
         console,
         title,
         (
-            ("Source", escape(directory_index.source_url)),
+            (
+                "Location",
+                escape(redact_text(_compact_url_label(directory_index.source_url))),
+            ),
             (
                 "Visible",
                 _menu_separator().join(
                     (
-                        f"{len(directory_index.folders):,} folders",
-                        f"{len(directory_index.files):,} files",
+                        f"{len(_directory_folders(directory_index)):,} folders",
+                        (
+                            f"{len(_downloadable_entries_from_directory_index(directory_index)):,} "
+                            "files"
+                        ),
                     )
                 ),
             ),
@@ -5439,14 +5586,14 @@ def _directory_visible_files_flow(
     if selected_entries is None:
         return FlowResult.back
     if not selected_entries:
-        console.print(
-            f"[{ATLAS_WARNING_STYLE}]No visible files selected.[/{ATLAS_WARNING_STYLE}]"
-        )
+        console.print(f"[{ATLAS_WARNING_STYLE}]No visible files selected.[/{ATLAS_WARNING_STYLE}]")
         return FlowResult.back
     urls = [entry.url for entry in selected_entries]
     batch_file = _write_menu_batch_file(settings.output_dir, urls)
+    selected_size = _selected_directory_size_label(selected_entries)
     console.print(
-        f"[{ATLAS_MUTED_STYLE}]Built exact visible-file queue with {len(urls)} URL(s): "
+        f"[{ATLAS_MUTED_STYLE}]Selected {len(urls)} visible file(s), {selected_size}. "
+        "Built exact queue: "
         f"{escape(str(batch_file))}[/{ATLAS_MUTED_STYLE}]"
     )
     result = _batch_file_plan_flow(
@@ -5468,11 +5615,26 @@ def _directory_deep_scan_flow(
     seed_scan: WorkItem,
     selected_roots: Sequence[str],
 ) -> FlowResult:
-    scans = [
-        _with_menu_status(console, "Scanning selected folder", partial(actions.scan_url, root))
-        for root in selected_roots
-    ]
-    _print_deep_directory_scan_summary(console, seed_scan, selected_roots, scans)
+    scans, scan_limited = _scan_directory_roots(
+        settings,
+        actions,
+        console,
+        seed_scan,
+        selected_roots,
+    )
+    _print_deep_directory_scan_summary(
+        console,
+        seed_scan,
+        selected_roots,
+        scans,
+        scan_limited=scan_limited,
+    )
+    if scan_limited:
+        console.print(
+            f"[{ATLAS_WARNING_STYLE}]Scan stopped at {_DIRECTORY_SCAN_PAGE_LIMIT:,} folder "
+            "pages. Queue includes only files already discovered; narrow folder selection to "
+            f"continue.[/{ATLAS_WARNING_STYLE}]"
+        )
     urls = _downloadable_links_from_scans(scans)
     if urls:
         batch_file = _write_menu_batch_file(settings.output_dir, urls)
@@ -5489,22 +5651,120 @@ def _directory_deep_scan_flow(
             default_kind=BatchKind.file,
         )
     else:
-        batch_file = _write_menu_batch_file(settings.output_dir, selected_roots)
         console.print(
-            f"[{ATLAS_MUTED_STYLE}]No direct files were visible yet; queued selected "
-            "folder root(s): "
-            f"{escape(str(batch_file))}[/{ATLAS_MUTED_STYLE}]"
+            f"[{ATLAS_WARNING_STYLE}]No downloadable files were found in the bounded scan. "
+            "No download was queued. Choose a narrower folder or plan a mirror explicitly."
+            f"[/{ATLAS_WARNING_STYLE}]"
         )
-        result = _batch_file_plan_flow(
-            settings,
-            actions,
-            prompts,
-            console,
-            batch_file,
-            default_kind=BatchKind.dir,
-            default_allow_dirs=True,
-        )
+        return FlowResult.back
     return FlowResult.quit if result == CompletionChoice.quit else FlowResult.back
+
+
+def _scan_directory_roots(
+    settings: AtlasSettings,
+    actions: MenuActions,
+    console: Console,
+    seed_scan: WorkItem,
+    selected_roots: Sequence[str],
+) -> tuple[list[WorkItem], bool]:
+    """Scan selected roots and their visible child folders to the configured depth."""
+
+    pending: deque[tuple[str, int, str]] = deque()
+    scheduled: set[str] = set()
+    scan_limited = False
+    for root in selected_roots:
+        normalized = _normalized_directory_url(root)
+        if normalized in scheduled:
+            continue
+        if len(scheduled) >= _DIRECTORY_SCAN_PAGE_LIMIT:
+            scan_limited = True
+            break
+        scheduled.add(normalized)
+        pending.append((root, 0, root))
+    scans: list[WorkItem] = []
+    seed_urls = {
+        _normalized_directory_url(seed_scan.url),
+        _normalized_directory_url(seed_scan.final_url or seed_scan.url),
+    }
+    while pending:
+        root, depth, scope_root = pending.popleft()
+        normalized = _normalized_directory_url(root)
+        if normalized in seed_urls:
+            scan = seed_scan
+        else:
+            scan = _with_menu_status(
+                console,
+                "Scanning selected folder",
+                partial(actions.scan_url, root),
+            )
+        if not _directory_scan_result_is_safe(scan, scope_root=scope_root):
+            console.print(
+                f"[{ATLAS_WARNING_STYLE}]Skipped a folder scan that redirected outside the "
+                f"selected origin or folder.[/{ATLAS_WARNING_STYLE}]"
+            )
+            continue
+        scans.append(scan)
+        if depth >= settings.dir_depth:
+            continue
+        for item in scan.discovered_work_items:
+            candidate = item.final_url or item.url
+            if not _directory_child_is_safe(item, candidate, scope_root=scope_root):
+                continue
+            child_key = _normalized_directory_url(candidate)
+            if child_key in scheduled:
+                continue
+            if len(scheduled) >= _DIRECTORY_SCAN_PAGE_LIMIT:
+                scan_limited = True
+                continue
+            scheduled.add(child_key)
+            pending.append((candidate, depth + 1, scope_root))
+    return scans, scan_limited
+
+
+def _normalized_directory_url(url: str) -> str:
+    parsed = urlsplit(url)
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower()
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        path = parsed.path.rstrip("/") or "/"
+        return urlunsplit((scheme, parsed.netloc, path, parsed.query, ""))
+    if (scheme, port) in {("http", 80), ("https", 443)}:
+        port = None
+    userinfo = parsed.netloc.rsplit("@", 1)[0] + "@" if "@" in parsed.netloc else ""
+    netloc = f"{userinfo}{hostname}{f':{port}' if port is not None else ''}"
+    path = parsed.path.rstrip("/") or "/"
+    return urlunsplit((scheme, netloc, path, parsed.query, ""))
+
+
+def _directory_child_is_safe(item: WorkItem, url: str, *, scope_root: str) -> bool:
+    return bool(
+        item.kind == HubKind.dir
+        and not item.error
+        and item.same_host
+        and not item.external_host
+        and _is_same_origin_url(url, scope_root)
+        and _directory_url_is_within_root(url, scope_root)
+    )
+
+
+def _directory_scan_result_is_safe(scan: WorkItem, *, scope_root: str) -> bool:
+    final_url = scan.final_url or scan.url
+    return _is_same_origin_url(final_url, scope_root) and _directory_url_is_within_root(
+        final_url,
+        scope_root,
+    )
+
+
+def _is_same_origin_url(candidate: str, source: str) -> bool:
+    return same_http_origin(candidate, source)
+
+
+def _directory_url_is_within_root(candidate: str, root: str) -> bool:
+    return url_within_directory_scope(root, candidate)
 
 
 def _print_deep_directory_scan_summary(
@@ -5512,6 +5772,8 @@ def _print_deep_directory_scan_summary(
     seed_scan: WorkItem,
     selected_roots: Sequence[str],
     scans: Sequence[WorkItem],
+    *,
+    scan_limited: bool = False,
 ) -> None:
     total_counts = {
         "folders": 0,
@@ -5522,6 +5784,8 @@ def _print_deep_directory_scan_summary(
     }
     estimated_size = 0
     estimated_known = False
+    incomplete_scans = 0
+    scan_warnings: list[str] = []
     for scan in scans:
         counts = _scan_link_counts(scan)
         for key in total_counts:
@@ -5529,14 +5793,20 @@ def _print_deep_directory_scan_summary(
         if scan.scan_estimated_bytes is not None:
             estimated_known = True
             estimated_size += scan.scan_estimated_bytes
+        if scan.scan_status == ScanStatus.partial or scan.scan_counts.get("complete") == 0:
+            incomplete_scans += 1
+        for warning in scan.scan_warnings:
+            if warning and warning not in scan_warnings:
+                scan_warnings.append(warning)
+    partial = scan_limited or incomplete_scans > 0
     _print_screen_title(
         console,
-        "Scan complete",
+        "Scan partial" if partial else "Scan complete",
         f"Selected: {_selected_roots_label(selected_roots)}",
     )
     rows: list[tuple[str, str]] = [
         ("Source", escape(_compact_url_label(seed_scan.final_url or seed_scan.url))),
-        ("Scope", visual_join(("same host", "no parent", "bounded scan"))),
+        ("Scope", visual_join(("same origin", "no parent", "bounded scan"))),
         ("Folders", f"{total_counts['folders']:,}"),
         ("Files", f"{total_counts['files']:,}"),
         ("HTML", f"{total_counts['html']:,}"),
@@ -5551,7 +5821,23 @@ def _print_deep_directory_scan_summary(
             f"~{format_bytes(estimated_size)}" if estimated_known else "unknown",
         )
     )
-    rows.append(("Plan", "exact-list adaptive batch"))
+    rows.append(
+        (
+            "Plan",
+            "discovered files only" if partial else "exact-list adaptive batch",
+        )
+    )
+    if incomplete_scans:
+        rows.append(
+            (
+                "Coverage",
+                f"{incomplete_scans:,} incomplete page(s); totals are lower bounds",
+            )
+        )
+    if scan_warnings:
+        rows.append(("Warning", visual_join(scan_warnings[:2])))
+    if scan_limited:
+        rows.append(("Limit", f"stopped after {_DIRECTORY_SCAN_PAGE_LIMIT:,} folder pages"))
     _print_fact_rows(console, rows)
 
 
@@ -5735,13 +6021,21 @@ def _downloadable_links_from_directory_index(directory_index: DirectoryIndex) ->
     return [entry.url for entry in _downloadable_entries_from_directory_index(directory_index)]
 
 
+def _directory_folders(directory_index: DirectoryIndex) -> tuple[DirectoryEntry, ...]:
+    return tuple(
+        entry
+        for entry in directory_index.folders
+        if _directory_entry_is_in_scope(directory_index, entry)
+    )
+
+
 def _downloadable_entries_from_directory_index(
     directory_index: DirectoryIndex,
 ) -> list[DirectoryEntry]:
     entries: list[DirectoryEntry] = []
     seen: set[str] = set()
     for entry in directory_index.files:
-        if not _directory_entry_is_downloadable(entry):
+        if not _directory_entry_is_downloadable(entry, directory_index=directory_index):
             continue
         if entry.url in seen:
             continue
@@ -5750,8 +6044,26 @@ def _downloadable_entries_from_directory_index(
     return entries
 
 
-def _directory_entry_is_downloadable(entry: DirectoryEntry) -> bool:
-    return not entry.parent and entry.kind == "file" and _link_looks_downloadable(entry.url)
+def _directory_entry_is_downloadable(
+    entry: DirectoryEntry,
+    *,
+    directory_index: DirectoryIndex,
+) -> bool:
+    return (
+        not entry.parent
+        and entry.kind == "file"
+        and _directory_entry_is_in_scope(directory_index, entry)
+    )
+
+
+def _directory_entry_is_in_scope(
+    directory_index: DirectoryIndex,
+    entry: DirectoryEntry,
+) -> bool:
+    return _is_same_origin_url(
+        entry.url,
+        directory_index.source_url,
+    ) and _directory_url_is_within_root(entry.url, directory_index.source_url)
 
 
 def _directory_entry_choice_label(entry: DirectoryEntry) -> str:
@@ -5765,7 +6077,7 @@ def _directory_entry_choice_label(entry: DirectoryEntry) -> str:
 
 
 def _directory_entry_name(entry: DirectoryEntry) -> str:
-    name = entry.name
+    name = safe_directory_display_name(entry.name) or "unnamed"
     if entry.kind == "directory" and not name.endswith("/"):
         return f"{name}/"
     return name
@@ -5778,11 +6090,19 @@ def _directory_entry_modified_label(entry: DirectoryEntry) -> str:
 
 
 def _directory_entry_size_label(entry: DirectoryEntry) -> str:
-    if entry.kind == "directory":
-        return "-"
     if entry.visible_size is None:
-        return "size unknown"
+        return "-" if entry.kind == "directory" else "size unknown"
     return format_bytes(entry.visible_size)
+
+
+def _selected_directory_size_label(entries: Sequence[DirectoryEntry]) -> str:
+    known_bytes = sum(entry.visible_size or 0 for entry in entries)
+    unknown_count = sum(entry.visible_size is None for entry in entries)
+    if not known_bytes:
+        return "total size unknown"
+    if unknown_count:
+        return f"at least {format_bytes(known_bytes)} ({unknown_count} unknown)"
+    return format_bytes(known_bytes)
 
 
 def _downloadable_link_label(url: str) -> str:
@@ -5796,6 +6116,8 @@ def _downloadable_link_label(url: str) -> str:
 
 def _downloadable_links_from_scan(scan: WorkItem) -> list[str]:
     seed_url = scan.final_url or scan.url
+    if not _is_same_origin_url(seed_url, scan.url):
+        return []
     seed_host = _host_for_menu(seed_url)
     urls: list[str] = []
     seen: set[str] = set()
@@ -5805,6 +6127,8 @@ def _downloadable_links_from_scan(scan: WorkItem) -> list[str]:
         if absolute in seen:
             return
         if not _is_same_host_url(absolute, seed_host):
+            return
+        if not _is_same_origin_url(absolute, seed_url):
             return
         if not _link_looks_downloadable(absolute):
             return
@@ -6014,9 +6338,7 @@ def _print_scan_error_details(console: Console, scan: WorkItem) -> None:
         code = error.get("code", "unknown")
         message = error.get("message", "")
         url = error.get("url", scan.url)
-        rows.append(
-            (f"Error {index}", visual_join((escape(str(code)), escape(str(message)))))
-        )
+        rows.append((f"Error {index}", visual_join((escape(str(code)), escape(str(message))))))
         rows.append(("URL", escape(str(url))))
     if not scan.error and not scan.scan_errors:
         rows.append(("Details", "No additional scanner details were recorded."))
@@ -6150,9 +6472,34 @@ def _write_menu_batch_file(output_dir: Path, urls: Sequence[str]) -> Path:
         ensure_private_directory(batch_dir)
         path = batch_dir / f"pasted-urls-{uuid4().hex}.txt"
         write_private_text(path, "\n".join(urls) + "\n")
+        _prune_menu_batch_files(batch_dir, preserve=path)
         return path
     except OSError as exc:
         raise AtlasError(f"Could not create private menu batch file: {exc}") from exc
+
+
+def _prune_menu_batch_files(
+    batch_dir: Path,
+    *,
+    preserve: Path,
+    keep: int = 20,
+) -> None:
+    candidates: list[tuple[int, str, Path]] = []
+    for candidate in batch_dir.glob("pasted-urls-*.txt"):
+        if candidate == preserve or candidate.is_symlink():
+            continue
+        try:
+            if not candidate.is_file():
+                continue
+            candidates.append((candidate.stat().st_mtime_ns, candidate.name, candidate))
+        except OSError:
+            continue
+    candidates.sort(reverse=True)
+    for _mtime, _name, candidate in candidates[max(0, keep - 1) :]:
+        try:
+            candidate.unlink()
+        except OSError:
+            continue
 
 
 def _print_batch_plan(
@@ -6192,11 +6539,44 @@ def _print_batch_plan(
     )
 
 
-def _reveal_path(path: Path) -> None:
-    if shutil.which("open"):
-        subprocess.run(["open", "-R", str(path)], check=False)
+def _path_launch_available() -> bool:
+    return _path_launcher() is not None
 
 
-def _open_path(path: Path) -> None:
-    if shutil.which("open"):
-        subprocess.run(["open", str(path)], check=False)
+def _path_launcher() -> tuple[str, str] | None:
+    if sys.platform == "darwin":
+        executable = shutil.which("open")
+        return ("open", executable) if executable else None
+    executable = shutil.which("xdg-open")
+    return ("xdg-open", executable) if executable else None
+
+
+def _reveal_path(path: Path) -> str | None:
+    launcher = _path_launcher()
+    if launcher is None:
+        return "Could not show the download: no desktop opener is installed."
+    kind, executable = launcher
+    command = (
+        [executable, "-R", str(path)]
+        if kind == "open"
+        else [executable, str(path if path.is_dir() else path.parent)]
+    )
+    return _run_path_launcher(command, action="show the download")
+
+
+def _open_path(path: Path) -> str | None:
+    launcher = _path_launcher()
+    if launcher is None:
+        return "Could not open the download: no desktop opener is installed."
+    _kind, executable = launcher
+    return _run_path_launcher([executable, str(path)], action="open the download")
+
+
+def _run_path_launcher(command: list[str], *, action: str) -> str | None:
+    try:
+        result = subprocess.run(command, check=False)
+    except OSError as exc:
+        return f"Could not {action}: {exc}"
+    if result.returncode:
+        return f"Could not {action}: desktop opener exited with status {result.returncode}."
+    return None

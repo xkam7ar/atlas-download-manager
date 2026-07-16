@@ -25,6 +25,7 @@ from atlas.errors import AtlasError
 from atlas.models import (
     AdaptiveDownloadPlan,
     AdaptivePoliteness,
+    AudioDownloadOptions,
     BatchEntry,
     BatchItemResult,
     BatchKind,
@@ -32,6 +33,7 @@ from atlas.models import (
     DirectFileProbe,
     DoctorCheck,
     DoctorReport,
+    DownloadPlan,
     DownloadResult,
     DownloadStatus,
     EngineKind,
@@ -40,19 +42,30 @@ from atlas.models import (
     FileSizeClass,
     FormatInfo,
     HubKind,
+    InfoOptions,
     MediaInfo,
     OptimizedDownloadPlan,
+    OrganizeMode,
     ProgressEvent,
     ProgressPhase,
+    ScanStatus,
     SiteDownloadOptions,
     VideoCodecChoice,
+    VideoDownloadOptions,
     WorkBucket,
     WorkItem,
 )
 from atlas.optimizer import HubExecutionPlan
 from atlas.runner import ProcessControl
 from atlas.sessions import SmartDownloadSession
-from atlas.setup import RuntimeTool, SetupEnvironment, SetupMode, SetupPlan, UpdatePlan
+from atlas.setup import (
+    PackageManager,
+    RuntimeTool,
+    SetupEnvironment,
+    SetupMode,
+    SetupPlan,
+    UpdatePlan,
+)
 from atlas.theme import (
     ATLAS_ACTIVE_STYLE,
     ATLAS_ERROR_STYLE,
@@ -230,7 +243,7 @@ def test_config_show() -> None:
 def test_doctor_json_output(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "atlas.cli.run_doctor",
-        lambda _settings: DoctorReport(
+        lambda _settings, **_kwargs: DoctorReport(
             checks=[DoctorCheck(name="Python", ok=True, detail="3.12.7")]
         ),
     )
@@ -245,7 +258,7 @@ def test_doctor_json_output(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_doctor_network_json_filters_network_checks(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "atlas.cli.run_doctor",
-        lambda _settings: DoctorReport(
+        lambda _settings, **_kwargs: DoctorReport(
             checks=[
                 DoctorCheck(name="Python", ok=True, detail="3.12.7"),
                 DoctorCheck(name="Python SSL", ok=True, detail="OpenSSL"),
@@ -267,7 +280,7 @@ def test_doctor_network_json_filters_network_checks(monkeypatch: pytest.MonkeyPa
 def test_doctor_network_json_fails_on_https_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "atlas.cli.run_doctor",
-        lambda _settings: DoctorReport(
+        lambda _settings, **_kwargs: DoctorReport(
             checks=[
                 DoctorCheck(name="Python", ok=True, detail="3.12.7"),
                 DoctorCheck(name="Python SSL", ok=True, detail="OpenSSL"),
@@ -291,7 +304,7 @@ def test_doctor_network_json_fails_on_https_failure(monkeypatch: pytest.MonkeyPa
 def test_doctor_fix_certs_outputs_safe_guidance(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "atlas.cli.run_doctor",
-        lambda _settings: DoctorReport(
+        lambda _settings, **_kwargs: DoctorReport(
             checks=[
                 DoctorCheck(name="Python", ok=True, detail="3.12.7"),
                 DoctorCheck(name="Python SSL", ok=True, detail="OpenSSL"),
@@ -317,7 +330,7 @@ def test_doctor_fix_certs_outputs_safe_guidance(monkeypatch: pytest.MonkeyPatch)
 def _fake_setup_plan(tmp_path: Path) -> SetupPlan:
     tool = RuntimeTool(
         executable="ffmpeg",
-        package="ffmpeg",
+        packages=dict.fromkeys(PackageManager, "ffmpeg"),
         purpose="media runtime",
         modes=frozenset({SetupMode.full}),
         required=True,
@@ -361,6 +374,107 @@ def test_setup_json_outputs_install_plan(
     assert payload["environment"]["package_manager"] == "homebrew"
     assert payload["missing_tools"] == ["ffmpeg"]
     assert payload["install_commands"] == ["brew install ffmpeg"]
+
+
+@pytest.mark.parametrize(
+    ("manager", "package"),
+    [
+        (PackageManager.homebrew, "ffmpeg"),
+        (PackageManager.apt, "ffmpeg"),
+        (PackageManager.dnf, "ffmpeg-free"),
+        (PackageManager.pacman, "ffmpeg"),
+    ],
+)
+def test_setup_json_reports_host_specific_package(
+    tmp_path: Path,
+    manager: PackageManager,
+    package: str,
+) -> None:
+    tool = RuntimeTool(
+        executable="ffmpeg",
+        packages={
+            PackageManager.homebrew: "ffmpeg",
+            PackageManager.apt: "ffmpeg",
+            PackageManager.dnf: "ffmpeg-free",
+            PackageManager.pacman: "ffmpeg",
+        },
+        purpose="media runtime",
+        modes=frozenset({SetupMode.full}),
+        required=True,
+    )
+    plan = SetupPlan(
+        mode=SetupMode.full,
+        environment=SetupEnvironment(
+            os_name="macOS" if manager == PackageManager.homebrew else "Linux",
+            architecture="x86_64",
+            shell="bash",
+            package_manager=manager,
+            package_manager_path=f"/usr/bin/{manager.value}",
+            install_method="unknown",
+            atlas_executable=None,
+        ),
+        tools=(tool,),
+        missing_tools=(tool,),
+        existing_tools=(),
+        install_commands=(),
+        manual_commands=(),
+        config_file=tmp_path / "config.toml",
+        output_dir=tmp_path / "out",
+        can_install=False,
+    )
+
+    payload = cli._setup_plan_as_dict(plan)
+
+    assert payload["environment"]["package_manager"] == manager.value  # type: ignore[index]
+    assert payload["tools"][0]["package"] == package  # type: ignore[index]
+
+
+def test_setup_no_install_is_plan_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "atlas.cli.build_setup_plan",
+        lambda _settings, *, mode: _fake_setup_plan(tmp_path),
+    )
+    monkeypatch.setattr(
+        "atlas.cli.apply_setup_plan",
+        lambda *_args, **_kwargs: pytest.fail("plan-only setup must not mutate paths"),
+    )
+
+    result = runner.invoke(app, ["setup", "--full", "--no-install"])
+
+    assert result.exit_code == 0
+    assert "Will install missing tools with" in result.output
+    assert not (tmp_path / "config.toml").exists()
+    assert not (tmp_path / "out").exists()
+
+
+def test_doctor_fix_no_install_is_plan_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "atlas.cli.run_doctor",
+        lambda _settings, **_kwargs: DoctorReport(
+            checks=[DoctorCheck(name="Python", ok=True, detail="3.12.7")]
+        ),
+    )
+    monkeypatch.setattr(
+        "atlas.cli.build_setup_plan",
+        lambda _settings, *, mode: _fake_setup_plan(tmp_path),
+    )
+    monkeypatch.setattr(
+        "atlas.cli.apply_setup_plan",
+        lambda *_args, **_kwargs: pytest.fail("plan-only doctor must not mutate paths"),
+    )
+
+    result = runner.invoke(app, ["doctor", "--fix", "--no-install"])
+
+    assert result.exit_code == 0
+    assert "Will install missing tools with" in result.output
+    assert not (tmp_path / "config.toml").exists()
+    assert not (tmp_path / "out").exists()
 
 
 def test_setup_rejects_conflicting_modes() -> None:
@@ -435,7 +549,7 @@ def test_doctor_fix_json_includes_setup_plan(
 ) -> None:
     monkeypatch.setattr(
         "atlas.cli.run_doctor",
-        lambda _settings: DoctorReport(
+        lambda _settings, **_kwargs: DoctorReport(
             checks=[DoctorCheck(name="Python", ok=True, detail="3.12.7")]
         ),
     )
@@ -1539,6 +1653,177 @@ def test_batch_shared_aria2_queue_applies_duplicate_filename_overrides(
     assert queued_outputs == ["one__file.iso", "two__file.iso"]
 
 
+def test_batch_shared_queue_reserves_casefolded_probe_filenames(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from atlas.aria2_rpc import Aria2RpcDownloadResult, Aria2RpcQueuedDownloadResult
+    from atlas.cli import _try_run_aria2_batch_queue
+
+    batch_file = tmp_path / "urls.txt"
+    batch_file.write_text(
+        "https://example.com/releases/one\nhttps://example.com/releases/two\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("atlas.optimizer.shutil.which", lambda name: f"/opt/bin/{name}")
+
+    def probe(url: str) -> DirectFileProbe:
+        filename = "Report.pdf" if url.endswith("one") else "report.pdf"
+        return DirectFileProbe(
+            url=url,
+            final_url=url,
+            content_length=700 * 1024 * 1024,
+            filename=filename,
+            supports_ranges=True,
+            file_extension=".pdf",
+            host="example.com",
+            final_host="example.com",
+        )
+
+    monkeypatch.setattr("atlas.optimizer.probe_direct_file", probe)
+    queued_outputs: list[str] = []
+
+    class FakeAria2Session:
+        def __init__(self, **_kwargs: object) -> None:
+            return None
+
+        def download_many(self, queued):
+            queued_outputs.extend(item.output.name for item in queued)
+            return [
+                Aria2RpcQueuedDownloadResult(
+                    item=item,
+                    result=Aria2RpcDownloadResult(
+                        gid=f"gid-{index}",
+                        output=item.output,
+                        status={},
+                    ),
+                )
+                for index, item in enumerate(queued, start=1)
+            ]
+
+    monkeypatch.setattr("atlas.cli.Aria2RpcSession", FakeAria2Session)
+    settings = AtlasSettings(output_dir=tmp_path / "out", archive_file=tmp_path / "archive.txt")
+
+    summary = _try_run_aria2_batch_queue(
+        settings,
+        file=batch_file,
+        kind=BatchKind.file,
+        output_dir=settings.output_dir,
+        backend="aria2",
+        allow_sites=False,
+        resolved_concurrency=2,
+        video_codec=VideoCodecChoice.auto,
+        audio_codec=None,
+        audio_quality=None,
+        adaptive=False,
+        max_concurrency=None,
+        per_host_concurrency=None,
+        politeness=AdaptivePoliteness.normal,
+        verbose=False,
+        reporter=None,
+    )
+
+    assert summary is not None
+    assert summary.succeeded == 2
+    assert len({name.casefold() for name in queued_outputs}) == 2
+    assert queued_outputs[0] == "Report.pdf"
+    assert queued_outputs[1].endswith("__report.pdf")
+
+
+def test_batch_shared_queue_retries_only_tls_failed_items_with_curl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from atlas.aria2_rpc import (
+        Aria2RpcDownloadResult,
+        Aria2RpcQueuedDownloadResult,
+    )
+    from atlas.cli import _try_run_aria2_batch_queue
+
+    batch_file = tmp_path / "urls.txt"
+    batch_file.write_text(
+        "https://example.com/one.iso\nhttps://example.com/two.iso\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("atlas.optimizer.shutil.which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.setattr(
+        "atlas.optimizer.probe_direct_file",
+        lambda url: DirectFileProbe(
+            url=url,
+            final_url=url,
+            content_length=700 * 1024 * 1024,
+            supports_ranges=True,
+            file_extension=".iso",
+            host="example.com",
+            final_host="example.com",
+        ),
+    )
+
+    class FakeAria2Session:
+        def __init__(self, **_kwargs: object) -> None:
+            return None
+
+        def download_many(self, queued):
+            return [
+                Aria2RpcQueuedDownloadResult(
+                    item=queued[0],
+                    result=Aria2RpcDownloadResult(
+                        gid="gid-1",
+                        output=queued[0].output,
+                        status={},
+                    ),
+                ),
+                Aria2RpcQueuedDownloadResult(
+                    item=queued[1],
+                    error=("SSL/TLS handshake failure: unable to get local issuer certificate"),
+                ),
+            ]
+
+    retried: list[str] = []
+
+    def retry_curl(self, options, *, output, progress_callback=None, message):
+        _ = self, progress_callback, message
+        retried.append(options.url)
+        return DownloadResult(
+            status=DownloadStatus.success,
+            url=options.url,
+            message=f"Saved to {output} (curl TLS fallback)",
+            ydl_opts={"backend": "curl", "output": str(output)},
+        )
+
+    monkeypatch.setattr("atlas.cli.Aria2RpcSession", FakeAria2Session)
+    monkeypatch.setattr(
+        "atlas.cli.FileDownloadEngine.download_with_verified_curl",
+        retry_curl,
+    )
+    settings = AtlasSettings(output_dir=tmp_path / "out", archive_file=tmp_path / "archive.txt")
+
+    summary = _try_run_aria2_batch_queue(
+        settings,
+        file=batch_file,
+        kind=BatchKind.file,
+        output_dir=settings.output_dir,
+        backend="aria2",
+        allow_sites=False,
+        resolved_concurrency=2,
+        video_codec=VideoCodecChoice.auto,
+        audio_codec=None,
+        audio_quality=None,
+        adaptive=False,
+        max_concurrency=None,
+        per_host_concurrency=None,
+        politeness=AdaptivePoliteness.normal,
+        verbose=False,
+        reporter=None,
+    )
+
+    assert summary is not None
+    assert summary.succeeded == 2
+    assert summary.failed == 0
+    assert retried == ["https://example.com/two.iso"]
+    assert summary.results[1].plan["queue"]["engine"] == "curl"
+
+
 def test_batch_shared_aria2_queue_receives_adaptive_scheduler(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1674,6 +1959,42 @@ def test_file_summary_shows_probe_metadata(monkeypatch: pytest.MonkeyPatch) -> N
     assert "sha256" in result.output
 
 
+def test_file_runtime_json_is_one_document(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "atlas.cli.DirectFileAdapter.run",
+        lambda self, options, **_kwargs: DownloadResult(
+            status=DownloadStatus.success,
+            url=options.url,
+            message="saved",
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "file",
+            "https://example.com/archive.zip",
+            "--backend",
+            "native",
+            "--output-dir",
+            str(tmp_path),
+            "--json",
+            "--progress",
+            "compact",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["status"] == "success"
+    assert payload["kind"] == "file"
+    assert payload["url"] == "https://example.com/archive.zip"
+    assert payload["files"] == [str(tmp_path / "archive.zip")]
+
+
 def test_site_dry_run_json(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
 
@@ -1695,6 +2016,44 @@ def test_site_dry_run_json(monkeypatch: pytest.MonkeyPatch) -> None:
     assert '"backend": "wget2"' in result.output
     assert "--recursive" in result.output
     assert "--level=1" in result.output
+
+
+def test_site_runtime_json_is_one_document(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.setattr(
+        "atlas.cli.SiteMirrorAdapter.run",
+        lambda self, options, **_kwargs: DownloadResult(
+            status=DownloadStatus.success,
+            url=options.url,
+            message="saved",
+            ydl_opts={"backend": "wget2", "output": str(options.output_dir)},
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "site",
+            "https://example.com/docs/",
+            "--backend",
+            "wget2",
+            "--output-dir",
+            str(tmp_path),
+            "--json",
+            "--progress",
+            "full",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["status"] == "success"
+    assert payload["kind"] == "site"
+    assert payload["url"] == "https://example.com/docs/"
+    assert payload["files"] == [str(tmp_path)]
 
 
 def test_site_accepts_page_requisites_alias(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1915,6 +2274,147 @@ def test_dir_adaptive_explain_human_uses_smart_plan_preview(
     assert "crawler queue with per-host politeness" in result.output
     assert '"route":' not in result.output
     assert '"summary":' not in result.output
+
+
+def test_dir_adaptive_explain_human_surfaces_failed_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.setattr(
+        "atlas.optimizer.scan_site",
+        lambda url, *, dry_run: WorkItem(
+            url=url,
+            host="example.com",
+            kind=HubKind.dir,
+            scan_type="failed scan",
+            scan_status=ScanStatus.failed,
+            scan_recommended_strategy="retry, run doctor, or continue as backend mirror",
+            scan_errors=[
+                {
+                    "code": "http_status",
+                    "message": "HTTP 403: Forbidden",
+                    "url": url,
+                    "recoverable": True,
+                }
+            ],
+            error="HTTP 403: Forbidden",
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "dir",
+            "https://example.com/files/",
+            "--backend",
+            "wget2",
+            "--adaptive",
+            "--explain",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Discovery" in result.output
+    assert "Scan" in result.output
+    assert "failed · HTTP 403: Forbidden" in result.output
+    assert "backend mirror plan continues without verified discovery" in result.output
+    assert "Equivalent Backend Command" in result.output
+
+
+def test_dir_adaptive_explain_preserves_partial_root_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.setattr(
+        "atlas.optimizer.scan_site",
+        lambda url, *, dry_run: WorkItem(
+            url=url,
+            final_url=url,
+            host="example.com",
+            kind=HubKind.dir,
+            scan_type="directory-style HTML index",
+            scan_status=ScanStatus.partial,
+            scan_counts={"links": 2_000, "same_host": 1, "complete": 0},
+            scan_warnings=["link extraction stopped at the 2,000-link safety limit"],
+            discovered_work_items=[
+                WorkItem(
+                    url=f"{url}visible.pdf",
+                    host="example.com",
+                    kind=HubKind.file,
+                )
+            ],
+        ),
+    )
+
+    json_result = runner.invoke(
+        app,
+        [
+            "dir",
+            "https://example.com/files/",
+            "--backend",
+            "wget2",
+            "--adaptive",
+            "--explain",
+            "--json",
+        ],
+    )
+    human_result = runner.invoke(
+        app,
+        [
+            "dir",
+            "https://example.com/files/",
+            "--backend",
+            "wget2",
+            "--adaptive",
+            "--explain",
+        ],
+    )
+
+    assert json_result.exit_code == 0
+    adaptive = json.loads(json_result.output)["summary"]["adaptive"]
+    assert adaptive["scan_status"] == "partial"
+    assert adaptive["scan_counts"]["complete"] == 0
+    assert adaptive["scan_warnings"] == ["link extraction stopped at the 2,000-link safety limit"]
+    assert human_result.exit_code == 0
+    assert "Discovery" in human_result.output
+    assert "partial" in human_result.output
+    assert "visible discovery is incomplete" in human_result.output
+    assert "2,000-link safety limit" in human_result.output
+
+
+def test_dir_adaptive_explain_human_surfaces_empty_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.setattr(
+        "atlas.optimizer.scan_site",
+        lambda url, *, dry_run: WorkItem(
+            url=url,
+            final_url=url,
+            host="example.com",
+            kind=HubKind.dir,
+            scan_type="directory-style HTML index",
+            scan_status=ScanStatus.empty,
+            scan_counts={"links": 0, "same_host": 0, "complete": 1},
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "dir",
+            "https://example.com/files/",
+            "--backend",
+            "wget2",
+            "--adaptive",
+            "--explain",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Discovery" in result.output
+    assert "empty" in result.output
+    assert "no downloadable links were discovered" in result.output
 
 
 def test_site_dry_run_json_accepts_wget2_policy_flags(
@@ -2343,6 +2843,23 @@ def test_get_reports_invalid_backend_without_traceback() -> None:
     assert "Traceback" not in result.output
 
 
+def test_file_reports_invalid_checksum_without_traceback() -> None:
+    result = runner.invoke(
+        app,
+        [
+            "file",
+            "https://example.com/archive.zip",
+            "--checksum",
+            "broken",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "checksum must look like sha256:<hex-digest>" in result.output
+    assert "Traceback" not in result.output
+
+
 def test_video_download_prints_summary_without_network(monkeypatch: pytest.MonkeyPatch) -> None:
     expected_hook = object()
     events: list[object] = []
@@ -2397,6 +2914,271 @@ def test_video_download_prints_summary_without_network(monkeypatch: pytest.Monke
         getattr(event, "status", None) == "running"
         and getattr(event, "message", None) == "temporary .part files are normal until merge"
         for event in events
+    )
+
+
+@pytest.mark.parametrize("progress_mode", ["auto", "compact", "full", "json"])
+def test_video_runtime_json_is_one_document(
+    progress_mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeEngine:
+        def get_info(self, _options):
+            return MediaInfo(id="abc123", title="Example Video", extractor="youtube")
+
+        def download_video(self, options, progress_hooks=None, postprocessor_hooks=None):
+            return DownloadResult(
+                status=DownloadStatus.success,
+                url=options.url,
+                message="done",
+            )
+
+    class FakeReporter:
+        def __init__(self, _console, **_kwargs):
+            self.saved_paths = ["/tmp/Example Video.mkv"]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def hook(self, _event):
+            return None
+
+    monkeypatch.setattr("atlas.cli._engine", lambda _settings: FakeEngine())
+    monkeypatch.setattr("atlas.cli.RichProgressReporter", FakeReporter)
+
+    result = runner.invoke(
+        app,
+        [
+            "video",
+            "https://example.com/watch?v=1",
+            "--json",
+            "--progress",
+            progress_mode,
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {
+        "status": "success",
+        "kind": "video",
+        "url": "https://example.com/watch?v=1",
+        "files": ["/tmp/Example Video.mkv"],
+    }
+
+
+def test_video_probe_receives_collection_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[InfoOptions] = []
+
+    class FakeEngine:
+        def get_info(self, options):
+            seen.append(options)
+            return MediaInfo(id="abc123", title="Example Video", extractor="youtube")
+
+        def download_video(self, options, progress_hooks=None, postprocessor_hooks=None):
+            return DownloadResult(
+                status=DownloadStatus.success,
+                url=options.url,
+                message="done",
+            )
+
+    class FakeReporter:
+        def __init__(self, _console, **_kwargs):
+            self.saved_paths = ["/tmp/Example Video.mkv"]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def hook(self, _event):
+            return None
+
+    monkeypatch.setattr("atlas.cli._engine", lambda _settings: FakeEngine())
+    monkeypatch.setattr("atlas.cli.RichProgressReporter", FakeReporter)
+
+    result = runner.invoke(
+        app,
+        [
+            "video",
+            "https://www.youtube.com/@example/videos",
+            "--playlist",
+            "--playlist-items",
+            "1",
+            "--socket-timeout",
+            "7",
+            "--quiet",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert len(seen) == 1
+    probe = seen[0]
+    assert probe.playlist is True
+    assert probe.playlist_items == "1"
+    assert probe.playlist_start is None
+    assert probe.playlist_end is None
+    assert probe.socket_timeout == 7
+
+
+def test_collection_output_preview_uses_downloader_template(tmp_path: Path) -> None:
+    outtmpl = str(
+        tmp_path
+        / "%(playlist_title|playlist)s"
+        / "%(playlist_index)03d - %(title).200B [%(id)s].%(ext)s"
+    )
+    options = VideoDownloadOptions(
+        url="https://www.youtube.com/@AveryYapps/videos",
+        output_dir=tmp_path,
+        playlist=True,
+        playlist_items="1",
+        organize=OrganizeMode.playlist,
+    )
+    plan = DownloadPlan(
+        url=options.url,
+        output_dir=tmp_path,
+        outtmpl=outtmpl,
+        format="best",
+        noplaylist=False,
+        merge_output_format="mkv",
+    )
+    media = MediaInfo(
+        id="UCU28LWFMn1GN0coMTBFTo2w",
+        title="Avery Yapps - Videos",
+        extractor="youtube:tab",
+        is_playlist=True,
+    )
+
+    assert cli._output_preview(media=media, options=options, plan=plan, ext="mkv") == outtmpl
+
+
+def test_video_download_summary_does_not_repeat_format_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = VideoDownloadOptions(
+        url="https://example.com/watch?v=1",
+        output_dir=tmp_path,
+    )
+    plan = DownloadPlan(
+        url=options.url,
+        output_dir=tmp_path,
+        outtmpl=str(tmp_path / "%(title)s.%(ext)s"),
+        format="best",
+        noplaylist=True,
+        merge_output_format="mkv",
+    )
+    media = MediaInfo(
+        id="abc123",
+        title="Example Video",
+        extractor="youtube",
+        formats=[FormatInfo(format_id="18", ext="mp4")],
+    )
+
+    monkeypatch.setattr(
+        cli,
+        "_print_smart_format_choices",
+        lambda _formats: pytest.fail("download summary repeated the format catalog"),
+    )
+
+    cli._print_video_summary(media, options, plan)
+
+
+def test_audio_runtime_json_is_one_document(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeEngine:
+        def get_info(self, _options):
+            return MediaInfo(id="abc123", title="Example Audio", extractor="youtube")
+
+        def download_audio(self, options, progress_hooks=None, postprocessor_hooks=None):
+            return DownloadResult(
+                status=DownloadStatus.success,
+                url=options.url,
+                message="done",
+            )
+
+    class FakeReporter:
+        def __init__(self, _console, **_kwargs):
+            self.saved_paths = ["/tmp/Example Audio.m4a"]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def hook(self, _event):
+            return None
+
+    monkeypatch.setattr("atlas.cli._engine", lambda _settings: FakeEngine())
+    monkeypatch.setattr("atlas.cli.RichProgressReporter", FakeReporter)
+
+    result = runner.invoke(
+        app,
+        [
+            "audio",
+            "https://example.com/watch?v=1",
+            "--json",
+            "--progress",
+            "compact",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {
+        "status": "success",
+        "kind": "audio",
+        "url": "https://example.com/watch?v=1",
+        "files": ["/tmp/Example Audio.m4a"],
+    }
+
+
+def test_media_work_context_only_lists_planned_steps(tmp_path: Path) -> None:
+    single_stream = VideoDownloadOptions(
+        url="https://example.com/watch?v=1",
+        output_dir=tmp_path,
+        embed_metadata=False,
+        write_thumbnail=False,
+        embed_thumbnail=False,
+    )
+    video_plan = DownloadPlan(
+        url=single_stream.url,
+        output_dir=tmp_path,
+        outtmpl="%(title)s.%(ext)s",
+        format="best[height<=480]",
+        noplaylist=True,
+    )
+
+    context = cli._media_work_context(single_stream, video_plan)
+
+    assert context.steps == ("Download video", "Finalize")
+
+
+def test_media_work_context_lists_enabled_postprocessing(tmp_path: Path) -> None:
+    audio = AudioDownloadOptions(
+        url="https://example.com/watch?v=1",
+        output_dir=tmp_path,
+        embed_metadata=True,
+        write_thumbnail=False,
+        embed_thumbnail=True,
+    )
+    audio_plan = DownloadPlan(
+        url=audio.url,
+        output_dir=tmp_path,
+        outtmpl="%(title)s.%(ext)s",
+        format="bestaudio",
+        noplaylist=True,
+    )
+
+    context = cli._media_work_context(audio, audio_plan)
+
+    assert context.steps == (
+        "Download audio",
+        "Embed metadata",
+        "Embed artwork",
+        "Finalize",
     )
 
 
@@ -2517,6 +3299,16 @@ def test_archive_retry_notice_is_ascii_in_plain_mode() -> None:
             motion=True,
             env={},
         )
+
+
+def test_archive_retry_notice_does_not_contaminate_json_output() -> None:
+    output = StringIO()
+
+    with cli.console.capture() as capture:
+        cli._maybe_print_archive_retry(SimpleNamespace(quiet=False, json_output=True))
+    output.write(capture.get())
+
+    assert output.getvalue() == ""
 
 
 def test_video_overwrite_disables_archive_for_redownload(
@@ -2685,6 +3477,24 @@ def test_playlist_prompt_can_choose_audio() -> None:
     assert "FFmpegExtractAudio" in result.output
 
 
+def test_playlist_type_contract_only_accepts_video_or_audio() -> None:
+    result = runner.invoke(
+        app,
+        [
+            "playlist",
+            "https://www.youtube.com/playlist?list=PL123",
+            "--type",
+            "file",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "video" in result.output
+    assert "audio" in result.output
+    assert "file" in result.output
+
+
 def test_playlist_refuses_watch_url_with_radio_list() -> None:
     result = runner.invoke(
         app,
@@ -2738,6 +3548,17 @@ def test_info_json_uses_engine_without_network(monkeypatch: pytest.MonkeyPatch) 
 
     assert result.exit_code == 0
     assert '"title": "Example"' in result.output
+
+
+def test_info_rejects_unbounded_channel_without_traceback() -> None:
+    result = runner.invoke(
+        app,
+        ["info", "https://www.youtube.com/@example/videos", "--playlist"],
+    )
+
+    assert result.exit_code == 1
+    assert "finite selection bound" in result.output
+    assert "Traceback" not in result.output
 
 
 def test_info_accepts_cookie_file_without_network(
@@ -3337,6 +4158,7 @@ def test_batch_real_file_summary_keeps_route_plan(
             file_extension=".zip",
         ),
     )
+
     def fake_run(self, options, *, progress_callback=None):
         return DownloadResult(
             status=DownloadStatus.success,
@@ -3390,7 +4212,10 @@ def test_batch_concurrency_passes_progress_hooks(
 
     class FakeEngine:
         def download_video(self, options, progress_hooks=None, postprocessor_hooks=None):
-            assert progress_hooks == [expected_hook]
+            assert progress_hooks is not None
+            assert progress_hooks[0] is expected_hook
+            assert len(progress_hooks) == 2
+            assert callable(progress_hooks[1])
             calls.append(options.url)
             return DownloadResult(
                 status=DownloadStatus.success,
@@ -3950,9 +4775,7 @@ def test_inspect_session_ignores_untrusted_saved_output_path(
             {
                 "kind": "file",
                 "retry_failed_only": [],
-                "smart_session": {
-                    "customization": {"output_dir": str(untrusted_output)}
-                },
+                "smart_session": {"customization": {"output_dir": str(untrusted_output)}},
             }
         ),
         encoding="utf-8",
@@ -4698,6 +5521,104 @@ def test_batch_site_plan_passes_process_control_to_mirror_adapter(
     assert captured_controls == [process_control]
 
 
+def test_batch_file_plan_checks_active_process_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    url = "https://example.com/file.zip"
+    route = EngineRoute(
+        kind=HubKind.file,
+        engine=EngineKind.native,
+        reason="test",
+        url=url,
+        output_dir=tmp_path,
+    )
+    plan = HubExecutionPlan(
+        route=route,
+        preview=OptimizedDownloadPlan(route=route, output=tmp_path / "file.zip"),
+        options=FileDownloadOptions(url=url, output_dir=tmp_path),
+    )
+    process_control = ProcessControl()
+
+    class FakeDirectFileAdapter:
+        def run(self, options, *, progress_callback=None):
+            process_control.cancel("stop active file")
+            assert progress_callback is not None
+            progress_callback(
+                ProgressEvent(
+                    engine=EngineKind.native,
+                    status="downloading",
+                    phase=ProgressPhase.download,
+                    kind=HubKind.file,
+                    url=options.url,
+                    downloaded_bytes=1,
+                )
+            )
+            return DownloadResult(
+                status=DownloadStatus.success,
+                url=url,
+                message="should not complete",
+            )
+
+    monkeypatch.setattr("atlas.cli.DirectFileAdapter", FakeDirectFileAdapter)
+
+    with pytest.raises(RuntimeError, match="stop active file"):
+        _run_batch_hub_plan(
+            AtlasSettings(output_dir=tmp_path),
+            plan,
+            progress_hooks=None,
+            postprocessor_hooks=None,
+            progress_callback=lambda _event: None,
+            process_control=process_control,
+        )
+
+
+def test_batch_media_plan_checks_active_process_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    url = "https://example.com/watch?v=1"
+    route = EngineRoute(
+        kind=HubKind.video,
+        engine=EngineKind.ytdlp,
+        reason="test",
+        url=url,
+        output_dir=tmp_path,
+    )
+    plan = HubExecutionPlan(
+        route=route,
+        preview=OptimizedDownloadPlan(route=route, output=tmp_path),
+        options=VideoDownloadOptions(url=url, output_dir=tmp_path),
+    )
+    process_control = ProcessControl()
+
+    class FakeEngine:
+        def download_video(self, options, *, progress_hooks=None, postprocessor_hooks=None):
+            _ = options, postprocessor_hooks
+            process_control.cancel("stop active media")
+            assert progress_hooks is not None
+            for hook in progress_hooks:
+                hook({"status": "downloading"})
+            return DownloadResult(
+                status=DownloadStatus.success,
+                url=url,
+                message="should not complete",
+            )
+
+    monkeypatch.setattr("atlas.cli._engine", lambda _settings: FakeEngine())
+    monkeypatch.setattr("atlas.cli.ensure_download_dependencies", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="stop active media"):
+        _run_batch_hub_plan(
+            AtlasSettings(output_dir=tmp_path),
+            plan,
+            progress_hooks=None,
+            postprocessor_hooks=None,
+            progress_callback=None,
+            process_control=process_control,
+        )
+
+
 def test_hub_plan_preview_omits_redundant_intent_row(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -5097,3 +6018,25 @@ def test_batch_explicit_directory_kind_requires_allow_dirs(
     assert allowed.exit_code == 0
     assert '"succeeded": 1' in allowed.output
     assert '"kind": "dir"' in allowed.output
+
+
+def test_batch_human_summary_stays_readable_at_40_columns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("atlas.backends.shutil.which", lambda name: f"/opt/bin/{name}")
+    batch_file = tmp_path / "urls.txt"
+    batch_file.write_text("https://example.com/releases/app.dmg\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["--plain", "batch", str(batch_file), "--dry-run"],
+        env={"COLUMNS": "40"},
+    )
+
+    assert result.exit_code == 0
+    assert "dry-run" in result.output
+    assert "file via aria2" in result.output
+    assert result.output.count("file via") == 1
+    assert "https://example.com/releases/app.dmg" in result.output
+    assert max(len(line) for line in result.output.splitlines()) <= 40

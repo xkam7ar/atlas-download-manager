@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "atlas contributors" }]
-keywords = ["yt-dlp", "download-manager", "aria2", "wget2", "cli", "macos"]
+keywords = ["yt-dlp", "download-manager", "aria2", "wget2", "cli", "macos", "linux"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
@@ -23,6 +23,7 @@ classifiers = [
 ]
 dependencies = [
   "certifi>=2024.8",
+  "mutagen>=1.47",
   "platformdirs>=4.2",
   "pydantic>=2.7",
   "pydantic-settings>=2.2",

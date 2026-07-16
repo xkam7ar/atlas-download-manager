@@ -39,7 +39,7 @@ class ProcessCanceled(RuntimeError):
 
 
 class ProcessControl:
-    """Small thread-safe cancellation handle for subprocess-backed engines."""
+    """Small thread-safe cancellation handle for engines and hook checkpoints."""
 
     def __init__(self, *, reason: str = "canceled by operator") -> None:
         self._cancel_requested = Event()

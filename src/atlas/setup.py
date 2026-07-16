@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import platform
+import shlex
 import shutil
 import subprocess
 import sys
@@ -16,9 +17,9 @@ from atlas.config import AtlasSettings, settings_as_toml
 from atlas.paths import config_path, ensure_app_dirs
 
 ATLAS_REPOSITORY = "https://github.com/xkam7ar/atlas.git"
-ATLAS_RAW_INSTALL_URL = (
-    "https://raw.githubusercontent.com/xkam7ar/atlas/main/install.sh"
-)
+ATLAS_RAW_INSTALL_URL = "https://raw.githubusercontent.com/xkam7ar/atlas/main/install.sh"
+HOMEBREW_INSTALL_URL = "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
+LINUXBREW_PATH = "/home/linuxbrew/.linuxbrew/bin/brew"
 
 
 class SetupMode(StrEnum):
@@ -30,15 +31,36 @@ class SetupMode(StrEnum):
     mirrors = "mirrors"
 
 
+class PackageManager(StrEnum):
+    """System package managers Atlas can drive automatically."""
+
+    homebrew = "homebrew"
+    apt = "apt"
+    dnf = "dnf"
+    pacman = "pacman"
+
+
 @dataclass(frozen=True)
 class RuntimeTool:
     """A runtime executable and its package-manager mapping."""
 
     executable: str
-    package: str
+    packages: Mapping[PackageManager, str | None]
     purpose: str
     modes: frozenset[SetupMode]
     required: bool = False
+
+    @property
+    def package(self) -> str:
+        """Return the canonical Homebrew package name for compatibility."""
+
+        return self.packages[PackageManager.homebrew] or self.executable
+
+    def package_for(self, manager: PackageManager | str | None) -> str | None:
+        """Return the package providing this executable for a package manager."""
+
+        resolved = _package_manager(manager)
+        return self.packages.get(resolved) if resolved is not None else None
 
 
 @dataclass(frozen=True)
@@ -48,10 +70,12 @@ class SetupEnvironment:
     os_name: str
     architecture: str
     shell: str | None
-    package_manager: str | None
+    package_manager: PackageManager | str | None
     package_manager_path: str | None
     install_method: str
     atlas_executable: str | None
+    is_root: bool = False
+    elevation_tool: str | None = None
 
 
 @dataclass(frozen=True)
@@ -99,33 +123,58 @@ class UpdatePlan:
 TOOL_SPECS: tuple[RuntimeTool, ...] = (
     RuntimeTool(
         executable="ffmpeg",
-        package="ffmpeg",
+        packages={
+            PackageManager.homebrew: "ffmpeg",
+            PackageManager.apt: "ffmpeg",
+            PackageManager.dnf: "ffmpeg-free",
+            PackageManager.pacman: "ffmpeg",
+        },
         purpose="media download post-processing",
         modes=frozenset({SetupMode.full, SetupMode.minimal, SetupMode.media_only}),
         required=True,
     ),
     RuntimeTool(
         executable="ffprobe",
-        package="ffmpeg",
+        packages={
+            PackageManager.homebrew: "ffmpeg",
+            PackageManager.apt: "ffmpeg",
+            PackageManager.dnf: "ffmpeg-free",
+            PackageManager.pacman: "ffmpeg",
+        },
         purpose="media metadata probing",
         modes=frozenset({SetupMode.full, SetupMode.minimal, SetupMode.media_only}),
         required=True,
     ),
     RuntimeTool(
         executable="aria2c",
-        package="aria2",
+        packages={
+            PackageManager.homebrew: "aria2",
+            PackageManager.apt: "aria2",
+            PackageManager.dnf: "aria2",
+            PackageManager.pacman: "aria2",
+        },
         purpose="segmented direct-file downloads, Metalink, and shared batch queues",
         modes=frozenset({SetupMode.full}),
     ),
     RuntimeTool(
         executable="wget2",
-        package="wget2",
+        packages={
+            PackageManager.homebrew: "wget2",
+            PackageManager.apt: "wget2",
+            PackageManager.dnf: "wget2",
+            PackageManager.pacman: None,
+        },
         purpose="website and open-directory mirroring",
         modes=frozenset({SetupMode.full, SetupMode.mirrors}),
     ),
     RuntimeTool(
         executable="wget",
-        package="wget",
+        packages={
+            PackageManager.homebrew: "wget",
+            PackageManager.apt: "wget",
+            PackageManager.dnf: "wget1-wget",
+            PackageManager.pacman: "wget",
+        },
         purpose="mirror fallback backend",
         modes=frozenset({SetupMode.full, SetupMode.mirrors}),
     ),
@@ -142,23 +191,29 @@ def detect_setup_environment(
     *,
     env: Mapping[str, str] | None = None,
     which: Callable[[str], str | None] = shutil.which,
+    is_root: bool | None = None,
 ) -> SetupEnvironment:
     """Detect OS, shell, package manager, and likely Atlas install method."""
 
     resolved_env = os.environ if env is None else env
-    brew_path = which("brew")
+    os_name = _os_label()
+    package_manager, package_manager_path = _detect_package_manager(
+        os_name=os_name,
+        which=which,
+    )
     uv_path = which("uv")
-    package_manager = "homebrew" if brew_path else None
-    package_manager_path = brew_path
     atlas_executable = which("atlas")
+    resolved_is_root = _is_root() if is_root is None else is_root
     return SetupEnvironment(
-        os_name=_os_label(),
+        os_name=os_name,
         architecture=platform.machine() or "unknown",
         shell=_shell_name(resolved_env.get("SHELL")),
         package_manager=package_manager,
         package_manager_path=package_manager_path,
         install_method=detect_install_method(which=which, uv_path=uv_path),
         atlas_executable=atlas_executable,
+        is_root=resolved_is_root,
+        elevation_tool=None if resolved_is_root else which("sudo"),
     )
 
 
@@ -195,26 +250,17 @@ def build_setup_plan(
     tools = selected_tools(mode)
     existing_tools = tuple(tool for tool in tools if which(tool.executable) is not None)
     missing_tools = tuple(tool for tool in tools if which(tool.executable) is None)
-    packages = _dedupe(tool.package for tool in missing_tools)
     install_commands: list[tuple[str, ...]] = []
     manual_commands: list[str] = []
     notes: list[str] = []
-    if packages and environment.package_manager == "homebrew":
-        brew = environment.package_manager_path or "brew"
-        install_commands.append((brew, "install", *packages))
-        manual_commands.append("brew install " + " ".join(packages))
-    elif packages:
-        notes.append(
-            "No supported package manager was detected. Install the missing tools manually."
+    manager = _package_manager(environment.package_manager)
+    if missing_tools:
+        install_commands, manual_commands, notes = _build_install_commands(
+            missing_tools,
+            environment=environment,
+            manager=manager,
+            which=which,
         )
-        if environment.os_name == "macOS":
-            manual_commands.append(
-                '/bin/bash -c "$(curl -fsSL '
-                'https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
-            )
-        manual_commands.extend(_manual_tool_commands(packages, os_name=environment.os_name))
-    if environment.package_manager is None:
-        notes.append("Homebrew was not detected; Atlas will not install it silently.")
     return SetupPlan(
         mode=mode,
         environment=environment,
@@ -228,6 +274,49 @@ def build_setup_plan(
         can_install=bool(install_commands),
         notes=tuple(notes),
     )
+
+
+def package_for_environment(tool: RuntimeTool, environment: SetupEnvironment) -> str:
+    """Return the package shown for a tool on the detected host."""
+
+    manager = _package_manager(environment.package_manager)
+    package = tool.package_for(manager)
+    if package is not None:
+        return package
+    if manager == PackageManager.pacman:
+        return tool.package_for(PackageManager.homebrew) or tool.executable
+    return tool.package
+
+
+def install_hint_for_tool(
+    executable: str,
+    *,
+    environment: SetupEnvironment | None = None,
+) -> str:
+    """Return a host-aware one-line install hint for a runtime tool."""
+
+    if executable == "yt-dlp":
+        return f"uv tool install --force git+{ATLAS_REPOSITORY}"
+    if executable == "atlas package":
+        return "brew install xkam7ar/tap/atlas"
+    tool = next((item for item in TOOL_SPECS if item.executable == executable), None)
+    if tool is None:
+        return "atlas doctor"
+    resolved = environment or detect_setup_environment()
+    manager = _package_manager(resolved.package_manager)
+    package = package_for_environment(tool, resolved)
+    if manager == PackageManager.homebrew or (
+        manager == PackageManager.pacman and tool.package_for(manager) is None
+    ):
+        return f"brew install {package}"
+    prefix = "" if resolved.is_root else "sudo "
+    if manager == PackageManager.apt:
+        return f"{prefix}apt-get install -y {package}"
+    if manager == PackageManager.dnf:
+        return f"{prefix}dnf install -y {package}"
+    if manager == PackageManager.pacman:
+        return f"{prefix}pacman -S --needed {package}"
+    return f"brew install {tool.package}"
 
 
 def apply_setup_plan(
@@ -340,6 +429,180 @@ def _shell_name(shell: str | None) -> str | None:
     return Path(shell).name
 
 
+def _package_manager(value: PackageManager | str | None) -> PackageManager | None:
+    if value is None:
+        return None
+    try:
+        return PackageManager(value)
+    except ValueError:
+        return None
+
+
+def _detect_package_manager(
+    *,
+    os_name: str,
+    which: Callable[[str], str | None],
+) -> tuple[PackageManager | None, str | None]:
+    brew = which("brew")
+    if os_name == "macOS":
+        return (PackageManager.homebrew, brew) if brew else (None, None)
+    if os_name == "Linux":
+        for manager, executable in (
+            (PackageManager.apt, "apt-get"),
+            (PackageManager.dnf, "dnf"),
+            (PackageManager.pacman, "pacman"),
+        ):
+            path = which(executable)
+            if path:
+                return manager, path
+    return (PackageManager.homebrew, brew) if brew else (None, None)
+
+
+def _is_root() -> bool:
+    geteuid = getattr(os, "geteuid", None)
+    return bool(geteuid is not None and geteuid() == 0)
+
+
+def _elevation_prefix(environment: SetupEnvironment) -> tuple[str, ...] | None:
+    if environment.is_root:
+        return ()
+    if environment.elevation_tool:
+        return (environment.elevation_tool,)
+    return None
+
+
+def _homebrew_install_command() -> tuple[str, ...]:
+    script = f'NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL {HOMEBREW_INSTALL_URL})"'
+    return ("/bin/bash", "-c", script)
+
+
+def _homebrew_path(*, os_name: str, architecture: str) -> str:
+    if os_name == "Linux":
+        return LINUXBREW_PATH
+    return "/opt/homebrew/bin/brew" if architecture == "arm64" else "/usr/local/bin/brew"
+
+
+def _build_install_commands(
+    missing_tools: Sequence[RuntimeTool],
+    *,
+    environment: SetupEnvironment,
+    manager: PackageManager | None,
+    which: Callable[[str], str | None],
+) -> tuple[list[tuple[str, ...]], list[str], list[str]]:
+    commands: list[tuple[str, ...]] = []
+    manual: list[str] = []
+    notes: list[str] = []
+    if manager == PackageManager.homebrew:
+        packages = _dedupe(
+            package for tool in missing_tools if (package := tool.package_for(manager)) is not None
+        )
+        brew = environment.package_manager_path or "brew"
+        command = (brew, "install", *packages)
+        return [command], [_command_text(command)], notes
+
+    if manager in {PackageManager.apt, PackageManager.dnf}:
+        packages = _dedupe(
+            package for tool in missing_tools if (package := tool.package_for(manager)) is not None
+        )
+        prefix = _elevation_prefix(environment)
+        manual_prefix = () if environment.is_root else ("sudo",)
+        if manager == PackageManager.apt:
+            manager_path = environment.package_manager_path or "apt-get"
+            native_commands = [
+                (*manual_prefix, manager_path, "update"),
+                (*manual_prefix, manager_path, "install", "-y", *packages),
+            ]
+            if prefix is not None:
+                commands = [
+                    (*prefix, manager_path, "update"),
+                    (*prefix, manager_path, "install", "-y", *packages),
+                ]
+        else:
+            manager_path = environment.package_manager_path or "dnf"
+            native_commands = [
+                (*manual_prefix, manager_path, "install", "-y", *packages),
+            ]
+            if prefix is not None:
+                commands = [
+                    (*prefix, manager_path, "install", "-y", *packages),
+                ]
+        manual = [_command_text(command) for command in native_commands]
+        if prefix is None:
+            notes.append("Root access or sudo is required to install missing system packages.")
+        return commands, manual, notes
+
+    if manager == PackageManager.pacman:
+        native_packages = _dedupe(
+            package for tool in missing_tools if (package := tool.package_for(manager)) is not None
+        )
+        brew_tools = tuple(tool for tool in missing_tools if tool.package_for(manager) is None)
+        brew_path = which("brew")
+        bootstrap_brew = bool(brew_tools and brew_path is None)
+        if bootstrap_brew:
+            native_packages = _dedupe(
+                (*native_packages, "base-devel", "procps-ng", "curl", "file", "git")
+            )
+        prefix = _elevation_prefix(environment)
+        manual_prefix = () if environment.is_root else ("sudo",)
+        manager_path = environment.package_manager_path or "pacman"
+        if native_packages:
+            native = (
+                *manual_prefix,
+                manager_path,
+                "-S",
+                "--needed",
+                "--noconfirm",
+                *native_packages,
+            )
+            manual.append(_command_text(native))
+            if prefix is not None:
+                commands.append(
+                    (
+                        *prefix,
+                        manager_path,
+                        "-S",
+                        "--needed",
+                        "--noconfirm",
+                        *native_packages,
+                    )
+                )
+        if bootstrap_brew:
+            brew_install = _homebrew_install_command()
+            manual.append(_command_text(brew_install))
+            if prefix is not None:
+                commands.append(brew_install)
+            brew_path = LINUXBREW_PATH
+        if brew_tools:
+            brew_packages = _dedupe(tool.package for tool in brew_tools)
+            brew_command = (brew_path or LINUXBREW_PATH, "install", *brew_packages)
+            manual.append(_command_text(brew_command))
+            if not bootstrap_brew or prefix is not None:
+                commands.append(brew_command)
+            notes.append("wget2 will be installed through Linuxbrew on this pacman host.")
+        if prefix is None and native_packages:
+            commands = []
+            notes.append("Root access or sudo is required to install missing system packages.")
+        return commands, manual, notes
+
+    homebrew_packages = _dedupe(tool.package for tool in missing_tools)
+    if environment.os_name == "macOS":
+        brew = _homebrew_path(
+            os_name=environment.os_name,
+            architecture=environment.architecture,
+        )
+        commands = [
+            _homebrew_install_command(),
+            (brew, "install", *homebrew_packages),
+        ]
+        manual = [_command_text(command) for command in commands]
+        notes.append("Homebrew will be installed after approval.")
+        return commands, manual, notes
+
+    notes.append("No supported package manager was detected. Install the missing tools manually.")
+    manual = _manual_tool_commands(homebrew_packages, os_name=environment.os_name)
+    return commands, manual, notes
+
+
 def _dedupe(values: Iterable[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
@@ -347,9 +610,19 @@ def _dedupe(values: Iterable[str]) -> tuple[str, ...]:
 def _manual_tool_commands(packages: Sequence[str], *, os_name: str) -> list[str]:
     commands: list[str] = []
     if os_name == "Linux":
-        commands.append("sudo apt install " + " ".join(packages))
+        commands.extend(
+            (
+                "sudo apt-get install -y " + " ".join(packages),
+                "sudo dnf install -y " + " ".join(packages),
+                "sudo pacman -S --needed " + " ".join(packages),
+            )
+        )
     commands.append("brew install " + " ".join(packages))
     return commands
+
+
+def _command_text(command: Sequence[str]) -> str:
+    return " ".join(shlex.quote(part) for part in command)
 
 
 def _run_command(command: Sequence[str]) -> None:

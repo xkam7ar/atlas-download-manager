@@ -32,8 +32,11 @@ from atlas.menu import (
     ScanFailedChoice,
     SetupGateChoice,
     _apply_customize_overlay,
+    _batch_file_plan_flow,
+    _completion_loop,
     _customize_choices,
     _customize_options,
+    _downloadable_links_from_directory_index,
     _downloadable_links_from_scan,
     _export_failed_session_flow,
     _files_mirrors_choices,
@@ -42,9 +45,12 @@ from atlas.menu import (
     _media_choices,
     _menu_footer,
     _menu_shortcut_fields,
+    _normalized_directory_url,
+    _open_path,
     _primary_saved_path,
     _print_batch_plan,
     _print_completion_summary,
+    _print_deep_directory_scan_summary,
     _print_directory_explorer,
     _print_launcher,
     _print_media_profile_context,
@@ -52,12 +58,15 @@ from atlas.menu import (
     _print_scan_failed,
     _print_url_scan_summary,
     _questionary_style,
+    _reveal_path,
     _runtime_tool_statuses,
+    _scan_directory_roots,
     _session_choices,
     _settings_choices,
     _tool_choices,
     _url_should_scan_before_auto_plan,
     _with_menu_status,
+    _write_menu_batch_file,
     build_audio_options,
     build_directory_options,
     build_file_options,
@@ -430,10 +439,11 @@ def test_menu_footer_advertises_only_supported_controls() -> None:
     try:
         configure_visuals(unicode=True, color=True, plain=False, env={})
 
-        assert _menu_footer().plain == "↑/↓ move   enter select   type filter   ctrl-c cancel"
+        assert _menu_footer().plain == "↑/↓ move   enter select   type to filter   ctrl-c quit"
         assert _menu_footer(multi=True).plain == (
-            "↑/↓ move   space select   enter continue   type filter   ctrl-c cancel"
+            "↑/↓ move   space select   enter continue   type to filter   ctrl-c quit"
         )
+        assert _menu_footer(back="back").plain.endswith("ctrl-c back")
     finally:
         reset_visuals()
 
@@ -524,8 +534,8 @@ def test_launcher_header_is_polished_without_redundant_paths(settings: AtlasSett
         assert "Archive" not in rendered
         assert "↑/↓" in rendered
         assert "enter" in rendered
-        assert "type filter" in rendered
-        assert "ctrl-c cancel" in rendered
+        assert "type to filter" in rendered
+        assert "ctrl-c quit" in rendered
     finally:
         reset_visuals()
 
@@ -1410,14 +1420,13 @@ def test_menu_directory_explorer_can_download_visible_files(
     action_prompt = next(
         labels
         for message, labels in prompts.seen_selects
-        if message == "What would you like to do?"
-        and "Everything under this folder" in labels
+        if message == "Directory actions" and "Open a folder" in labels
     )
     assert action_prompt[:4] == [
-        "Everything under this folder",
-        "Choose one specific folder",
-        "Choose multiple folders",
-        "Only visible files at this level",
+        "Open a folder",
+        "Choose files at this level",
+        "Scan this folder and children (depth 2)",
+        "Scan selected folders",
     ]
 
 
@@ -1492,6 +1501,432 @@ def test_menu_directory_explorer_deep_scans_selected_folders(
         "https://example.com/serveur/images/photo.jpg",
     ]
     assert prompts.seen_multi_selects[0][0] == "Folders"
+
+
+def test_deep_directory_summary_labels_partial_discovery_honestly() -> None:
+    root = "https://example.com/root/"
+    partial_scan = WorkItem(
+        url=root,
+        final_url=root,
+        host="example.com",
+        kind=HubKind.dir,
+        scan_status=ScanStatus.partial,
+        scan_counts={"files": 1, "same_host": 1, "complete": 0},
+        scan_warnings=["link extraction stopped at the safety limit"],
+        discovered_work_items=[
+            WorkItem(url=f"{root}visible.pdf", host="example.com", kind=HubKind.file)
+        ],
+    )
+    output = StringIO()
+
+    _print_deep_directory_scan_summary(
+        Console(file=output),
+        partial_scan,
+        [root],
+        [partial_scan],
+    )
+
+    rendered = output.getvalue()
+    assert "Scan partial" in rendered
+    assert "Scan complete" not in rendered
+    assert "discovered files only" in rendered
+    assert "totals are lower bounds" in rendered
+    assert "link extraction stopped at the safety limit" in rendered
+
+
+def test_menu_directory_everything_keeps_root_files_and_scans_nested_folders(
+    settings: AtlasSettings,
+    tmp_path: Path,
+) -> None:
+    seed_url = "https://example.com/public/"
+    nested_url = "https://example.com/public/nested/"
+    prompts = FakePrompts(
+        selects=[
+            MainMenuChoice.smart,
+            DirectoryExplorerChoice.everything,
+            PlanMenuChoice.dry_run,
+            PlanMenuChoice.back,
+            MainMenuChoice.quit,
+        ],
+        texts=[seed_url],
+    )
+    actions = FakeActions(tmp_path)
+    actions.scan_items[seed_url] = WorkItem(
+        url=seed_url,
+        final_url=seed_url,
+        host="example.com",
+        scan_type="directory-style HTML index",
+        discovered_work_items=[
+            WorkItem(
+                url=f"{seed_url}README.md",
+                host="example.com",
+                kind=HubKind.file,
+                file_extension=".md",
+            ),
+            WorkItem(url=nested_url, host="example.com", kind=HubKind.dir),
+        ],
+    )
+    actions.scan_items[nested_url] = WorkItem(
+        url=nested_url,
+        final_url=nested_url,
+        host="example.com",
+        scan_type="directory-style HTML index",
+        discovered_work_items=[
+            WorkItem(
+                url=f"{nested_url}manual.pdf",
+                host="example.com",
+                kind=HubKind.file,
+                file_extension=".pdf",
+            )
+        ],
+    )
+
+    run_interactive_menu(settings, actions, prompts=prompts, console=Console(file=StringIO()))
+
+    assert actions.scan_calls == [seed_url, nested_url]
+    batch_file, kind, _concurrency, _allow_sites, allow_dirs, *_rest = actions.batch_runs[0]
+    assert kind == BatchKind.file
+    assert allow_dirs is False
+    assert batch_file.read_text(encoding="utf-8").splitlines() == [
+        f"{seed_url}README.md",
+        f"{nested_url}manual.pdf",
+    ]
+
+
+def test_menu_directory_can_open_folder_then_navigate_up(
+    settings: AtlasSettings,
+    tmp_path: Path,
+) -> None:
+    seed_url = "https://example.com/public/"
+    child_url = f"{seed_url}Books/"
+    folder = DirectoryEntry(name="Books/", url=child_url, kind="directory")
+    prompts = FakePrompts(
+        selects=[
+            MainMenuChoice.smart,
+            DirectoryExplorerChoice.open_folder,
+            folder,
+            DirectoryExplorerChoice.back,
+            DirectoryExplorerChoice.back,
+            MainMenuChoice.quit,
+        ],
+        texts=[seed_url],
+    )
+    actions = FakeActions(tmp_path)
+    actions.scan_items[seed_url] = WorkItem(
+        url=seed_url,
+        final_url=seed_url,
+        host="example.com",
+        scan_type="directory-style HTML index",
+        discovered_work_items=[
+            WorkItem(url=child_url, host="example.com", kind=HubKind.dir),
+        ],
+    )
+    actions.scan_items[child_url] = WorkItem(
+        url=child_url,
+        final_url=child_url,
+        host="example.com",
+        scan_type="directory-style HTML index",
+        discovered_work_items=[
+            WorkItem(
+                url=f"{child_url}manual",
+                host="example.com",
+                kind=HubKind.file,
+            )
+        ],
+    )
+
+    run_interactive_menu(settings, actions, prompts=prompts, console=Console(file=StringIO()))
+
+    assert actions.scan_calls == [seed_url, child_url]
+    directory_menus = [
+        labels for message, labels in prompts.seen_selects if message == "Directory actions"
+    ]
+    assert "Up to parent folder" in directory_menus[1]
+    assert "Back" in directory_menus[-1]
+
+
+def test_directory_visible_queue_enforces_origin_and_keeps_extensionless_files() -> None:
+    directory_index = DirectoryIndex(
+        source_url="https://example.com:443/public/",
+        host="example.com",
+        entries=(
+            DirectoryEntry(
+                name="README",
+                url="https://example.com/public/README",
+                kind="file",
+            ),
+            DirectoryEntry(
+                name="other-port.zip",
+                url="https://example.com:444/other-port.zip",
+                kind="file",
+            ),
+            DirectoryEntry(
+                name="downgrade.zip",
+                url="http://example.com/downgrade.zip",
+                kind="file",
+            ),
+            DirectoryEntry(
+                name="offsite.zip",
+                url="https://evil.example/offsite.zip",
+                kind="file",
+            ),
+            DirectoryEntry(
+                name="sibling.zip",
+                url="https://example.com/sibling/sibling.zip",
+                kind="file",
+            ),
+            DirectoryEntry(
+                name="offsite-folder/",
+                url="https://evil.example/offsite-folder/",
+                kind="directory",
+            ),
+        ),
+    )
+
+    assert _downloadable_links_from_directory_index(directory_index) == [
+        "https://example.com/public/README"
+    ]
+    output = StringIO()
+    _print_directory_explorer(
+        Console(file=output),
+        WorkItem(url=directory_index.source_url, scan_type="open directory index"),
+        directory_index,
+    )
+    assert "offsite" not in output.getvalue()
+
+
+def test_directory_scan_keeps_case_sensitive_children_and_rejects_unsafe_folders(
+    settings: AtlasSettings,
+    tmp_path: Path,
+) -> None:
+    root = "https://example.com/root/"
+    safe_urls = [f"{root}Folder/", f"{root}folder/"]
+    seed_scan = WorkItem(
+        url=root,
+        final_url=root,
+        host="example.com",
+        kind=HubKind.dir,
+        discovered_work_items=[
+            *(WorkItem(url=url, host="example.com", kind=HubKind.dir) for url in safe_urls),
+            WorkItem(
+                url="https://example.com/",
+                host="example.com",
+                kind=HubKind.dir,
+                error="parent directory link skipped by no-parent policy",
+            ),
+            WorkItem(
+                url="https://evil.example/root/offsite/",
+                host="evil.example",
+                kind=HubKind.dir,
+                same_host=False,
+                external_host=True,
+            ),
+            WorkItem(
+                url="https://example.com:444/root/other-port/",
+                host="example.com",
+                kind=HubKind.dir,
+            ),
+        ],
+    )
+    actions = FakeActions(tmp_path)
+
+    scans, limited = _scan_directory_roots(
+        settings.model_copy(update={"dir_depth": 1}),
+        actions,
+        Console(file=StringIO()),
+        seed_scan,
+        [root],
+    )
+
+    assert limited is False
+    assert actions.scan_calls == safe_urls
+    assert [scan.url for scan in scans] == [root, *safe_urls]
+    assert _normalized_directory_url(safe_urls[0]) != _normalized_directory_url(safe_urls[1])
+    assert _normalized_directory_url("HTTPS://Example.COM:443/Folder/#fragment") == (
+        "https://example.com/Folder"
+    )
+    assert _normalized_directory_url("https://example.com:bad/root/").endswith("/root")
+
+
+def test_directory_scan_rejects_child_scan_that_redirects_outside_scope(
+    settings: AtlasSettings,
+    tmp_path: Path,
+) -> None:
+    root = "https://example.com/root/"
+    child = f"{root}redirect/"
+    escaped = "https://example.com:444/elsewhere/"
+    seed_scan = WorkItem(
+        url=root,
+        final_url=root,
+        host="example.com",
+        kind=HubKind.dir,
+        discovered_work_items=[
+            WorkItem(url=child, host="example.com", kind=HubKind.dir),
+        ],
+    )
+    escaped_scan = WorkItem(
+        url=child,
+        final_url=escaped,
+        host="example.com",
+        final_host="example.com",
+        kind=HubKind.dir,
+        discovered_work_items=[
+            WorkItem(
+                url=f"{escaped}payload.bin",
+                host="example.com",
+                kind=HubKind.file,
+            )
+        ],
+    )
+    actions = FakeActions(tmp_path)
+    actions.scan_items[child] = escaped_scan
+    output = StringIO()
+
+    scans, limited = _scan_directory_roots(
+        settings.model_copy(update={"dir_depth": 1}),
+        actions,
+        Console(file=output),
+        seed_scan,
+        [root],
+    )
+
+    assert limited is False
+    assert scans == [seed_scan]
+    assert actions.scan_calls == [child]
+    assert "redirected outside" in output.getvalue()
+    assert _downloadable_links_from_scan(escaped_scan) == []
+
+    encoded_escape = escaped_scan.model_copy(
+        update={
+            "final_url": f"{root}%252e%252e/out/",
+            "discovered_work_items": [],
+        }
+    )
+    encoded_scans, _limited = _scan_directory_roots(
+        settings.model_copy(update={"dir_depth": 0}),
+        FakeActions(tmp_path),
+        Console(file=StringIO()),
+        encoded_escape,
+        [child],
+    )
+    assert encoded_scans == []
+
+
+def test_directory_open_folder_stays_put_after_cross_origin_redirect(
+    settings: AtlasSettings,
+    tmp_path: Path,
+) -> None:
+    root = "https://example.com/root/"
+    child = f"{root}redirect/"
+    folder = DirectoryEntry(name="redirect/", url=child, kind="directory")
+    prompts = FakePrompts(
+        selects=[
+            MainMenuChoice.smart,
+            DirectoryExplorerChoice.open_folder,
+            folder,
+            "back",
+            DirectoryExplorerChoice.back,
+            MainMenuChoice.quit,
+        ],
+        texts=[root],
+    )
+    actions = FakeActions(tmp_path)
+    actions.scan_items[root] = WorkItem(
+        url=root,
+        final_url=root,
+        host="example.com",
+        scan_type="directory-style HTML index",
+        discovered_work_items=[
+            WorkItem(url=child, host="example.com", kind=HubKind.dir),
+        ],
+    )
+    actions.scan_items[child] = WorkItem(
+        url=child,
+        final_url="https://evil.example/elsewhere/",
+        host="example.com",
+        final_host="evil.example",
+        scan_type="directory-style HTML index",
+    )
+    output = StringIO()
+
+    run_interactive_menu(
+        settings,
+        actions,
+        prompts=prompts,
+        console=Console(file=output),
+    )
+
+    assert actions.scan_calls == [root, child]
+    assert any(message == "Back to directory" for message, _labels in prompts.seen_selects)
+    directory_menus = [
+        labels for message, labels in prompts.seen_selects if message == "Directory actions"
+    ]
+    assert len(directory_menus) == 2
+    assert all("Open a folder" in labels for labels in directory_menus)
+
+
+def test_directory_scan_page_cap_bounds_fanout(
+    settings: AtlasSettings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("atlas.menu._DIRECTORY_SCAN_PAGE_LIMIT", 3)
+    root = "https://example.com/root/"
+    children = [f"{root}{index}/" for index in range(10)]
+    seed_scan = WorkItem(
+        url=root,
+        final_url=root,
+        host="example.com",
+        kind=HubKind.dir,
+        discovered_work_items=[
+            WorkItem(url=url, host="example.com", kind=HubKind.dir) for url in children
+        ],
+    )
+    actions = FakeActions(tmp_path)
+
+    scans, limited = _scan_directory_roots(
+        settings.model_copy(update={"dir_depth": 1}),
+        actions,
+        Console(file=StringIO()),
+        seed_scan,
+        [root],
+    )
+
+    assert limited is True
+    assert len(scans) == 3
+    assert actions.scan_calls == children[:2]
+
+
+def test_partial_batch_command_exit_stays_in_menu_recovery(
+    settings: AtlasSettings,
+    tmp_path: Path,
+) -> None:
+    class Exit(RuntimeError):
+        exit_code = 1
+
+    prompts = FakePrompts(
+        selects=[PlanMenuChoice.start, PlanRecoveryChoice.back],
+    )
+    actions = FakeActions(tmp_path)
+
+    def fail_batch(*_args: object, **_kwargs: object) -> None:
+        raise Exit()
+
+    actions.run_batch = fail_batch  # type: ignore[method-assign]
+
+    result = _batch_file_plan_flow(
+        settings,
+        actions,
+        prompts,
+        Console(
+            file=StringIO(),
+            theme=Theme(resolve_theme(AtlasThemeName.auto)),
+        ),
+        tmp_path / "urls.txt",
+    )
+
+    assert result == CompletionChoice.back
+    assert any(message == "Continue" for message, _labels in prompts.seen_selects)
 
 
 def test_menu_explicit_directory_action_uses_explorer(
@@ -1775,9 +2210,7 @@ def test_url_scan_summary_shows_scan_warnings() -> None:
         url="https://example.com/serveur/",
         host="example.com",
         discovered_links=["https://example.com/serveur/readme.txt"],
-        scan_warnings=[
-            "Python TLS verification failed; scanned using curl fallback."
-        ],
+        scan_warnings=["Python TLS verification failed; scanned using curl fallback."],
     )
 
     _print_url_scan_summary(Console(file=output), scan)
@@ -1837,17 +2270,49 @@ def test_directory_explorer_uses_compact_context_card_and_preview_sections() -> 
 
     rendered = output.getvalue()
     assert "Browse Directory" in rendered
-    assert "Seed" in rendered
+    assert "Location" in rendered
+    assert "Navigation" in rendered
     assert "Scope" in rendered
     assert "Visible" in rendered
-    assert "Estimated" in rendered
+    assert "Visible size" in rendered
     assert "example.com/serveur/" in rendered
     assert "2023-12-23" in rendered
     assert "Files at this level (1)" in rendered
-    assert "ctrl-c cancel" in rendered
+    assert "ctrl-c back" in rendered
     assert rendered.splitlines()[0].startswith("+")
     assert "Directory Explorer" not in rendered
     reset_visuals()
+
+
+def test_directory_explorer_renders_remote_names_without_rich_markup_injection() -> None:
+    output = StringIO()
+    directory_index = DirectoryIndex(
+        source_url="https://example.com/root/",
+        host="example.com",
+        entries=(
+            DirectoryEntry(
+                name="[link=https://evil.example]trusted[/link]/",
+                url="https://example.com/root/trusted/",
+                kind="directory",
+            ),
+            DirectoryEntry(
+                name="\x1b]8;;https://evil.example\x07name\x1b]8;;\x07.txt",
+                url="https://example.com/root/name.txt",
+                kind="file",
+            ),
+        ),
+    )
+
+    _print_directory_explorer(
+        Console(file=output, force_terminal=True, color_system="truecolor"),
+        WorkItem(url=directory_index.source_url, scan_type="open directory index"),
+        directory_index,
+    )
+
+    rendered = output.getvalue()
+    assert "\x1b]8;;https://evil.example" not in rendered
+    assert "[link=https://evil.example]trusted[/link]/" in rendered
+    assert "name.txt" in rendered
 
 
 def test_directory_explorer_shows_preview_note_and_warning_section() -> None:
@@ -1858,6 +2323,7 @@ def test_directory_explorer_shows_preview_note_and_warning_section() -> None:
             url="https://example.com/serveur/cours/",
             kind="directory",
             last_modified=datetime(2023, 12, 23, 6, 50),
+            visible_size=9_663_676_416,
         )
     ]
     entries.extend(
@@ -1892,7 +2358,8 @@ def test_directory_explorer_shows_preview_note_and_warning_section() -> None:
     assert "Warnings" in rendered
     assert "Parent directory links skipped" in rendered
     assert "URL-encoded or spaced filenames detected" in rendered
-    assert "showing first 8 of 9; use / to filter" in rendered
+    assert "showing first 8 of 9; choose files to search all" in rendered
+    assert "9.0 GB" in rendered
     assert "~20.4 GB" in rendered
 
 
@@ -1949,14 +2416,15 @@ def test_directory_explorer_plain_mode_uses_ascii_footer_and_warning_bullets() -
 
         rendered = output.getvalue()
         assert "up/down move" in rendered
-        assert "ctrl-c cancel" in rendered
+        assert "ctrl-c back" in rendered
         assert "- Parent directory links skipped" in rendered
         assert "•" not in rendered
     finally:
         reset_visuals()
 
 
-def test_directory_explorer_narrow_width_truncates_without_overflow() -> None:
+@pytest.mark.parametrize("width", [24, 48])
+def test_directory_explorer_narrow_width_truncates_without_overflow(width: int) -> None:
     output = StringIO()
     directory_index = DirectoryIndex(
         source_url="https://ex.com/d/",
@@ -1971,14 +2439,14 @@ def test_directory_explorer_narrow_width_truncates_without_overflow() -> None:
     )
 
     _print_directory_explorer(
-        Console(file=output, width=48),
+        Console(file=output, width=width),
         WorkItem(url="https://ex.com/d/", scan_type="open directory index"),
         directory_index,
     )
 
     rendered = output.getvalue()
     assert "Files at this level (1)" in rendered
-    assert max(len(line) for line in rendered.splitlines()) <= 48
+    assert max(len(line) for line in rendered.splitlines()) <= width
 
 
 def test_directory_explorer_redraw_emits_clear_sequence_when_menu_owns_screen() -> None:
@@ -2045,16 +2513,11 @@ def test_menu_url_scan_failure_shows_recovery_actions_without_discovered_downloa
     assert "Scan failed" in rendered
     assert "Scan complete" not in rendered
     assert "Download discovered files" not in rendered
-    labels = next(
-        labels
-        for message, labels in prompts.seen_selects
-        if message == "Scan failed"
-    )
+    labels = next(labels for message, labels in prompts.seen_selects if message == "Scan failed")
     assert labels == [
         "Retry scan",
-        "Doctor check",
-        "Backend fetch",
-        "Continue as mirror",
+        "Run network diagnostics",
+        "Plan bounded mirror without scan",
         "Error details",
         "Back",
     ]
@@ -2100,8 +2563,8 @@ def test_menu_url_scan_empty_shows_only_empty_state_actions(
     labels = next(labels for message, labels in prompts.seen_selects if message == "No links found")
     assert labels == [
         "Retry scan",
-        "Treat as website",
-        "This page only",
+        "Plan offline website mirror",
+        "Download this URL only",
         "Back",
     ]
     assert "Download discovered files" not in labels
@@ -2131,9 +2594,7 @@ def test_menu_video_flow_detects_explicit_playlist(
     assert first_options.playlist is True
     assert first_kind == HubKind.audio
     prompt = next(
-        labels
-        for message, labels in prompts.seen_selects
-        if message == "Playlist detected"
+        labels for message, labels in prompts.seen_selects if message == "Playlist detected"
     )
     assert "Download playlist as audio" in prompt
 
@@ -2169,8 +2630,7 @@ def test_plan_execution_failure_retries_without_leaving_menu(
             self.executed.append(plan)
             if len(self.executed) == 1:
                 raise AtlasError(
-                    "Request failed: "
-                    "https://example.com/archive.zip?X-Goog-Signature=TOPSECRET"
+                    "Request failed: https://example.com/archive.zip?X-Goog-Signature=TOPSECRET"
                 )
             return [self.output_dir / "download.bin"]
 
@@ -2566,15 +3026,52 @@ def test_menu_playlist_can_map_to_audio_playlist(
     completion_prompt = next(
         labels
         for message, labels in prompts.seen_selects
-        if message == "Next" and "Reveal in Finder" in labels
+        if message == "Next" and "Show in folder" in labels
     )
     assert completion_prompt == [
-        "Reveal in Finder",
+        "Show in folder",
         "Open file",
         "Extract another",
         "Back to menu",
         "Quit",
     ]
+
+
+def test_completion_actions_are_platform_neutral_and_report_launch_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved = tmp_path / "file.bin"
+    saved.write_bytes(b"x")
+    calls: list[list[str]] = []
+    monkeypatch.setattr("atlas.menu.sys.platform", "linux")
+    monkeypatch.setattr(
+        "atlas.menu.shutil.which",
+        lambda name: "/usr/bin/xdg-open" if name == "xdg-open" else None,
+    )
+    monkeypatch.setattr(
+        "atlas.menu.subprocess.run",
+        lambda command, **_kwargs: calls.append(command) or type("Result", (), {"returncode": 0})(),
+    )
+
+    assert _reveal_path(saved) is None
+    assert _open_path(saved) is None
+    assert calls == [
+        ["/usr/bin/xdg-open", str(tmp_path)],
+        ["/usr/bin/xdg-open", str(saved)],
+    ]
+
+    monkeypatch.setattr("atlas.menu.shutil.which", lambda _name: None)
+    output = StringIO()
+    prompts = FakePrompts(selects=[CompletionChoice.back])
+    _completion_loop(
+        prompts,
+        [saved],
+        console=Console(file=output),
+    )
+    labels = next(labels for message, labels in prompts.seen_selects if message == "Next")
+    assert "Show in folder" not in labels
+    assert "Open file" not in labels
 
 
 def test_completion_prefers_final_media_file_over_stream_fragments(tmp_path: Path) -> None:
@@ -2611,10 +3108,7 @@ def test_completion_prefers_final_media_file_over_stream_fragments(tmp_path: Pat
 def test_video_completion_summary_uses_saved_file_card(tmp_path: Path) -> None:
     try:
         configure_visuals(color=False, unicode=True, env={})
-        saved = (
-            tmp_path
-            / "2025-03-09 - How to Get a New Identity and Disappear. [AICiFEiKM8c].mp4"
-        )
+        saved = tmp_path / "2025-03-09 - How to Get a New Identity and Disappear. [AICiFEiKM8c].mp4"
         saved.write_bytes(b"x" * 133_500)
         options = VideoDownloadOptions(
             url="https://www.youtube.com/watch?v=AICiFEiKM8c",
@@ -2780,9 +3274,7 @@ def test_menu_batch_customize_and_dry_run(
         )
     ]
     assert any(message == "Batch queue" for message, _labels in prompts.seen_selects)
-    source_prompt = next(
-        labels for message, labels in prompts.seen_selects if message == "Batch"
-    )
+    source_prompt = next(labels for message, labels in prompts.seen_selects if message == "Batch")
     assert source_prompt == [
         "Paste URL and scan",
         "Use URL file",
@@ -3004,9 +3496,19 @@ def test_menu_batch_url_scan_can_choose_discovered_folder(
                 url="http://textfiles.com/bbs/",
                 kind="directory",
             ),
+            DirectoryExplorerChoice.visible_files,
             PlanMenuChoice.dry_run,
             PlanMenuChoice.back,
             MainMenuChoice.quit,
+        ],
+        multi_selects=[
+            [
+                DirectoryEntry(
+                    name="old-bbs-list.txt",
+                    url="http://textfiles.com/bbs/old-bbs-list.txt",
+                    kind="file",
+                )
+            ]
         ],
         texts=[seed_url],
     )
@@ -3043,7 +3545,7 @@ def test_menu_batch_url_scan_can_choose_discovered_folder(
         "http://textfiles.com/bbs/old-bbs-list.txt"
     ]
     folder_prompt = next(
-        labels for message, labels in prompts.seen_selects if message == "Folder"
+        labels for message, labels in prompts.seen_selects if message == "Open folder"
     )
     assert any("bbs/" in label for label in folder_prompt)
 
@@ -3094,9 +3596,7 @@ def test_menu_batch_url_scan_files_only_rejects_html(
     assert queue_path.read_text(encoding="utf-8").splitlines() == [
         "http://textfiles.com/bbs/old-bbs-list.txt"
     ]
-    choice_labels = next(
-        labels for message, labels in prompts.seen_selects if message == "Actions"
-    )
+    choice_labels = next(labels for message, labels in prompts.seen_selects if message == "Actions")
     assert "Download discovered files" in choice_labels
     assert "Choose discovered files" in choice_labels
 
@@ -3554,3 +4054,17 @@ def test_menu_option_builders_use_settings_defaults(settings: AtlasSettings) -> 
     assert directory_options.timestamping is True
     assert directory_options.if_modified_since is False
     assert directory_options.user_agent == settings.dir_user_agent
+
+
+def test_menu_batch_files_have_bounded_retention(tmp_path: Path) -> None:
+    newest: Path | None = None
+    for index in range(25):
+        newest = _write_menu_batch_file(
+            tmp_path,
+            [f"https://example.com/{index}.zip"],
+        )
+
+    assert newest is not None
+    assert newest.exists()
+    menu_files = list((tmp_path / ".atlas" / "menu").glob("pasted-urls-*.txt"))
+    assert len(menu_files) == 20

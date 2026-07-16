@@ -49,7 +49,7 @@ next actions for the detected source instead of asking the user to guess.
 | Explicit playlist | `media_playlist` | yt-dlp + ffmpeg | Media queue lane plus bounded postprocessor budget. |
 | Direct file | `direct_file` | native, aria2c, or wget2 | One file item; adaptive mode can pick queue/segment policy. |
 | Website mirror | `site_session` | Wget2 or Wget | Recursive mirror policy with explicit scope and politeness. |
-| Directory mirror | `directory_session` | Wget2 or Wget | Scanned file-tree policy with no-parent/same-host boundaries. |
+| Directory mirror | `directory_session` | native exact-index or Wget2/Wget | Exact same-host file list for complete CopyParty indexes; otherwise recursive no-parent/same-host policy. |
 | Batch | `batch_session` | Mixed adapters | Queue-level scheduler with per-item backend plans. |
 
 The interactive Directory Explorer is a first-class directory preset on top of
@@ -68,13 +68,19 @@ capability step is part of the session, not a side path.
 Ordinary watch URLs with playlist or radio query parameters remain single-media
 sessions by default. An explicit playlist session is deliberate: use
 `atlas playlist`, `--playlist`, or an interactive playlist choice.
+YouTube channel/tab collections require `--playlist` and a finite item/end
+bound. Their probe and transfer share that bound, and their preview uses the
+resolved output template rather than inventing one selected filename from
+collection metadata.
 
 ## Adaptive Versus Preset Plans
 
 `SmartDownloadSession.plan` is always present for optimized command plans, but it
 can describe either adaptive or preset behavior:
 
-- Adaptive plans are scan-first. They include queue concurrency, per-host caps,
+- Adaptive plans start with a pre-execution evidence pass: direct files are
+  probed, allowed mirrors are scanned, and media entries are route-classified
+  without a metadata probe. Plans include queue concurrency, per-host caps,
   per-file segments, connection budgets, size buckets, selected backend, safety
   notes, and scheduler decisions.
 - Runtime adaptive sessions add evidence to those decisions: host EWMA speed,
@@ -133,6 +139,8 @@ the UI what kind of surface to show:
   media table, retry count, archive skips.
 - Direct file: probe, transfer, verify, finalize.
 - Site/directory: discovery/mirror phase, transfer, Wget2 stats, failed samples.
+- Exact directory: bounded discovery, per-file native transfer, verify/finalize,
+  and a selected/downloaded/current summary.
 - Batch: stacked overall/transfer/lane/failure bars and one calm active table.
 
 Unknown totals must never fake a percent. They should show bytes so far, speed,
@@ -171,7 +179,7 @@ Interactive surfaces should keep these behavior boundaries:
 
 ## Artifacts
 
-Batch sessions and completed site/directory mirrors write durable artifacts
+Batch sessions and successful or failed non-dry-run site/directory attempts write durable artifacts
 under `<output>/.atlas/` after non-dry-run execution:
 
 - `batch-summary-*.json`: normalized `BatchSummary`
@@ -182,23 +190,24 @@ under `<output>/.atlas/` after non-dry-run execution:
   artifact paths
 - `latest/failed.txt`: failed URLs, written even when empty
 - `latest/skipped.txt`: skipped URLs, written even when empty
-- `latest/canceled.txt`: URLs canceled before item start, written even when empty
+- `latest/canceled.txt`: queued or active-controlled canceled URLs, written even when empty
 - `latest/retry.atlas.json`: machine-readable retry/resume hints for failed-only,
   checksum-only, skipped-unknown, canceled-only, save-manifest, load-manifest,
   and resume flows
 
 Site and directory mirrors do not create timestamped batch history files, but
-they do write the same stable `latest/` session files. When Wget2 stats include
-failed URL rows, those URLs are copied into `failed.txt` and `retry.atlas.json`.
+they do write the same stable `latest/` session files. Successful Wget2 stats
+enrich the summary. A failed Wget2 error can display parsed failed-row samples,
+but the current saved recovery item is the mirror seed URL.
 
 The user-facing commands are:
 
 - `atlas resume [SESSION]`: retry failed URLs, skipped unknown-route URLs, and
-  URLs canceled before item start
+  canceled URLs
 - `atlas retry [SESSION] --failed-only`: retry failed URLs, the default selector
 - `atlas retry [SESSION] --checksum-failures-only`: retry checksum failures only
 - `atlas retry [SESSION] --skipped-unknowns-only`: retry skipped unknown-route URLs
-- `atlas retry [SESSION] --canceled-only`: retry only URLs canceled before item start
+- `atlas retry [SESSION] --canceled-only`: retry only canceled URLs
 - `atlas export-failed [SESSION] --output failed.txt`: export retryable URLs
 - `atlas inspect-session [SESSION] --preview plan|manifest`: inspect counts,
   scheduler policy, item samples, failures, artifact paths, focused session

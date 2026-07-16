@@ -147,7 +147,7 @@ def test_probe_direct_file_explains_page_url_resolving_to_zip(monkeypatch) -> No
         "No extension in URL, but Content-Disposition named release.zip."
         in probe.classification_notes
     )
-    assert probe.mirror_fingerprint == 'file:release.zip:42:?'
+    assert probe.mirror_fingerprint == "file:release.zip:42:?"
 
 
 def test_probe_direct_file_explains_file_url_returning_html(monkeypatch) -> None:

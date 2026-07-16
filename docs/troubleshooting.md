@@ -32,21 +32,27 @@ atlas doctor --json
 atlas setup --json
 ```
 
-`atlas doctor --fix` prints a full runtime repair plan and can run Homebrew
-install commands with confirmation or `--yes`.
+`atlas doctor --fix` prints a full runtime repair plan and can run Homebrew,
+apt, dnf, or pacman commands with confirmation or `--yes`.
 Use `atlas doctor --network --fix-certs` when scans fail with TLS or certificate
 errors. It prints CA-bundle and Homebrew/Python repair guidance, but it never
 turns off certificate verification silently.
 
-## Installer says Homebrew is missing
+Every Doctor mode performs one verified HTTPS GET to `https://www.python.org/`
+with a three-second timeout. Default human mode creates/checks Atlas directories
+and temporary write probes. `--json` and `--fix --no-install` keep path checks
+non-mutating, but they are not offline modes.
 
-The bootstrap installer uses Homebrew as the preferred macOS package layer for
-runtime tools. It intentionally does not install Homebrew silently.
+## Installer plans a Homebrew bootstrap
 
-Fix:
+Homebrew is the macOS package layer and the `wget2` fallback on pacman-based
+Linux. When missing and needed, its official bootstrap command appears in the
+complete installer plan. Approving that plan authorizes the bootstrap; Atlas
+never runs it before showing it.
+
+Run normally and approve the displayed plan:
 
 ```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 curl -fsSL https://raw.githubusercontent.com/xkam7ar/atlas/main/install.sh | bash
 ```
 
@@ -56,8 +62,8 @@ To inspect the installer without changing the system:
 curl -fsSL https://raw.githubusercontent.com/xkam7ar/atlas/main/install.sh | bash -s -- --no-install --no-menu --yes
 ```
 
-In `--no-install` mode, missing Homebrew is reported as a setup gap rather than
-a failed install attempt.
+`--no-install` prints the bootstrap and package commands without creating files
+or changing the system.
 
 ## Installer finds an old atlas command
 
@@ -100,8 +106,8 @@ atlas doctor
 
 Before the public tap is published, the bootstrap installer may report that
 `xkam7ar/tap/atlas` is not available from the current machine. In that case it
-falls back to `uv tool install git+https://github.com/xkam7ar/atlas.git` when
-`uv` is available or when you approve installing `uv` with Homebrew.
+falls back to `uv tool install git+https://github.com/xkam7ar/atlas.git`. When
+`uv` is missing, the same approved plan uses uv's official standalone installer.
 
 The checked-in Homebrew formula under `packaging/homebrew/atlas.rb` is a release
 template. The tap formula must have the release tarball SHA and generated Python
@@ -118,9 +124,12 @@ Symptoms:
 Fix:
 
 ```bash
-atlas doctor --fix
-brew install ffmpeg
+atlas setup --minimal --install
 ```
+
+Direct manager equivalents are `brew install ffmpeg`,
+`sudo apt-get install -y ffmpeg`, `sudo dnf install -y ffmpeg-free`, and
+`sudo pacman -S --needed ffmpeg`.
 
 Why required:
 
@@ -135,9 +144,10 @@ Why required:
 Install:
 
 ```bash
-atlas setup --full
-brew install aria2
+atlas setup --full --install
 ```
+
+Atlas maps this to package `aria2` on every supported manager.
 
 If missing:
 
@@ -151,6 +161,13 @@ For `atlas file --backend aria2`, atlas starts a local aria2c RPC subprocess on
 `127.0.0.1` with a random secret and shuts it down when the download finishes.
 If RPC startup fails, atlas can fall back to the older streamed subprocess path.
 
+For an all-aria2 batch, RPC startup failure falls back to ordinary per-item
+batch execution. If the shared RPC session disappears after transfers begin,
+Atlas preserves completed items, marks unresolved items failed, and removes
+active GIDs best-effort. TLS-chain failures receive a verified-curl per-item
+retry; other mid-session RPC failures do not automatically retry through the
+legacy aria2 subprocess. Inspect `latest/failed.txt` before retrying.
+
 ## Missing wget2 or wget
 
 `wget2` is optional unless you choose `atlas file --backend wget2`, set
@@ -160,15 +177,14 @@ If RPC startup fails, atlas can fall back to the older streamed subprocess path.
 Install Wget2:
 
 ```bash
-atlas setup --mirrors
-brew install wget2
+atlas setup --mirrors --install
 ```
 
 Install Wget fallback support:
 
-```bash
-brew install wget
-```
+The same plan installs `wget`. On pacman hosts it installs `wget` natively and
+bootstraps Linuxbrew for `wget2`; apt and dnf provide both through native
+repositories.
 
 If Wget2 is missing:
 
@@ -273,11 +289,19 @@ atlas site URL --same-host-only --depth 1 --max-files 500
 atlas dir URL --accept zip,pdf --max-total-size 5G --max-runtime 1800
 ```
 
-`--max-files` is an adaptive scan guard. `--max-total-size` maps to Wget2 quota.
-`--max-runtime` is enforced by Atlas around the mirror process. If the scan is
-too broad, narrow scope with `--same-host-only`, `--no-parent`, `--depth`,
+For ordinary recursive mirrors, `--max-files` is a scan-time guard,
+`--max-total-size` maps to Wget2 quota, and `--max-runtime` surrounds the mirror
+process. For a signature-recognized CopyParty index, Atlas builds an exact file
+list: file count is exact, all sizes must be known when a total-size bound is
+requested, and runtime covers discovery plus transfer. If the scan is too
+broad, narrow scope with `--same-host-only`, `--no-parent`, `--depth`,
 `--accept`, `--reject`, include/exclude path patterns, or a more specific seed
 folder.
+
+Exact-index downloads also refuse truncated indexes, unsupported nested index
+formats, unsafe `..`/absolute paths, symlink escapes, and filenames that collide
+after case folding. These are safety failures, not retryable backend exits;
+narrow or correct the source index rather than forcing the plan.
 
 ## yt-dlp extractor errors
 
@@ -314,6 +338,8 @@ Symptoms:
 - The download bar reached 100%, then the command failed.
 - The message mentions `ffmpeg`, merge, metadata, thumbnail, or audio
   extraction.
+- The verbose error mentions missing `mutagen` while embedding Opus, Ogg, or
+  FLAC artwork.
 - The output file may contain the downloaded video, but not the requested final
   audio/container/metadata result.
 
@@ -323,6 +349,10 @@ What to do:
 atlas video URL --progress full --verbose
 atlas audio URL --codec best --progress full
 ```
+
+The guided installer and `uv tool install` include `mutagen`. If an older or
+manually assembled environment is missing it, reinstall Atlas and confirm the
+`mutagen` check passes in `atlas doctor`.
 
 Atlas treats merge, extract, embed metadata, thumbnail, and finalize as real
 phases. A transfer is not successful until those phases finish. If extraction
@@ -367,6 +397,16 @@ atlas playlist "https://www.youtube.com/playlist?list=..."
 
 If you pass a watch URL to `atlas playlist`, it is refused. This prevents large
 accidental downloads from radio/list query parameters.
+
+Channel and tab URLs such as `@name/videos` are collection-only URLs. Use the
+video or audio command with explicit playlist intent and a finite bound:
+
+```bash
+atlas video "https://www.youtube.com/@name/videos" --playlist --playlist-items 1
+```
+
+Atlas applies the same bound during probing so the command cannot silently
+enumerate the entire channel before progress starts.
 
 Explicit playlist sessions skip removed, private, or otherwise unavailable
 download entries with yt-dlp's download-only ignore mode. Post-processing errors
@@ -451,6 +491,8 @@ For live automation diagnostics, use `--progress json` rather than `--json`.
 `--json` prints the final summary, while `--progress json` emits newline-delimited
 progress events with adaptive queue, per-host, segment, bucket, backend,
 priority, reclassification, and scheduler-decision fields when known.
+When both flags are supplied, `--json` takes precedence and suppresses all live
+progress so stdout remains one parseable document.
 
 ## Duplicate filenames in batch output
 
@@ -465,6 +507,10 @@ pamphlets__bestpractices.pdf
 
 This is intentional. It prevents silent overwrites in flat batch output
 directories.
+
+Atlas also reserves case-folded final paths before concurrent work and
+re-disambiguates server-provided Content-Disposition/redirect names. This
+prevents two URLs from converging on one file on case-insensitive filesystems.
 
 ## Recover a failed or canceled session
 
@@ -486,8 +532,9 @@ atlas retry ~/Downloads/atlas --canceled-only
 atlas resume ~/Downloads/atlas
 ```
 
-`resume` includes failed, skipped-unknown, and canceled-before-start items. To
-review the next retry plans without starting them:
+`resume` includes failed, skipped-unknown, and canceled items. Canceled items can
+come from queued work or from native/media/exact-index/mirror work stopped by an
+active control. To review the next retry plans without starting them:
 
 ```bash
 atlas resume ~/Downloads/atlas --dry-run --json

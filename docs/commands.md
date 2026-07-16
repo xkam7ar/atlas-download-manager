@@ -96,7 +96,8 @@ files at this level` opens the full searchable visible-file picker.
 Guided setup planner and repair surface. It detects the host, package manager,
 install method, selected runtime footprint, config path, and output directory.
 By default it prints a plan and creates Atlas paths; it only runs package-manager
-commands with `--install` and confirmation or `--yes`.
+commands with `--install` and confirmation or `--yes`. `--no-install` and
+`--json` are plan-only and do not create paths or install packages.
 
 ```bash
 atlas setup
@@ -107,6 +108,7 @@ atlas setup --mirrors
 atlas setup --no-install
 atlas setup --install --yes
 atlas setup --json
+atlas setup --open-menu
 ```
 
 Runtime footprints:
@@ -117,11 +119,21 @@ Runtime footprints:
 - `--mirrors`: `wget2`, `wget`
 
 `atlas setup --json` emits the setup plan without human UI.
+Its stable top-level fields are `mode`, `environment`, `tools`, `missing_tools`,
+`install_commands`, `manual_commands`, `config_file`, `output_dir`,
+`can_install`, `complete`, and `notes`. `environment.package_manager` is one of
+`homebrew`, `apt`, `dnf`, or `pacman` on supported hosts. Each tool row reports
+the executable, host-specific package name, purpose, required status, and
+installed status. `ffmpeg` and `ffprobe` intentionally share one package and one
+install command.
 
-When Homebrew is available, setup prints commands using the detected executable
-path. This keeps Apple Silicon and Intel Homebrew prefixes correct. Without a
-supported package manager, setup prints manual repair commands and does not try
-to install anything automatically.
+Setup uses Homebrew on macOS, apt on Debian/Ubuntu, dnf on Fedora, and pacman on
+Arch-family Linux. Fedora maps the runtime to `ffmpeg-free`, `aria2`, `wget2`,
+and `wget1-wget`. Because official pacman repositories do not provide `wget2`,
+the full pacman plan installs that one tool through Linuxbrew. Without root or
+`sudo`, native Linux plans remain manual and `can_install` is false.
+`--open-menu` opens the interactive menu after the normal setup result; it has
+no effect in the early-return `--no-install` or `--json` plan modes.
 
 ## `atlas update`
 
@@ -321,6 +333,12 @@ Checksums support `sha256`, `sha512`, `sha1`, and `md5` in the form
 Wget2 downloads verify the saved file after download. aria2 plans pass checksum
 verification to aria2c.
 
+Native resume is representation-safe: Atlas binds a partial file to its saved
+ETag or Last-Modified validator with `If-Range`, verifies the returned
+`Content-Range` starts at the local byte count, and restarts cleanly when the
+remote representation changed. Equal file size alone is never treated as proof
+that a partial file is complete.
+
 For direct files, aria2 progress is read from JSON-RPC `tellStatus`, not console
 scraping. The RPC secret is random per run and redacted from dry-run output.
 `.meta4` and `.metalink` URLs route as manifest downloads and expand through
@@ -401,7 +419,7 @@ Defaults are restrained:
 Use `atlas site` only for websites you are allowed to mirror and keep recursion
 bounded.
 
-Completed site mirrors write stable session artifacts under
+Successful and failed non-dry-run site mirror attempts write stable session artifacts under
 `<output>/.atlas/latest/`: `summary.json`, `manifest.json`, `failed.txt`,
 `skipped.txt`, `canceled.txt`, and `retry.atlas.json`.
 
@@ -463,9 +481,10 @@ Mirror bounds:
 - `--max-runtime SEC`: Atlas-enforced subprocess runtime cap.
 
 `--adaptive` scans the starting page, applies the selected politeness profile,
-and adds crawler queue guidance to the plan preview. Site and directory
-adaptive plans are still executed by Wget2/Wget; Atlas uses the scan to bound
-queue and per-host behavior and to make the safety notes explicit.
+and adds crawler queue guidance to the plan preview. Website plans and ordinary
+HTML directory indexes are executed by Wget2/Wget. Signature-recognized
+CopyParty indexes can resolve to Atlas's bounded `native-exact-index` path
+instead, as described below.
 
 ## `atlas dir URL`
 
@@ -489,7 +508,7 @@ atlas dir "https://example.com/files/" --adaptive --explain --json
 atlas dir "https://example.com/files/" --dry-run --json
 ```
 
-Defaults are restrained:
+Defaults for recursive Wget2 directory plans are restrained:
 
 - recursion is enabled only because `dir` was chosen explicitly
 - Wget2 gets the directory mirror preset: `--recursive`, `--no-parent`,
@@ -530,20 +549,56 @@ politeness, discovered links from the starting index, and external-host safety
 notes. This is useful for open archive directories where a dry run should show
 whether Atlas sees a single-host bounded file tree before Wget2 starts.
 
+Discovery supports conventional HTML indexes and signature-recognized
+CopyParty HTML or plain-text/ANSI indexes. Ambiguous `text/plain` responses fail
+with an explicit parse error. Responses capped at 512 KiB or 2,000 entries are
+marked partial; Atlas does not present their counts or size estimates as
+complete.
+
+Before a real `atlas dir` download, a complete CopyParty scan is converted into
+an exact same-host file list. Atlas applies depth and accept/reject filters,
+refuses partial or mixed unsupported nested indexes, enforces `--max-files`, and
+requires every selected size to be known when `--max-total-size` is set. The
+native exact-index executor preserves relative paths, rejects traversal,
+symlink escapes, and case-folded collisions, honors resume/timestamp/overwrite
+and runtime bounds, and checks cancellation between files and during native
+file progress. Exact-index transfer is currently sequential, one native file at
+a time. Mirror `--wait` and `--random-wait` apply to recursive Wget2/Wget work,
+not this exact native loop. Ordinary HTML trees remain recursive Wget2/Wget work.
+
 Wget2 stats are parsed after mirror runs. Successful mirrors show URL counts,
 failures, redirects, downloaded bytes, hosts, and DNS/TLS/OCSP summaries when
 available. If Wget2 exits nonzero after partial work, Atlas still fails the
 command but includes downloaded bytes and failed URL samples in the error.
-Completed directory mirrors write stable session artifacts under
+Successful and failed non-dry-run directory mirror attempts write stable session artifacts under
 `<output>/.atlas/latest/`: `summary.json`, `manifest.json`, `failed.txt`,
-`skipped.txt`, `canceled.txt`, and `retry.atlas.json`. Failed Wget2
-site-stat rows are copied into `failed.txt` and `retry.atlas.json`.
+`skipped.txt`, `canceled.txt`, and `retry.atlas.json`. A failed Wget2 attempt
+retains parsed stat samples in the displayed error, but the current recovery
+artifact retries the mirror seed URL rather than individual failed stat rows.
 
 ## `atlas video URL`
 
 Download a single video by default. Even if a YouTube watch URL contains
 `list=...`, atlas keeps `noplaylist=true` unless an explicit playlist URL and
 playlist mode are used.
+
+YouTube channel/tab URLs are collections, not single videos. Atlas refuses them
+unless playlist intent and a finite bound are both explicit:
+
+```bash
+atlas video "https://www.youtube.com/@example/videos" --playlist --playlist-items 1
+atlas audio "https://www.youtube.com/@example/videos" --playlist --playlist-end 5
+```
+
+This bound is applied to both the metadata probe and the download. A collection
+URL without `--playlist` and `--playlist-items` or `--playlist-end` fails before
+yt-dlp can enumerate the channel.
+
+For a bounded collection, the human plan preview shows the resolved yt-dlp
+output template. It does not fabricate a concrete filename from
+collection-level metadata. The selected-item summary also stays compact instead
+of printing the entire format catalog; use `atlas formats` or the menu's
+exact-format picker for that detail.
 
 In the interactive menu, Atlas probes the URL before showing media choices. The
 menu builds a format catalog, then recommends profiles such as Best quality,
@@ -618,6 +673,9 @@ Selection, playlist, section, and SponsorBlock controls:
 --sponsorblock-chapter-title TEMPLATE
 --sponsorblock-api URL
 ```
+
+`--max-downloads N` is a successful requested cap after N distinct items finish;
+it is not reported as a failed download merely because yt-dlp signals the stop.
 
 `--match-filter`, `--break-match-filter`, `--download-section`,
 `--sponsorblock-mark`, and `--sponsorblock-remove` are repeatable. Section time
@@ -733,6 +791,11 @@ Playlist controls:
 --playlist-end 25
 ```
 
+Open-ended selections such as `20-` are valid for an explicit playlist URL,
+but they are not a finite channel/tab collection bound. Collections require a
+closed range such as `1-10`, explicit item numbers such as `1,4,7`, or a finite
+`--playlist-end`.
+
 In the interactive menu, playlist customization offers three item-selection
 paths: all items, typed yt-dlp range/start-end values, or a checkbox list of
 item numbers for quick multi-select sessions. The checkbox path writes the
@@ -746,6 +809,8 @@ Safety behavior:
   playlist allowed.
 - Watch URL with radio/list params: refused by `atlas playlist`.
 - Watch URL with radio/list params plus `atlas video` or `atlas audio`: single item.
+- Channel/tab collection plus `atlas video` or `atlas audio`: requires
+  `--playlist` and a finite item/end bound.
 - Removed, private, or unavailable download entries are skipped in effective
   playlist sessions; post-processing failures still fail.
 
@@ -756,6 +821,7 @@ Show a sanitized media card.
 ```bash
 atlas info URL
 atlas info URL --json
+atlas info PLAYLIST_URL --playlist
 atlas info URL --cookies-from-browser safari
 atlas info URL --cookies-file ~/Downloads/cookies.txt
 ```
@@ -772,7 +838,11 @@ Default output is a readable card with:
 - Playlist detection
 - Best video and audio summaries
 
-`--json` prints a machine-readable `MediaInfo` model.
+`--json` prints a machine-readable `MediaInfo` model. `--playlist` explicitly
+permits extraction from a canonical playlist URL; without it, playlist
+enumeration is disabled.
+Collection/channel URLs are rejected here because `atlas info` has no finite
+selection flags; use a bounded `atlas video|audio ... --dry-run --json` plan.
 
 ## `atlas formats URL`
 
@@ -785,10 +855,15 @@ atlas formats URL
 atlas formats URL --video-only
 atlas formats URL --audio-only
 atlas formats URL --sort quality
+atlas formats PLAYLIST_URL --playlist
 atlas formats URL --json
 ```
 
 Sort choices are `quality`, `size`, and `codec`.
+
+`--playlist` explicitly permits extraction from a canonical playlist URL.
+Channel/tab collection URLs are rejected because `atlas formats` has no finite
+selection flags; use a bounded `atlas video|audio ... --dry-run --json` plan.
 
 Columns:
 
@@ -855,7 +930,9 @@ Input rules:
 - Possible open-directory mirrors are skipped unless `--allow-dirs` is passed.
 - Batch continues after individual URL failures.
 - The command exits nonzero when any item fails.
-- `--concurrency N` controls how many URLs run at once.
+- `--concurrency N` controls ordinary batch URL concurrency. With `--adaptive`,
+  mixed-engine execution uses the adaptive plan's queue value; an all-aria2
+  shared RPC batch instead maps the explicit value to aria2's global queue.
 - Direct-file duplicate basenames are disambiguated with path-scoped names.
 
 `--type audio` and `--type video` keep the older explicit media-only behavior.
@@ -896,17 +973,21 @@ unique generation names. Atlas rejects symbolic-link `latest/` directories.
 
 `total` is the full number of considered input lines, including skipped blank or
 comment lines. `succeeded`, `failed`, and `skipped` always describe the final
-batch outcome, and batch continues after individual item failures.
+batch outcome, and batch continues after individual item failures. `canceled`
+is a reported subset of `skipped`; automation must not add the two values when
+reconciling totals.
 
-Concurrency is item-level. Each item still uses its own optimized plan, including
+Batch concurrency is queue-level: it limits active URL items. Each item still
+uses its own optimized plan, including
 yt-dlp options for media and aria2 HTTP/HTTPS connections/splits for direct-file
 downloads when aria2 is selected. The default comes from `batch_concurrency` in
 config and is deliberately conservative. When every batch item resolves to a
 direct-file or Metalink aria2 plan, atlas submits the whole batch to one local
 aria2 RPC session and maps `--concurrency` to aria2's queue limit.
 
-Adaptive batch mode scans direct files, media URLs, and allowed site/directory
-candidates before execution. The plan reports size counts, bucket counts, hosts,
+Adaptive batch mode probes direct files, scans allowed site/directory
+candidates, and route-classifies media URLs without a media metadata probe. The
+plan reports size counts, bucket counts, hosts,
 queue concurrency, per-host concurrency, per-file segments, selected backend, and
 safety notes. At runtime the batch scheduler enforces the adaptive queue and
 per-host caps, while each item still carries its own native, aria2c, Wget2, site,
@@ -914,6 +995,29 @@ or yt-dlp media plan. Tiny/small direct files can run many URL slots with no
 splitting; large ranged files use fewer URL slots with more per-item aria2
 segments. Unknown-size items begin conservatively and are reclassified once a
 backend progress event reports a total size.
+
+For the mixed-engine executor, only rows that can start under the current
+global, per-host, and operator-pause limits enter the executor. Paused or
+host-capped rows remain pending, so they do not occupy worker threads needed by
+another runnable host. The runtime API can attribute feedback to a resolved/CDN
+host when a caller supplies a host resolver; the built-in CLI currently uses
+the original item host. The all-aria2 shared RPC path queues every item into
+aria2 immediately, enforces only its global adaptive queue limit, and does not
+bind `BatchControl`, so the full-progress mutation keys are not advertised for
+that path. Shared RPC batches change global queue and speed options only when
+their effective values change, and reset that cache when the process stops.
+
+If shared aria2 RPC startup fails, Atlas returns to ordinary per-item batch
+execution. If RPC is lost after work starts, completed items stay complete,
+unresolved items fail, and active GIDs are removed best-effort. Only TLS-chain
+failures receive the verified-curl per-item retry; general mid-session RPC
+failures do not automatically retry through the legacy aria2 subprocess.
+
+In interactive full progress on the mixed-engine path, `x` and `X` can cancel queued rows and controlled
+active work. Active mirror subprocesses are terminated; native files,
+exact-index files, and media work stop cooperatively at progress or
+postprocessor hook boundaries. Canceled rows are recorded distinctly and stay
+eligible for resume or canceled-only retry.
 
 Use exact-list batch downloads when you need every known file from an archive
 page and recursive Wget2 traversal is confused by malformed HTML, broken links,
@@ -951,6 +1055,7 @@ Preview choices are `plan`, `backend`, `manifest`, `summary`, `retry`, `failed`,
 Filters do not change the saved session. `--export-urls PATH` exports every URL
 in the filtered view, ignoring the display-only `--limit`. Exports refuse to
 replace existing files or session artifacts unless `--force` is explicit.
+`--open-output` uses the macOS `open` command and is currently macOS-only.
 
 ### Resume and retry
 
@@ -964,10 +1069,11 @@ atlas retry ~/Downloads/atlas --canceled-only
 atlas retry ~/Downloads/atlas --dry-run --json
 ```
 
-`resume` includes failed URLs, skipped unknown-route URLs, and URLs canceled
-before item start. `retry` defaults to failed items and can narrow to one failure
-class. Both reuse the normal batch execution path so routing, progress, and new
-artifacts stay consistent.
+`resume` includes failed URLs, skipped unknown-route URLs, and canceled URLs,
+including both queued cancellations and controllable active cancellations.
+`retry` defaults to failed items and can narrow to one failure class. Both reuse
+the normal batch execution path so routing, progress, and new artifacts stay
+consistent.
 
 ### Export retryable URLs
 
@@ -1006,6 +1112,7 @@ Checks include:
 - atlas package version
 - Python SSL, CA bundle, and HTTPS verification
 - yt-dlp import/version
+- mutagen artwork-embedding support
 - ffmpeg
 - ffprobe
 - aria2c
@@ -1014,6 +1121,13 @@ Checks include:
 - wget
 - config/data/cache/log/output directories
 - browser cookie support
+- optional yt-dlp impersonation support
+
+Every mode performs one verified HTTPS GET to `https://www.python.org/` with a
+three-second timeout for the HTTPS verification row. Default human mode creates
+missing Atlas directories and performs temporary write probes. `--json` and
+`--fix --no-install` use non-mutating path checks, but they still perform that
+network probe and therefore are not offline modes.
 
 `--network` filters the report to Python/SSL/CA/HTTPS checks and exits nonzero
 when any network check fails. `--fix-certs` prints safe certificate repair
@@ -1025,7 +1139,7 @@ dependency check.
 
 `--fix` builds the same full-runtime repair plan as `atlas setup --full`.
 It prints the plan by default, runs install commands only with confirmation or
-`--yes`, and keeps JSON output machine-readable with `--json --fix`.
+`--yes`, and keeps `--no-install` and JSON output non-mutating.
 
 ## `atlas config`
 

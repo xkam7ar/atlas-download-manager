@@ -97,6 +97,11 @@ def test_stable_json_model_field_contracts() -> None:
         "hosts",
         "work_items",
         "safety_notes",
+        "scan_status",
+        "scan_type",
+        "scan_counts",
+        "scan_warnings",
+        "scan_errors",
     )
     assert tuple(SmartDownloadSession.model_fields) == (
         "source",
@@ -519,17 +524,23 @@ def test_cli_and_menu_keep_raw_backend_construction_in_advanced_paths() -> None:
         "_run_backend_passthrough",
     )
     assert "run_backend_command" in _called_functions_in_scope(cli_tree, "_run_backend_passthrough")
-    assert _called_functions_outside_scopes(
-        cli_tree,
-        {"plan_backend_command", "run_backend_command"},
-        allowed_scopes={"_run_backend_passthrough"},
-    ) == {}
-    assert _called_functions_outside_scopes(
-        menu_tree,
-        {"split"},
-        allowed_scopes={"_advanced_backend_flow", "_parse_pasted_urls"},
-        owner="shlex",
-    ) == {}
+    assert (
+        _called_functions_outside_scopes(
+            cli_tree,
+            {"plan_backend_command", "run_backend_command"},
+            allowed_scopes={"_run_backend_passthrough"},
+        )
+        == {}
+    )
+    assert (
+        _called_functions_outside_scopes(
+            menu_tree,
+            {"split"},
+            allowed_scopes={"_advanced_backend_flow", "_parse_pasted_urls"},
+            owner="shlex",
+        )
+        == {}
+    )
 
     forbidden_preset_builders = {
         "build_audio_opts",
@@ -539,16 +550,22 @@ def test_cli_and_menu_keep_raw_backend_construction_in_advanced_paths() -> None:
     }
     assert _imported_names(cli_tree, "atlas.presets").isdisjoint(forbidden_preset_builders)
     assert _imported_names(menu_tree, "atlas.presets").isdisjoint(forbidden_preset_builders)
-    assert _called_functions_outside_scopes(
-        cli_tree,
-        forbidden_preset_builders,
-        allowed_scopes=set(),
-    ) == {}
-    assert _called_functions_outside_scopes(
-        menu_tree,
-        forbidden_preset_builders,
-        allowed_scopes=set(),
-    ) == {}
+    assert (
+        _called_functions_outside_scopes(
+            cli_tree,
+            forbidden_preset_builders,
+            allowed_scopes=set(),
+        )
+        == {}
+    )
+    assert (
+        _called_functions_outside_scopes(
+            menu_tree,
+            forbidden_preset_builders,
+            allowed_scopes=set(),
+        )
+        == {}
+    )
 
 
 def _json_payload(model: BaseModel) -> dict[str, Any]:

@@ -143,9 +143,7 @@ def redact_command_args(args: Sequence[object]) -> list[object]:
             redact_next = not separator
             continue
         if name == "--header":
-            redacted.append(
-                f"{name}={_redact_header_value(value)}" if separator else name
-            )
+            redacted.append(f"{name}={_redact_header_value(value)}" if separator else name)
             header_next = not separator
             continue
         redacted.append("<redacted>" if text_contains_secret(arg) else arg)

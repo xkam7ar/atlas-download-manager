@@ -17,7 +17,8 @@ artifacts, and duplicate-name handling stay precise.
 
 ## Scope
 
-Atlas exposes friendly scope controls on top of Wget2/Wget recursion:
+Atlas exposes friendly scope controls on top of recursive Wget2/Wget plans and
+native exact-index plans:
 
 ```bash
 atlas site URL --same-host-only
@@ -48,15 +49,19 @@ atlas site URL --max-total-size 5G
 atlas site URL --max-runtime 1800
 ```
 
-`--depth` maps to Wget2/Wget recursion depth.
-`--max-total-size` is a friendly alias for Wget2 quota.
-`--max-runtime` is enforced by Atlas around the mirror subprocess. Interactive
-operator cancellation uses the same safe subprocess boundary through
-`ProcessControl`, so an in-flight mirror can be stopped without dumping raw
-Wget2/Wget shutdown output into the UI.
-`--max-files` is enforced during Atlas adaptive scan planning when scan counts
-are available. Backend-only Wget2/Wget mirrors do not expose a hard file-count
-kill switch, so use `--adaptive --explain` for file-count preflight.
+`--depth` maps to Wget2/Wget recursion depth and bounds exact-index folder
+walking. `--max-total-size` is a friendly alias for Wget2 quota; on an exact
+index Atlas requires all selected sizes to be known and verifies the sum before
+transfer. `--max-runtime` is enforced around a recursive mirror subprocess and
+across exact-index discovery/transfer. Interactive operator cancellation uses
+`ProcessControl`: it terminates recursive children and cooperatively stops native
+exact-index work at file/progress boundaries without dumping backend shutdown
+noise into the UI.
+
+`--max-files` is exact for complete CopyParty index lists and is a scan-time
+guard when ordinary recursive scan counts are available. Backend-only
+Wget2/Wget mirrors do not expose a hard file-count kill switch, so use
+`--adaptive --explain` for file-count preflight.
 
 ## Filters And HTML Policy
 
@@ -96,5 +101,9 @@ atlas site URL --wait 0.5 --random-wait --timeout 60 --tries 5
 atlas dir URL --wait 0.5 --random-wait --continue
 ```
 
-Adaptive mirrors add scan-based safety notes and queue/per-host planning, while
-Wget2/Wget remain the recursive workers.
+Adaptive mirrors add scan-based safety notes and queue/per-host planning.
+Wget2/Wget remain the recursive workers; complete signature-recognized
+CopyParty text/HTML indexes use the bounded `native-exact-index` worker. That
+exact worker currently downloads one native file at a time; adaptive queue and
+per-host fields describe discovery/session planning, and recursive `--wait` or
+`--random-wait` settings do not pace the exact native loop.

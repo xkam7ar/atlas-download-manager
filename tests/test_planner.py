@@ -186,6 +186,71 @@ def test_playlist_ranges_are_ignored_for_watch_urls(tmp_path: Path) -> None:
     assert "watch URL playlist/radio parameters kept single-item" in plan.planner_notes
 
 
+def test_youtube_channel_collection_requires_explicit_playlist_intent(tmp_path: Path) -> None:
+    with pytest.raises(PlanningError, match="YouTube collection URL"):
+        SmartPlanner(_settings(tmp_path)).plan_video(
+            _video(tmp_path, url="https://www.youtube.com/@AveryYapps/videos")
+        )
+
+
+def test_youtube_channel_collection_requires_finite_selection_bound(tmp_path: Path) -> None:
+    with pytest.raises(PlanningError, match="finite selection bound"):
+        SmartPlanner(_settings(tmp_path)).plan_video(
+            _video(
+                tmp_path,
+                url="https://www.youtube.com/@AveryYapps/videos",
+                playlist=True,
+            )
+        )
+
+    with pytest.raises(PlanningError, match="finite selection bound"):
+        SmartPlanner(_settings(tmp_path)).plan_video(
+            _video(
+                tmp_path,
+                url="https://www.youtube.com/@AveryYapps/videos",
+                playlist=True,
+                playlist_items="20-",
+            )
+        )
+
+
+def test_youtube_channel_collection_preserves_playlist_bounds(tmp_path: Path) -> None:
+    plan = SmartPlanner(_settings(tmp_path)).plan_video(
+        _video(
+            tmp_path,
+            url="https://www.youtube.com/@AveryYapps/videos",
+            playlist=True,
+            playlist_items="1-3,5",
+            socket_timeout=12,
+            json_output=True,
+        )
+    )
+
+    assert plan.noplaylist is False
+    assert plan.playlist_items == "1-3,5"
+    assert plan.socket_timeout == 12
+    assert plan.youtube_collection_url_detected is True
+    assert plan.playlist_url_detected is False
+    assert plan.json_output is True
+    assert "bounded YouTube collection URL accepted" in plan.planner_notes
+
+
+def test_youtube_channel_collection_accepts_playlist_end_bound(tmp_path: Path) -> None:
+    plan = SmartPlanner(_settings(tmp_path)).plan_audio(
+        _audio(
+            tmp_path,
+            url="https://www.youtube.com/channel/UCU28LWFMn1GN0coMTBFTo2w/videos",
+            playlist=True,
+            playlist_start=2,
+            playlist_end=4,
+        )
+    )
+
+    assert plan.noplaylist is False
+    assert plan.playlist_start == 2
+    assert plan.playlist_end == 4
+
+
 def test_media_sidecar_modes_skip_primary_download(tmp_path: Path) -> None:
     subtitle_plan = SmartPlanner(_settings(tmp_path)).plan_video(
         _video(tmp_path, subtitle_only=True)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import atlas.doctor as doctor_module
 from atlas.config import AtlasSettings
 from atlas.doctor import Wget2Capabilities, _parse_wget2_capabilities, run_doctor
 
@@ -15,10 +16,25 @@ def test_doctor_reports_required_checks(tmp_path: Path) -> None:
     assert "Python" in names
     assert "atlas package" in names
     assert "yt-dlp" in names
+    assert "mutagen" in names
     assert "ffmpeg" in names
     assert "ffprobe" in names
     assert "aria2c" in names
     assert "output dir" in names
+
+
+def test_doctor_plan_only_does_not_create_output_path(tmp_path: Path) -> None:
+    output_dir = tmp_path / "missing" / "output"
+    settings = AtlasSettings(
+        output_dir=output_dir,
+        archive_file=tmp_path / "archive.txt",
+    )
+
+    report = run_doctor(settings, create_paths=False)
+
+    output_check = next(check for check in report.checks if check.name == "output dir")
+    assert output_check.ok is True
+    assert not output_dir.exists()
 
 
 def test_doctor_fails_when_required_tools_missing(
@@ -91,6 +107,25 @@ def test_doctor_reports_missing_ytdlp(
     assert report.ok is False
 
 
+def test_doctor_reports_missing_required_mutagen(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = AtlasSettings(output_dir=tmp_path, archive_file=tmp_path / "archive.txt")
+    real_module_available = doctor_module._module_available
+    monkeypatch.setattr(
+        "atlas.doctor._module_available",
+        lambda name: False if name == "mutagen" else real_module_available(name),
+    )
+
+    report = run_doctor(settings)
+
+    mutagen = next(check for check in report.checks if check.name == "mutagen")
+    assert mutagen.ok is False
+    assert mutagen.required is True
+    assert report.ok is False
+
+
 def test_parse_wget2_capabilities_extracts_feature_flags() -> None:
     text = "\n".join(
         [
@@ -103,8 +138,7 @@ def test_parse_wget2_capabilities_extracts_feature_flags() -> None:
     capabilities = _parse_wget2_capabilities("/opt/bin/wget2", text)
 
     assert (
-        capabilities.version
-        == "GNU Wget2 2.2.1 - multithreaded metalink/file/website downloader"
+        capabilities.version == "GNU Wget2 2.2.1 - multithreaded metalink/file/website downloader"
     )
     assert capabilities.features["http2"] is True
     assert capabilities.features["psl"] is True

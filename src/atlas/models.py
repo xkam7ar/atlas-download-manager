@@ -629,6 +629,12 @@ class InfoOptions(BaseModel):
     browser_cookies: str | None = None
     cookies_file: Path | None = None
     playlist: bool = False
+    playlist_items: str | None = None
+    playlist_start: int | None = Field(default=None, ge=1)
+    playlist_end: int | None = Field(default=None, ge=1)
+    socket_timeout: float | None = Field(default=None, ge=0)
+    flat_playlist: bool = True
+    json_output: bool = False
     verbose: bool = False
 
     @field_validator("url")
@@ -647,6 +653,37 @@ class InfoOptions(BaseModel):
         if isinstance(value, Path):
             return value.expanduser()
         return value
+
+    @field_validator("playlist_items")
+    @classmethod
+    def playlist_items_must_be_simple_ranges(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        if not _PLAYLIST_ITEMS_PATTERN.fullmatch(cleaned):
+            msg = "playlist_items must look like 1-10,15,20-"
+            raise ValueError(msg)
+        for segment in cleaned.split(","):
+            if "-" not in segment:
+                continue
+            start_text, end_text = segment.split("-", 1)
+            if end_text and int(start_text) > int(end_text):
+                msg = "playlist item ranges cannot count backwards"
+                raise ValueError(msg)
+        return cleaned
+
+    @model_validator(mode="after")
+    def playlist_range_must_be_ordered(self) -> InfoOptions:
+        if (
+            self.playlist_start is not None
+            and self.playlist_end is not None
+            and self.playlist_start > self.playlist_end
+        ):
+            msg = "playlist_start cannot be greater than playlist_end"
+            raise ValueError(msg)
+        return self
 
 
 class WorkItem(BaseModel):
@@ -721,6 +758,11 @@ class AdaptiveDownloadPlan(BaseModel):
     hosts: dict[str, int] = Field(default_factory=dict)
     work_items: list[WorkItem] = Field(default_factory=list)
     safety_notes: list[str] = Field(default_factory=list)
+    scan_status: ScanStatus | None = None
+    scan_type: str | None = None
+    scan_counts: dict[str, int] = Field(default_factory=dict)
+    scan_warnings: list[str] = Field(default_factory=list)
+    scan_errors: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class SmartDownloadSession(BaseModel):
@@ -1078,6 +1120,7 @@ class SiteDownloadOptions(BaseModel):
     max_files: int | None = Field(default=None, ge=1)
     max_total_size: str | None = None
     max_runtime: float | None = Field(default=None, ge=0)
+    planning_runtime_seconds: float = Field(default=0.0, ge=0, exclude=True, repr=False)
     quota: str | None = None
     limit_rate: str | None = None
     warc_file: Path | None = None
@@ -1196,6 +1239,9 @@ class DirectoryMirrorOptions(SiteDownloadOptions):
     user_agent: str | None = DEFAULT_DIRECTORY_USER_AGENT
     if_modified_since: bool | None = False
     timestamping: bool = True
+    exact_directory_index: bool = False
+    exact_directory_base_url: str | None = None
+    exact_directory_items: tuple[WorkItem, ...] = ()
 
 
 class FormatInfo(BaseModel):
@@ -1426,8 +1472,10 @@ class DownloadPlan(BaseModel):
     sponsorblock_chapter_title: str | None = None
     sponsorblock_api: str | None = None
     playlist_url_detected: bool = False
+    youtube_collection_url_detected: bool = False
     watch_playlist_params_detected: bool = False
     planner_notes: list[str] = Field(default_factory=list)
+    json_output: bool = False
     verbose: bool = False
 
 

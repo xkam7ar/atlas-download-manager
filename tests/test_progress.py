@@ -34,6 +34,7 @@ from atlas.progress import (
     create_progress_hook,
     progress_event_from_ytdlp,
     progress_event_from_ytdlp_postprocessor,
+    resolve_progress_mode,
     should_use_alternate_screen,
 )
 from atlas.progress_events import progress_event_from_aria2_line, progress_event_from_wget2_line
@@ -121,6 +122,21 @@ def test_alternate_screen_policy_requires_human_interactive_mode() -> None:
     assert not should_use_alternate_screen(ProgressMode.none, console=terminal, plain=False)
     assert not should_use_alternate_screen(ProgressMode.compact, console=terminal, plain=True)
     assert not should_use_alternate_screen(ProgressMode.compact, console=pipe, plain=False)
+
+
+@pytest.mark.parametrize("mode", list(ProgressMode))
+def test_json_output_always_suppresses_progress(mode: ProgressMode) -> None:
+    terminal = Console(file=StringIO(), force_terminal=True)
+
+    assert (
+        resolve_progress_mode(
+            mode,
+            console=terminal,
+            quiet=False,
+            json_output=True,
+        )
+        == ProgressMode.none
+    )
 
 
 def test_live_reporter_passes_alternate_screen_to_rich(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -702,6 +718,82 @@ def test_video_progress_uses_download_card_with_compact_steps() -> None:
     assert "q cancel" not in rendered
 
 
+def test_media_progress_renders_exact_plan_steps_including_empty_plan() -> None:
+    reporter = RichProgressReporter(
+        Console(file=StringIO(), force_terminal=True),
+        work_context=WorkPanelContext(
+            kind=HubKind.video,
+            item_title="Single stream",
+            steps=("Download video", "Finalize"),
+        ),
+    )
+    reporter.hook(
+        ProgressEvent(
+            engine=EngineKind.ytdlp,
+            status="downloading",
+            phase=ProgressPhase.download,
+            kind=HubKind.video,
+            title="Single stream",
+            downloaded_bytes=1,
+            total_bytes=2,
+        )
+    )
+
+    output = StringIO()
+    _render_console(output, width=80).print(reporter._render())
+    rendered = output.getvalue()
+
+    assert "Download video" in rendered
+    assert "Finalize" in rendered
+    assert "Merge video/audio" not in rendered
+    assert "Embed metadata" not in rendered
+    assert "Add thumbnail" not in rendered
+
+    no_steps = RichProgressReporter(
+        Console(file=StringIO(), force_terminal=True),
+        work_context=WorkPanelContext(kind=HubKind.video, steps=()),
+    )
+    no_steps_output = StringIO()
+    _render_console(no_steps_output, width=80).print(no_steps._render())
+    assert "Steps" not in no_steps_output.getvalue()
+
+
+def test_file_progress_only_shows_transfer_phases_that_apply() -> None:
+    reporter = FileProgressReporter(
+        Console(file=StringIO(), force_terminal=True),
+        work_context=WorkPanelContext(kind=HubKind.file),
+    )
+    reporter.handle_event(
+        ProgressEvent(
+            engine=EngineKind.native,
+            status="done",
+            phase=ProgressPhase.download,
+            kind=HubKind.file,
+            title="README.md",
+        )
+    )
+    reporter.handle_event(
+        ProgressEvent(
+            engine=EngineKind.native,
+            status="running",
+            phase=ProgressPhase.verify,
+            kind=HubKind.file,
+            title="README.md",
+        )
+    )
+
+    output = StringIO()
+    _render_console(output, width=80).print(reporter._render())
+    rendered = output.getvalue()
+
+    assert "Download" in rendered
+    assert "Verify" in rendered
+    assert "Merge" not in rendered
+    assert "Extract" not in rendered
+    assert "metadata" not in rendered
+    assert "Thumbnail" not in rendered
+
+
 def test_create_batch_progress_hook_preserves_batch_context() -> None:
     reporter = BatchProgressReporter(Console(file=StringIO()))
     events: list[ProgressEvent] = []
@@ -951,9 +1043,7 @@ def test_batch_render_avoids_status_progress_duplicates() -> None:
         reporter.hook(event)
 
     output = StringIO()
-    _render_console(output, width=180).print(
-        reporter._render()
-    )
+    _render_console(output, width=180).print(reporter._render())
     rendered = output.getvalue()
 
     assert "2 jobs" in rendered
@@ -1020,9 +1110,7 @@ def test_batch_reporter_operator_key_cancels_focused_active_item() -> None:
     assert result.action == "cancel_line"
     assert result.snapshot["canceled_lines"] == [2]
     output = StringIO()
-    _render_console(output, width=140).print(
-        reporter._render()
-    )
+    _render_console(output, width=140).print(reporter._render())
     assert "cancel requested for item 2" in output.getvalue()
 
 
@@ -1040,9 +1128,7 @@ def test_batch_reporter_help_overlay_toggles_with_question_key() -> None:
     assert result.action == "toggle_help"
     assert result.snapshot["shortcut_help"] is True
     output = StringIO()
-    _render_console(output, width=140).print(
-        reporter._render()
-    )
+    _render_console(output, width=140).print(reporter._render())
     rendered = output.getvalue()
     assert "Shortcuts" in rendered
     assert "show batch shortcuts" in rendered
@@ -1055,9 +1141,7 @@ def test_batch_reporter_help_overlay_toggles_with_question_key() -> None:
     assert result is not None
     assert result.snapshot["shortcut_help"] is False
     output = StringIO()
-    _render_console(output, width=140).print(
-        reporter._render()
-    )
+    _render_console(output, width=140).print(reporter._render())
     assert "show batch shortcuts" not in output.getvalue()
 
 
@@ -1108,9 +1192,7 @@ def test_batch_reporter_tab_cycles_operator_panels() -> None:
     assert result.action == "cycle_panel"
     assert result.snapshot["active_panel"] == "completed"
     output = StringIO()
-    _render_console(output, width=140).print(
-        reporter._render()
-    )
+    _render_console(output, width=140).print(reporter._render())
     assert "[completed]" in output.getvalue()
 
 
@@ -1140,9 +1222,7 @@ def test_batch_reporter_operator_panels_filter_visible_rows() -> None:
 
     reporter.handle_operator_key("tab")
     output = StringIO()
-    _render_console(output, width=140).print(
-        reporter._render()
-    )
+    _render_console(output, width=140).print(reporter._render())
 
     rendered = output.getvalue()
     assert "[completed]" in rendered
@@ -1183,9 +1263,7 @@ def test_batch_reporter_arrow_focus_controls_cancel_target() -> None:
     assert cancel_result is not None
     assert cancel_result.snapshot["canceled_lines"] == [3]
     output = StringIO()
-    _render_console(output, width=140).print(
-        reporter._render()
-    )
+    _render_console(output, width=140).print(reporter._render())
     assert ">3" in output.getvalue()
 
 
@@ -1267,9 +1345,7 @@ def test_batch_render_uses_compact_rows_on_narrow_terminals() -> None:
         reporter.hook(event)
 
     output = StringIO()
-    _render_console(output, width=64).print(
-        reporter._render()
-    )
+    _render_console(output, width=64).print(reporter._render())
     rendered = output.getvalue()
 
     assert "Kind" not in rendered
@@ -1278,6 +1354,54 @@ def test_batch_render_uses_compact_rows_on_narrow_terminals() -> None:
     assert "retry 1" in rendered
     assert "Shortcuts" not in rendered
     assert "\n                             P" not in rendered
+
+
+def test_batch_render_limits_rows_to_terminal_height_and_prioritizes_actionable_items() -> None:
+    reporter = BatchProgressReporter(
+        Console(file=StringIO(), width=100, height=18),
+        total=30,
+        concurrency=3,
+        mode=ProgressMode.compact,
+        work_context=WorkPanelContext(operation="Batch Download"),
+    )
+    for line_no in range(1, 28):
+        reporter.hook(
+            ProgressEvent(
+                engine=EngineKind.native,
+                status="queued" if line_no < 20 else "done",
+                phase=ProgressPhase.download if line_no < 20 else ProgressPhase.done,
+                kind=HubKind.file,
+                line_no=line_no,
+                item_id=str(line_no),
+                title=f"ordinary-{line_no}.bin",
+            )
+        )
+    for line_no, status, title in (
+        (28, "failed", "failed-priority.bin"),
+        (29, "retrying", "retry-priority.bin"),
+        (30, "downloading", "active-priority.bin"),
+    ):
+        reporter.hook(
+            ProgressEvent(
+                engine=EngineKind.native,
+                status=status,
+                phase=ProgressPhase.error if status == "failed" else ProgressPhase.download,
+                kind=HubKind.file,
+                line_no=line_no,
+                item_id=str(line_no),
+                title=title,
+            )
+        )
+
+    output = StringIO()
+    _render_console(output, width=100).print(reporter._render())
+    rendered = output.getvalue()
+
+    assert "active-priority.bin" in rendered
+    assert "retry-priority.bin" in rendered
+    assert "failed-priority.bin" in rendered
+    assert "hidden" in rendered
+    assert "ordinary-1.bin" not in rendered
 
 
 def test_compact_batch_rows_keep_speed_and_eta_together_at_40_columns() -> None:
@@ -1346,9 +1470,7 @@ def test_batch_reporter_seeds_queue_and_renders_percent_progress() -> None:
     )
 
     output = StringIO()
-    _render_console(output, width=140).print(
-        reporter._render()
-    )
+    _render_console(output, width=140).print(reporter._render())
     rendered = output.getvalue()
 
     assert "one.iso" in rendered
@@ -1384,9 +1506,7 @@ def test_batch_reporter_renders_wget2_percent_progress() -> None:
     )
 
     output = StringIO()
-    _render_console(output, width=120).print(
-        reporter._render()
-    )
+    _render_console(output, width=120).print(reporter._render())
     rendered = output.getvalue()
 
     assert " 42%" in rendered

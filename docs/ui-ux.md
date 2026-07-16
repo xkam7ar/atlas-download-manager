@@ -45,7 +45,7 @@ GitHub CLI polish
 - [Scriptability](#scriptability)
 - [Visual rhythm and state](#visual-rhythm)
 - [Scheduler and error UI](#scheduler-ui)
-- [Terminal width and accessibility](#terminal-width)
+- [Terminal size and accessibility](#terminal-size)
 - [Aesthetic rules](#aesthetic-rules)
 
 </details>
@@ -645,6 +645,12 @@ Next
     Quit
 ```
 
+For bounded channel/tab collections, the output row must show the resolved
+yt-dlp template rather than a fabricated concrete path based on collection-level
+title/id metadata. The selected-item card should summarize the chosen quality,
+container, and codecs without dumping the full format catalog; the exact-format
+picker and `atlas formats` own that detailed table.
+
 ## Audio summary
 
 Audio summary focuses on extraction:
@@ -720,10 +726,11 @@ Steps
   Finalize
 ```
 
-Explicit playlists are media batches. If video/audio receives an explicit
-playlist URL, ask before converting the run into a playlist session. Watch URLs
-with playlist/radio parameters remain single media downloads unless deliberately
-accepted as playlist work.
+Explicit playlists are media batches. In the interactive menu, if video/audio
+receives an explicit playlist URL, ask before converting the run into a playlist
+session; non-interactive video/audio commands instead require explicit playlist
+intent. Watch URLs with playlist/radio parameters always remain single-item
+media downloads. Playlist work requires a canonical explicit playlist URL.
 
 ```text
 ╭─ atlas Audio Playlist ──────────────────────────────────────────────╮
@@ -1032,17 +1039,16 @@ the same semantic state colors as the row: `Done` is green, `Error` is red, and
 retry/backoff phases are yellow even when the underlying item is a file, media,
 or mirror.
 
-Operator cancellation is a visible state, not a hidden failure. When a queued
-item is canceled before backend start, Atlas should render `canceled`, include
-the URL in the failure/state drawer only when that drawer is selected, write it
-to `latest/canceled.txt`, and make it available to `atlas resume` and
-`atlas retry --canceled-only`. When an already-running subprocess-backed mirror
-or advanced backend command is canceled through `ProcessControl`, Atlas should
-stop the child process, emit a `canceled` progress event, keep the failure drawer
-language operator-focused, and avoid printing raw backend shutdown logs. Batch
-rows expose this through `BatchItemContext`, so full-screen keybindings can map
-line-level cancel actions to active mirror process controls instead of only
-canceling work that has not started yet.
+Operator cancellation is a visible state, not a hidden failure. Queued and
+active-controlled cancellation should render `canceled`, include the URL in the
+failure/state drawer only when that drawer is selected, write it to
+`latest/canceled.txt`, and make it available to `atlas resume` and
+`atlas retry --canceled-only`. Subprocess-backed mirrors stop their child and
+avoid raw shutdown logs. Native files, exact-index work, and media stop
+cooperatively at transfer, file, or progress/postprocessor hook boundaries.
+Batch rows expose one `ProcessControl` through `BatchItemContext`, so the same
+line-level action covers every controlled route while keeping the wording
+operator-focused.
 
 ## Scheduler UI
 
@@ -1171,20 +1177,28 @@ Details
   Archive   updated
 
 Next
-  Reveal in Finder
+  Reveal in desktop file manager
   Open file
   Download another video
   Back to menu
   Quit
 ```
 
-## Terminal width
+## Terminal size
 
-The UI should adapt to the terminal:
+The UI should adapt to both terminal width and height:
 
-- Wide: header panel, multi-bar dashboard, active table, scheduler line.
-- Medium: header panel, overall bars, compact active table.
-- Narrow: one-line status, one overall bar, active/failed/queued counts.
+- At 110 columns or wider, live batches use the full active table.
+- Below 110 columns, live batches use compact rows.
+- Below 64 columns, each live item becomes a stacked row with identity,
+  progress, and detail lines. Speed and ETA remain visible even at 40 columns.
+- Short terminals budget visible rows instead of overflowing. Selection priority
+  is the focused row, active work, retry/backoff warnings, failures, then the
+  most recently updated remaining rows.
+- Omitted rows are summarized as `+N hidden (...)` with state counts, so height
+  reduction does not hide queue health.
+- Narrow completed batches use stacked result cards that preserve status,
+  kind/engine, URL, and outcome text below 72 columns.
 
 If a table is too wide, collapse columns in this order:
 
@@ -1195,7 +1209,9 @@ If a table is too wide, collapse columns in this order:
 5. path
 6. title
 
-Always preserve status, progress, speed, ETA, and failure count.
+Always preserve status, progress, speed, ETA, and failure count during live
+work. Final batch results must always preserve status, engine, and URL, even
+when that requires stacked rows instead of a table.
 
 ## Accessibility
 

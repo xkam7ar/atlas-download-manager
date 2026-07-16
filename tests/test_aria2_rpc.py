@@ -545,6 +545,82 @@ def test_rpc_session_download_many_reuses_one_process_and_queue(
     assert fake_process.wait_calls >= 1
 
 
+def test_rpc_session_midstream_error_returns_recoverable_item_results(
+    tmp_path: Path,
+) -> None:
+    output_one = tmp_path / "one.bin"
+    output_two = tmp_path / "two.bin"
+    fake_process = FakeProcess()
+    clients: list[MidstreamFailureClient] = []
+
+    class MidstreamFailureClient:
+        def __init__(self, _endpoint: str, _timeout: float) -> None:
+            self.calls: list[tuple[str, list[object]]] = []
+            self.added = 0
+
+        def call(self, method: str, params: list[object]) -> object:
+            self.calls.append((method, params))
+            if method == "aria2.getVersion":
+                return {"version": "1.37.0"}
+            if method == "aria2.addUri":
+                self.added += 1
+                return f"gid-{self.added}"
+            if method == "aria2.tellStatus":
+                gid = str(params[1])
+                if gid == "gid-1":
+                    output_one.write_bytes(b"complete")
+                    return {
+                        "gid": gid,
+                        "status": "complete",
+                        "completedLength": "8",
+                        "totalLength": "8",
+                        "files": [{"path": str(output_one), "length": "8"}],
+                    }
+                raise EngineError("aria2 RPC connection lost")
+            if method in {"aria2.remove", "aria2.shutdown"}:
+                return "OK"
+            raise AssertionError(f"unexpected method {method}")
+
+    def client_factory(endpoint: str, timeout: float) -> MidstreamFailureClient:
+        client = MidstreamFailureClient(endpoint, timeout)
+        clients.append(client)
+        return client
+
+    downloads = [
+        Aria2RpcQueuedDownload(
+            options=FileDownloadOptions(
+                url="https://example.com/one.bin",
+                output_dir=tmp_path,
+                backend=FileBackendChoice.aria2,
+            ),
+            output=output_one,
+        ),
+        Aria2RpcQueuedDownload(
+            options=FileDownloadOptions(
+                url="https://example.com/two.bin",
+                output_dir=tmp_path,
+                backend=FileBackendChoice.aria2,
+            ),
+            output=output_two,
+        ),
+    ]
+
+    results = Aria2RpcSession(
+        port_factory=lambda: 39007,
+        token_factory=lambda: "test-secret",
+        popen_factory=lambda _args, **_kwargs: fake_process,
+        rpc_client_factory=client_factory,
+        sleep=lambda _seconds: None,
+        max_concurrent_downloads=2,
+    ).download_many(downloads)
+
+    assert results[0].result is not None
+    assert results[0].result.output == output_one
+    assert results[1].result is None
+    assert results[1].error == "aria2 RPC connection lost"
+    assert any(method == "aria2.remove" for method, _params in clients[0].calls)
+
+
 def test_rpc_session_download_many_applies_adaptive_backoff_options(
     tmp_path: Path,
 ) -> None:
@@ -651,14 +727,13 @@ def test_rpc_session_download_many_applies_adaptive_backoff_options(
     assert results[0].error is not None
     assert "disk saturation" in results[0].error
     change_options = [
-        call[1][1]
-        for call in clients[0].calls
-        if call[0] == "aria2.changeGlobalOption"
+        call[1][1] for call in clients[0].calls if call[0] == "aria2.changeGlobalOption"
     ]
     assert {
         "max-concurrent-downloads": "1",
         "max-overall-download-limit": "1M",
     } in change_options
+    assert len(change_options) == 2
 
 
 def test_rpc_session_error_status_raises_and_cleans_up(tmp_path: Path) -> None:

@@ -11,7 +11,13 @@ from atlas.config import AtlasSettings
 from atlas.models import EngineKind, EngineRoute, HubKind, HubRequest
 from atlas.urls import is_metalink_url
 
-_MEDIA_HOST_MARKERS = ("youtube.com", "youtu.be", "music.youtube.com", "rumble.com")
+_MEDIA_HOST_MARKERS = (
+    "youtube.com",
+    "youtube-nocookie.com",
+    "youtu.be",
+    "music.youtube.com",
+    "rumble.com",
+)
 _FILE_EXTENSIONS = {
     ".7z",
     ".aac",

@@ -77,7 +77,8 @@ lightweight:
   link sample up to 2,000 discovered URLs; open-directory indexes are parsed as
   visible rows when possible so folders, files, parent links, visible sizes, and
   modified times survive into `WorkItem` metadata
-- batches scan each direct-file, media URL, or allowed site/directory candidate
+- batches probe direct files, scan allowed site/directory candidates, and
+  route-classify media URLs without a media metadata probe
 
 Scan requests try normal certificate verification first using the shared Atlas
 fetch client and CA bundle. If Python cannot verify a certificate chain but an
@@ -125,7 +126,7 @@ builds an `AdaptiveDownloadPlan` with:
 to audit large direct-file batches or open-directory mirrors before starting the
 download.
 
-Adaptive direct-file and batch behavior separates queue concurrency from
+Adaptive direct-file and mixed-engine batch behavior separates queue concurrency from
 per-file segmented downloading. A batch can run six URLs at once while each
 medium ranged URL uses three aria2c segments, and a same-host cap can still
 limit how many URLs hit one host concurrently. Adaptive site and directory
@@ -160,6 +161,13 @@ speed collapse are cut back with multiplicative decrease and held before
 increasing again. Local pressure signals such as disk, CPU, or postprocess
 bottlenecks reduce the global queue and can apply a temporary speed limit.
 
+The mixed-engine runtime queue submits only work that is currently runnable. Global caps,
+dynamic host caps, and operator pause state are checked before an item enters
+the executor; a blocked row remains pending instead of parking a worker thread.
+This lets unrelated hosts continue while one host is paused or backed off.
+The runtime API can use a resolved/CDN host when a caller supplies a host
+resolver. The built-in CLI currently feeds back against the original item host.
+
 The scheduler favors tiny/small direct-file buckets with higher queue
 concurrency and no per-file splitting. Large/huge ranged buckets get lower queue
 concurrency and more aria2 segments. Media buckets remain on yt-dlp, and
@@ -179,6 +187,23 @@ file trees. It shares the wget2/wget backend planner with `site`, but defaults
 page requisites and link conversion off, keeps host spanning off, prevents
 parent ascent, and uses separate `dir_depth`, `dir_wait`, and `dir_backend`
 configuration.
+
+Real directory downloads scan before execution. Conventional HTML indexes stay
+on the recursive Wget2/Wget path. Signature-recognized CopyParty HTML and
+plain-text indexes take a stricter path: Atlas walks only same-host supported
+indexes to the requested depth, refuses truncated or unsupported nested pages,
+applies accept/reject filters, and builds an exact list capped at 2,000 selected
+files. `--max-files` is enforced against that list. If `--max-total-size` is
+present, every selected file must expose a size and the sum must fit the bound.
+`--max-runtime` covers both exact-list discovery and transfer.
+
+The resulting `native-exact-index` executor preserves safe relative paths and
+uses the native direct-file engine for each selected URL. It rejects traversal,
+symlink escapes, and case-insensitive destination collisions before transfer,
+then honors native resume, timestamps, overwrite, rate, TLS, and retry policy.
+Cancellation is checked between files and at native progress checkpoints. The
+transfer loop is currently sequential, one native file at a time. Recursive
+mirror `--wait` and `--random-wait` settings do not apply to this exact loop.
 
 The planner passes through Wget2-native behavior for:
 
@@ -423,12 +448,15 @@ selected categories before metadata embedding.
 
 ## Playlist Safety
 
-The planner calls `is_explicit_playlist_url`.
+The planner distinguishes explicit playlist URLs from bounded YouTube
+channel/tab collection URLs.
 
 Effective playlist mode is:
 
 ```python
-requested_playlist and is_explicit_playlist_url(url)
+requested_playlist and (
+    is_explicit_playlist_url(url) or is_youtube_collection_url(url)
+)
 ```
 
 That means:
@@ -438,6 +466,14 @@ That means:
 - `atlas video WATCH_URL --playlist`: still single video if the URL is a watch URL.
 - `atlas playlist PLAYLIST_URL`: playlist.
 - `atlas playlist WATCH_URL_WITH_LIST`: refused by the CLI.
+
+YouTube channel and tab URLs are collection URLs. `atlas video` and
+`atlas audio` accept them only with `--playlist` plus a finite
+`--playlist-items` or `--playlist-end` bound. The same bound is used for the
+metadata probe and transfer, preventing an unbounded pre-download enumeration.
+Collection plan previews show the resolved yt-dlp template because
+collection-level metadata cannot truthfully predict one selected item's final
+filename.
 
 Effective playlist plans set `ignoreerrors = "only_download"` so removed,
 private, or unavailable entries can be skipped without hiding merge/extract
@@ -526,7 +562,8 @@ Required:
 - `ffmpeg`
 - `ffprobe`
 
-Missing tools raise `DependencyMissingError` with a Homebrew install hint.
+Missing tools raise `DependencyMissingError` with a host-specific setup or
+package-manager install hint.
 
 Dry runs skip preflight because they only print resolved options.
 
@@ -667,7 +704,7 @@ After a non-dry-run batch completes, Atlas writes durable run artifacts under
 - `latest/manifest.json`: stable newest manifest
 - `latest/failed.txt`: failed URLs, always present
 - `latest/skipped.txt`: skipped URLs, always present
-- `latest/canceled.txt`: URLs canceled before item start, always present
+- `latest/canceled.txt`: queued or active-controlled canceled URLs, always present
 - `latest/retry.atlas.json`: retry/resume manifest with failed-only,
   checksum-only, skipped-unknown, canceled-only, save/load manifest,
   export-failed, and resume pointers
@@ -678,19 +715,17 @@ Retry and resume commands write a scoped `.atlas/retry/*.txt` file and then run
 the regular batch path so planner, progress, and artifact behavior remains
 shared.
 
-The execution-layer `BatchControl` primitive supports global pause/resume,
-per-host pause/resume, cancel-all, and cancel-by-line checks before an item
-starts. Canceled items become `DownloadStatus.canceled`, are counted separately,
-and are also included in skipped accounting so legacy totals remain balanced.
-This primitive intentionally does not pretend to kill an already-running backend
-process. In-flight subprocess interruption uses the runner-level
-`ProcessControl` and `ProcessCanceled` contract instead. The mirror engine and
-advanced backend pass-through accept this control handle, terminate the child
-process through `runner.py`, and surface cancellation as a distinct operator
-state rather than backend stdout noise. Batch execution now supplies an optional
-`BatchItemContext` to context-aware handlers; site and directory batch rows pass
-that context's process control into the mirror adapter, so a live controller can
-cancel an active Wget2/Wget mirror row as well as queued rows.
+On the mixed-engine executor, the execution-layer `BatchControl` primitive supports global pause/resume,
+per-host pause/resume, cancel-all, and cancel-by-line for queued and controlled
+active items. Canceled items become `DownloadStatus.canceled`, are counted
+separately, and are also included in skipped accounting so legacy totals remain
+balanced. Batch execution supplies an optional `BatchItemContext` with one
+runner-level `ProcessControl` per started row. Wget2/Wget work uses it to
+terminate the child process. Native direct files and exact-index work check it
+at progress and file boundaries; media work checks it in yt-dlp progress and
+postprocessor hooks. These in-process paths are cooperative and do not pretend
+to suspend arbitrary code between checkpoints. Every path surfaces operator
+cancellation as a distinct state rather than backend noise.
 `BatchOperatorController` applies the shared live keys to this state: `g` for
 global pause/resume, `h` for focused-host pause/resume, `s` for focused queued
 line pause/resume, `x` for focused-line cancel, and `X` for cancel-all. The
@@ -701,11 +736,13 @@ queue/active/completed/failed/scheduler/logs/summary panels, and `?` toggles the
 shared shortcut overlay. The live key reader is enabled only for interactive
 full-progress batch sessions so scripts and JSON output remain stable.
 
-Completed standalone `atlas site` and `atlas dir` mirrors also write the stable
+Successful and failed non-dry-run standalone `atlas site` and `atlas dir`
+attempts also write the stable
 `latest/summary.json`, `latest/manifest.json`, `latest/failed.txt`,
 `latest/skipped.txt`, `latest/canceled.txt`, and `latest/retry.atlas.json` files.
-If Wget2 stats expose failed URL rows, Atlas copies those URLs into the
-failed/retry artifacts.
+Successful Wget2 stats contribute summary detail. On a failed Wget2 process,
+the displayed error retains parsed failed-row samples, but the current recovery
+artifact retries the mirror seed URL rather than individual stat rows.
 
 Batch result events preserve the routed plan, so final tables continue to show
 the actual kind and engine after a backend emits its final done event. Direct
@@ -719,6 +756,19 @@ aria2 settings remain item-level and control connections/splits inside a single
 HTTP/HTTPS download when aria2 is selected. For all-aria2 direct-file batches,
 atlas keeps one local aria2 RPC process alive, queues every item into that
 session, and maps batch concurrency to `--max-concurrent-downloads`.
+With `--adaptive`, mixed-engine batches use the adaptive queue value even when
+`--concurrency` is present; the shared aria2 path uses explicit
+`--concurrency` as its global queue value. The shared path queues all items
+immediately, does not apply per-host runnable gating, and deliberately does not
+bind `BatchControl`, so pause/cancel mutation keys are hidden.
+Adaptive queue/speed changes call `aria2.changeGlobalOption` only when the
+effective option dictionary changes; the cached value is cleared when the RPC
+process stops so a later session starts cleanly.
+If RPC startup fails, Atlas falls back to ordinary per-item batch execution. A
+mid-session RPC loss preserves completed items, fails unresolved items, and
+removes active GIDs best-effort. TLS-chain failures receive the verified-curl
+per-item retry; general mid-session RPC errors do not automatically retry via
+the legacy subprocess.
 When Wget2 is selected for a direct file, the file command maps `connections` to
 Wget2 `--max-threads` and `chunk_size` to `--chunk-size`.
 

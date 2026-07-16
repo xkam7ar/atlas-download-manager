@@ -22,6 +22,18 @@ Normal watch URLs with `list=` or `start_radio=` remain single-item downloads,
 even when `--playlist` is present. This prevents an ordinary watch URL from
 turning into an accidental playlist batch.
 
+YouTube channel and tab URLs are collection URLs. They are rejected unless both
+playlist intent and a finite selection are explicit:
+
+```bash
+atlas video "https://www.youtube.com/@example/videos" --playlist --playlist-items 1
+atlas audio "https://www.youtube.com/@example/videos" --playlist --playlist-end 5
+```
+
+Atlas uses the same bound for metadata probing and downloading. Human previews
+show the output template for a bounded collection rather than inventing a final
+filename from collection-level metadata.
+
 Playlist sessions set yt-dlp `ignoreerrors = "only_download"` so removed,
 private, or unavailable download entries can be skipped without hiding
 post-processing failures.

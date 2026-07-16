@@ -24,7 +24,8 @@ or docs change.
 - Run batch queues with bounded, visible concurrency.
 - Keep the core engine testable and independent from Rich UI.
 - Fail early for local setup problems such as missing `ffmpeg`.
-- Provide a Homebrew-first bootstrap/setup/update path without hiding system changes.
+- Provide manager-aware bootstrap/setup/update paths on macOS and supported
+  Linux hosts without hiding system changes.
 
 ## High-Level Flow
 
@@ -61,9 +62,11 @@ Setup and update lifecycle:
 ```text
 install.sh / atlas setup / doctor --fix
   -> detect OS, architecture, shell, package manager, install method
-  -> build setup plan
-  -> create Atlas config/output directories
-  -> optionally run package-manager commands with consent
+  -> build and render the complete setup/bootstrap plan
+  -> obtain one Atlas-level approval
+  -> run approved package-manager and Atlas install commands in order
+  -> run atlas setup --MODE to initialize Atlas paths and configuration
+  -> run atlas setup --MODE --no-install for final plan-only verification
   -> doctor verification
   -> menu
 ```
@@ -98,7 +101,7 @@ flowchart LR
     S --> T["yt-dlp / native / aria2c / wget2 / wget"]
     T --> K
     A --> X["Setup planner"]
-    X --> Y["Homebrew / uv / source update guidance"]
+    X --> Y["Homebrew / apt / dnf / pacman / uv guidance"]
 ```
 
 The interactive menu is the primary human front door. `atlas get` is the
@@ -131,17 +134,29 @@ deep-scans only the selected roots. If the selected roots already resolve to
 exact file URLs, Atlas prefers an exact-list batch session; otherwise it queues
 an explicit directory session for the chosen roots.
 
-Adaptive runs add a scan-first planning layer before execution. Direct files use
-HTTP probes; site and directory mirrors inspect the starting document; batches
-scan every direct-file or allowed site/directory item. The resulting
+Standalone real `atlas dir` execution also scans before mutation. Complete
+signature-recognized CopyParty text/HTML indexes become a bounded
+`native-exact-index` plan: same-host files only, depth/filter/file/size/runtime
+guards, safe relative destinations, and one native file transfer at a time.
+Conventional HTML directory trees remain explicit Wget2/Wget recursion.
+
+Adaptive runs add a pre-execution evidence layer. Direct files use HTTP probes;
+site and directory mirrors inspect the starting document; batches probe every
+direct file, scan every allowed site/directory item, and route-classify media
+without a metadata probe. The resulting
 `AdaptiveDownloadPlan` carries queue concurrency, per-host caps, per-file
 segments, max total connections, max per-host connections, postprocessor budget,
 backend preference, size counts, bucket counts, host counts, mirror bounds, and
 safety notes.
 Its `work_items` manifest records URL, kind, host, estimated size, range
 support, checksum metadata when known, recursion depth, selected backend,
-priority, bucket, and scheduler decision. The batch scheduler owns URL slots;
+priority, bucket, and scheduler decision. The mixed-engine batch scheduler owns URL slots;
 aria2, native, Wget2/Wget, and yt-dlp still own per-item transfer mechanics.
+Only runnable rows are submitted to worker threads. Per-host-capped and paused
+rows remain pending so one blocked host cannot occupy the executor. An all-aria2
+RPC batch instead queues all items immediately, applies only a global adaptive
+queue, and binds no operator controls. Shared aria2 work caches its last global
+options to avoid redundant control calls.
 
 All optimized plans also carry a `SmartDownloadSession`. This is the shared
 abstraction for video, audio, playlists, direct files, site mirrors, directory
@@ -202,26 +217,30 @@ dry-runs, JSON output, and friendly dependency errors.
 | `sessions.py` | Shared `SmartDownloadSession` builders for media, file, mirror, and batch presets. |
 | `passthrough.py` | Advanced raw backend command planning for yt-dlp, aria2c, wget2, and wget. |
 | `file_probe.py` | Lightweight HTTP metadata probe for direct-file backend optimization. |
-| `directory_parser.py` | Common Apache/nginx/LiteSpeed/Caddy/simple-list directory-index parsing. |
+| `directory_parser.py` | Stable facade for directory-index parsing contracts. |
+| `directory_index.py` | Conventional HTML and signature-recognized CopyParty row parsing, completeness metadata, and work-item conversion. |
 | `directory_scanner.py` | Typed directory scan results, scan errors, and status translation from scan work items. |
 | `directory_tree.py` | Visible folder-tree modeling for open-directory browsing. |
 | `directory_explorer.py` | Valid pre-download actions for root maps, selected folders, and deep-scan flows. |
 | `adaptive.py` | Scan-first work-item classification, URL/scan warnings, adaptive queue planning, per-host gating, and runtime backoff. |
 | `adapters.py` | Engine adapter boundary for yt-dlp, direct files, and site/directory mirrors. |
-| `backends.py` | Direct-file and website/directory mirror backend planning/execution. |
+| `backends.py` | Direct-file, recursive mirror, and native exact-index planning/execution, including cooperative cancellation. |
 | `aria2_rpc.py` | Shared aria2 JSON-RPC queue integration and status polling. |
 | `progress_events.py` | UI-free normalization from backend hooks/log lines into `ProgressEvent`. |
-| `progress.py` | Live work panel context and restrained Rich/JSON reporters. |
+| `progress.py` | Width/height-responsive live work panels, full-mode operator input, and restrained Rich/JSON reporters. |
 | `theme.py` | Named Rich styles, theme selection, glyphs, NO_COLOR/plain/no-unicode fallbacks. |
 | `views.py` | Reusable smart-session cards, progress dashboards, active tables, previews, and summaries. |
 | `formats.py` | Metadata sanitization, format modeling, filtering, sorting. |
 | `config.py` | pydantic-settings config loading, defaults, TOML display. |
-| `paths.py` | macOS-aware application, cache, log, and output paths. |
-| `doctor.py` | Runtime diagnostics for Python, package, tools, writable paths, cookies. |
+| `paths.py` | `platformdirs`-based config, data, cache, log, archive, and output paths. |
+| `setup.py` | Host/package-manager detection, runtime mappings, idempotent install plans, and approved execution. |
+| `doctor.py` | Runtime diagnostics for Python, package, TLS, tools, capabilities, writable paths, and cookies. |
 | `preflight.py` | Required local dependency checks before real downloads. |
-| `batch.py` | Batch URL parsing, bounded concurrency, and continue-after-failure aggregation. |
-| `urls.py` | Explicit playlist URL detection and playlist safety helpers. |
+| `batch.py` | Batch parsing, adaptive/per-host runnable submission, pause/resume/cancel gates, and continue-after-failure aggregation. |
+| `urls.py` | Classification of single media, watch/radio, explicit playlist, and YouTube channel/tab collection URLs. |
 | `runner.py` | Safe subprocess helpers for captured and streaming output, cancellation handles, always without `shell=True`. |
+| `redaction.py` | Shared secret detection and safe command/URL redaction. |
+| `private_files.py` | Owner-only directory creation and atomic no-symlink artifact writes. |
 | `errors.py` | Custom application exception hierarchy. |
 | `logging.py` | stdlib logging configuration. |
 
@@ -266,25 +285,21 @@ Batch execution should not:
 - Treat playlist/radio URL parameters as permission to download whole playlists.
 - Hide failed items behind a successful process exit.
 
-Batch operator controls live at the execution boundary. `BatchControl` gates
+Mixed-engine batch operator controls live at the execution boundary.
+`BatchControl` gates
 items before backend start so a UI/TUI can pause all new work, pause one host,
-cancel all queued work, or cancel a specific line without teaching every backend
-adapter a separate control protocol. A pre-start cancellation is recorded as
-`DownloadStatus.canceled`, appears in `canceled.txt`, and is eligible for
-resume/canceled-only retry. Already-running subprocess-backed transfers use the
-separate runner-level `ProcessControl` hook. `ProcessControl` is deliberately
-small: the owning UI/controller can request cancellation, `runner.py` terminates
-the child process, and adapters such as the site mirror engine translate
-`ProcessCanceled` into a distinct canceled progress event. Batch queue controls
-and backend process controls stay separate so queued-item state, retry
-artifacts, and live process cleanup remain honest. Batch execution creates a
-`BatchItemContext` for every started row. Handlers that accept the optional
-context can pass `context.process_control` into subprocess-backed adapters; the
-CLI site/directory batch path does this for Wget2/Wget mirrors.
+or cancel queued work without occupying worker threads. It also forwards
+cancellation to the runner-level `ProcessControl` registered for each started
+row. Wget2/Wget adapters terminate their child process. Native direct files and
+exact-index work check the signal during progress and between files; yt-dlp
+media checks it in progress and postprocessor hooks. Those in-process paths are
+cooperative rather than arbitrary thread suspension. Every queued or
+active-controlled cancellation becomes `DownloadStatus.canceled`, appears in
+`canceled.txt`, and is eligible for resume/canceled-only retry.
 `BatchOperatorController` is the keybinding bridge above `BatchControl`: `g`
 toggles global pause, `h` toggles the focused host pause, `s` pauses/resumes the
 focused queued line, `x` cancels the focused line, and `X` cancels queued work
-plus active controlled subprocesses. Atlas does not pretend that `s` can freeze
+plus controlled active items. Atlas does not pretend that `s` can freeze
 an already-running transfer; active work can be canceled through `x` when its
 adapter has a `ProcessControl`.
 `BatchProgressReporter` owns UI-only operator state: normalized arrow/tab/help
@@ -292,7 +307,8 @@ keys move the focused row, cycle lazygit-style panels, and toggle the shared
 shortcut overlay before runtime controls are dispatched. The reporter starts
 the key reader only for interactive full-progress batch sessions;
 machine-readable, compact, plain/script, and non-terminal modes do not read
-stdin.
+stdin. The all-aria2 shared RPC queue binds no `BatchControl`, so it does not
+advertise mutation keys.
 
 ### Planner Boundary
 
@@ -435,7 +451,13 @@ metadata/thumbnail/finalize rows once post-processing starts. Batch downloads
 show an Atlas card, a dashboard card, stacked `Overall`/`Transfer`/lane/failure
 bars, and one active table. Known-total bars are color-coded by meaning and use
 a subtle shimmer only while active; completed bars settle. Unknown totals use an
-indeterminate pulse and never show a fake percentage.
+indeterminate pulse and never show a fake percentage. Completed batch results
+use a normal column table at medium/wide widths and stacked result cards below
+72 columns so status, kind/engine, URL, and outcome remain readable. Live batch
+tables switch to compact rows below 110 columns and three-line stacked rows
+below 64. Rendering also budgets rows against terminal height, prioritizing the
+focused row, active work, retry/backoff, failures, and recent state; a
+`+N hidden (...)` summary preserves omitted state counts.
 Live Rich surfaces are explicitly throttled to 4 renders per second even when a
 backend emits progress events more quickly, which keeps the terminal calm and
 prevents table churn.

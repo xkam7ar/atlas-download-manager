@@ -14,6 +14,7 @@ implementation contracts and design specifications are grouped separately.
 | Install runtime tools or repair setup | [Installation](installation.md) |
 | Find the right command or option | [Command reference](commands.md) |
 | Configure paths, defaults, or display behavior | [Configuration](configuration.md) |
+| Understand an end-to-end install or download lifecycle | [Architecture](architecture.md#high-level-flow) |
 | Recover a failed or canceled run | [Troubleshooting](troubleshooting.md#recover-a-failed-or-canceled-session) |
 | Understand how Atlas chooses a backend | [Download planning](download-planning.md) |
 | Build or review Atlas itself | [Development guide](development.md) |
@@ -84,6 +85,7 @@ To prevent the same concept from acquiring several competing definitions:
 | Interaction and visual rules | [UI and UX guidelines](ui-ux.md) |
 | Access and safety policy | [Responsible use](responsible-use.md) |
 | Symptoms and repairs | [Troubleshooting](troubleshooting.md) |
+| Install, download, cancellation, and recovery process invariants | [System contracts](system-contracts.md) |
 
 ## Need help now?
 

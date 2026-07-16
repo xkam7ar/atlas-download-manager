@@ -4,12 +4,14 @@ from pathlib import Path
 
 import pytest
 
+import atlas.optimizer as optimizer_module
 from atlas.config import AtlasSettings
 from atlas.errors import AtlasError
 from atlas.hub import EngineRouter
 from atlas.models import (
     AudioCodec,
     DirectFileProbe,
+    DirectoryMirrorOptions,
     EngineKind,
     FileBackendChoice,
     HubKind,
@@ -41,6 +43,20 @@ def test_optimizer_builds_media_preview(tmp_path: Path) -> None:
     assert data["session"]["session_type"] == "single_video"
     assert data["session"]["scheduler_policy"]["mode"] == "adaptive"
     assert data["session"]["manifest"][0]["selected_backend"] == "yt-dlp"
+
+
+def test_router_treats_youtube_nocookie_as_media(tmp_path: Path) -> None:
+    settings = AtlasSettings(output_dir=tmp_path, archive_file=tmp_path / "archive.txt")
+    request = HubRequest(
+        url="https://www.youtube-nocookie.com/embed/abc123",
+        output_dir=tmp_path,
+    )
+
+    route = EngineRouter(settings).route(request)
+
+    assert route.kind == HubKind.video
+    assert route.engine == EngineKind.ytdlp
+    assert route.is_media_host is True
 
 
 def test_optimizer_applies_hub_video_codec(tmp_path: Path) -> None:
@@ -91,8 +107,8 @@ def test_optimizer_marks_explicit_playlist_as_media_session(tmp_path: Path) -> N
         dry_run=True,
     )
     route = EngineRouter(settings).route(request)
-    options = DownloadOptimizer(settings)._audio_options(request).model_copy(
-        update={"playlist": True}
+    options = (
+        DownloadOptimizer(settings)._audio_options(request).model_copy(update={"playlist": True})
     )
 
     plan = DownloadOptimizer(settings).optimize_options(route, options)
@@ -195,6 +211,262 @@ def test_optimizer_builds_directory_mirror_preview(tmp_path: Path, monkeypatch) 
     assert plan.preview.session.customization["depth"] == 3
 
 
+def test_optimizer_uses_exact_file_plan_for_supported_text_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = AtlasSettings(output_dir=tmp_path, archive_file=tmp_path / "archive.txt")
+    request = HubRequest(
+        url="https://files.example/root/",
+        output_dir=tmp_path,
+        requested_kind=HubKind.dir,
+    )
+    route = EngineRouter(settings).route(request)
+    root = WorkItem(
+        url=request.url,
+        final_url=request.url,
+        host="files.example",
+        final_host="files.example",
+        kind=HubKind.site,
+        scan_type="directory-style text index",
+        scan_counts={"complete": 1, "same_host": 2},
+        discovered_work_items=[
+            WorkItem(
+                url="https://files.example/root/README.md",
+                host="files.example",
+                final_host="files.example",
+                kind=HubKind.file,
+                content_length=638,
+            ),
+            WorkItem(
+                url="https://files.example/root/archive/",
+                host="files.example",
+                final_host="files.example",
+                kind=HubKind.dir,
+            ),
+        ],
+    )
+    monkeypatch.setattr("atlas.optimizer.scan_site", lambda *_args, **_kwargs: root)
+    options = DirectoryMirrorOptions(
+        url=request.url,
+        output_dir=tmp_path,
+        depth=1,
+        accept="README.md",
+        max_files=1,
+        max_total_size="1K",
+    )
+
+    plan = DownloadOptimizer(settings).optimize_options(route, options)
+
+    assert isinstance(plan.options, DirectoryMirrorOptions)
+    assert plan.options.exact_directory_index is True
+    assert [item.filename for item in plan.options.exact_directory_items] == ["README.md"]
+    assert plan.preview.summary["backend"] == "native-exact-index"
+
+
+def test_exact_directory_suffix_filters_match_bare_and_dotted_extensions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = AtlasSettings(output_dir=tmp_path, archive_file=tmp_path / "archive.txt")
+    request = HubRequest(
+        url="https://files.example/root/",
+        output_dir=tmp_path,
+        requested_kind=HubKind.dir,
+    )
+    route = EngineRouter(settings).route(request)
+    root = WorkItem(
+        url=request.url,
+        final_url=request.url,
+        kind=HubKind.site,
+        scan_type="directory-style text index",
+        scan_counts={"complete": 1, "same_host": 3},
+        discovered_work_items=[
+            WorkItem(url=f"{request.url}book.pdf", kind=HubKind.file, content_length=10),
+            WorkItem(url=f"{request.url}cover.jpg", kind=HubKind.file, content_length=20),
+            WorkItem(url=f"{request.url}notes.txt", kind=HubKind.file, content_length=30),
+        ],
+    )
+    monkeypatch.setattr("atlas.optimizer.scan_site", lambda *_args, **_kwargs: root)
+    options = DirectoryMirrorOptions(
+        url=request.url,
+        output_dir=tmp_path,
+        depth=1,
+        accept="pdf,.jpg",
+    )
+
+    plan = DownloadOptimizer(settings).optimize_options(route, options)
+
+    assert isinstance(plan.options, DirectoryMirrorOptions)
+    assert plan.options.exact_directory_base_url == request.url
+    assert [item.filename for item in plan.options.exact_directory_items] == [
+        "book.pdf",
+        "cover.jpg",
+    ]
+
+
+def test_exact_directory_scan_has_hard_page_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(optimizer_module, "_EXACT_DIRECTORY_MAX_PAGES", 2)
+    seed = WorkItem(
+        url="https://files.example/root/",
+        final_url="https://files.example/root/",
+        kind=HubKind.site,
+        scan_type="directory-style text index",
+        scan_counts={"complete": 1},
+        discovered_work_items=[
+            WorkItem(url="https://files.example/root/one/", kind=HubKind.dir),
+            WorkItem(url="https://files.example/root/two/", kind=HubKind.dir),
+        ],
+    )
+    options = DirectoryMirrorOptions(
+        url=seed.url,
+        output_dir=tmp_path,
+        depth=2,
+    )
+
+    with pytest.raises(AtlasError, match="more than 2 directory pages"):
+        optimizer_module._collect_exact_directory_items(options, seed)
+
+
+def test_exact_directory_planning_consumes_shared_runtime_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"now": 10.0}
+    seed = WorkItem(
+        url="https://files.example/root/",
+        final_url="https://files.example/root/",
+        kind=HubKind.dir,
+        scan_type="directory-style text index",
+        scan_counts={"complete": 1},
+        discovered_work_items=[
+            WorkItem(
+                url="https://files.example/root/book.pdf",
+                kind=HubKind.file,
+                filename="book.pdf",
+                content_length=4,
+            )
+        ],
+    )
+
+    def fake_scan(url: str, *, dry_run: bool, timeout: float) -> WorkItem:
+        assert url == seed.url
+        assert dry_run is False
+        assert timeout == 10.0
+        clock["now"] = 12.5
+        return seed
+
+    monkeypatch.setattr("atlas.optimizer.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("atlas.optimizer.scan_site", fake_scan)
+    options = DirectoryMirrorOptions(
+        url=seed.url,
+        output_dir=tmp_path,
+        max_runtime=10,
+    )
+
+    optimized = DownloadOptimizer(AtlasSettings(output_dir=tmp_path))._optimize_site_options(
+        options
+    )
+
+    assert optimized.exact_directory_index is True
+    assert optimized.planning_runtime_seconds == 2.5
+
+
+def test_directory_relative_name_canonicalizes_default_port_and_idna() -> None:
+    relative = optimizer_module._directory_relative_name(
+        "https://b\N{LATIN SMALL LETTER U WITH DIAERESIS}cher.example/root/",
+        "https://xn--bcher-kva.example:443/root/book.pdf",
+    )
+
+    assert relative == "book.pdf"
+
+
+def test_directory_relative_name_rejects_encoded_escape_and_preserves_percent() -> None:
+    base = "https://files.example/root/"
+
+    with pytest.raises(AtlasError, match="unsafe path component"):
+        optimizer_module._directory_relative_name(
+            base,
+            f"{base}%252e%252e/secret.bin",
+        )
+
+    assert (
+        optimizer_module._directory_relative_name(base, f"{base}100%25-free.txt") == "100%-free.txt"
+    )
+
+
+@pytest.mark.parametrize(
+    "item_url",
+    [
+        "http://files.example/root/book.pdf",
+        "https://files.example:8443/root/book.pdf",
+    ],
+)
+def test_directory_relative_name_rejects_scheme_or_port_changes(item_url: str) -> None:
+    with pytest.raises(AtlasError, match="escape to another host"):
+        optimizer_module._directory_relative_name(
+            "https://files.example/root/",
+            item_url,
+        )
+
+
+def test_directory_scan_limits_apply_after_file_filters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = AtlasSettings(output_dir=tmp_path, archive_file=tmp_path / "archive.txt")
+    request = HubRequest(
+        url="https://files.example/root/",
+        output_dir=tmp_path,
+        requested_kind=HubKind.dir,
+        explain=True,
+    )
+    route = EngineRouter(settings).route(request)
+    scan = WorkItem(
+        url=request.url,
+        final_url=request.url,
+        kind=HubKind.site,
+        scan_type="directory-style HTML index",
+        scan_counts={"same_host": 12},
+        scan_estimated_bytes=10 * 1024 * 1024,
+        discovered_work_items=[
+            *[
+                WorkItem(
+                    url=f"https://files.example/root/folder-{index}/",
+                    kind=HubKind.dir,
+                )
+                for index in range(10)
+            ],
+            WorkItem(
+                url="https://files.example/root/song.mid",
+                kind=HubKind.file,
+                content_length=4_934,
+            ),
+            WorkItem(
+                url="https://files.example/root/book.pdf",
+                kind=HubKind.file,
+                content_length=2 * 1024 * 1024,
+            ),
+        ],
+    )
+    monkeypatch.setattr("atlas.optimizer.scan_site", lambda *_args, **_kwargs: scan)
+    options = DirectoryMirrorOptions(
+        url=request.url,
+        output_dir=tmp_path,
+        accept="song.mid",
+        max_files=1,
+        max_total_size="8K",
+        explain=True,
+    )
+
+    plan = DownloadOptimizer(settings).optimize_options(route, options)
+
+    assert plan.options.adaptive_plan is not None
+
+
 def test_optimizer_rejects_adaptive_mirror_over_max_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -207,8 +479,10 @@ def test_optimizer_rejects_adaptive_mirror_over_max_files(
         explain=True,
     )
     route = EngineRouter(settings).route(request)
-    options = DownloadOptimizer(settings)._site_options(request, "wget2").model_copy(
-        update={"max_files": 3}
+    options = (
+        DownloadOptimizer(settings)
+        ._site_options(request, "wget2")
+        .model_copy(update={"max_files": 3})
     )
     monkeypatch.setattr(
         "atlas.optimizer.scan_site",
@@ -236,8 +510,10 @@ def test_optimizer_rejects_adaptive_mirror_over_estimated_size(
         explain=True,
     )
     route = EngineRouter(settings).route(request)
-    options = DownloadOptimizer(settings)._site_options(request, "wget2").model_copy(
-        update={"max_total_size": "1M"}
+    options = (
+        DownloadOptimizer(settings)
+        ._site_options(request, "wget2")
+        .model_copy(update={"max_total_size": "1M"})
     )
     monkeypatch.setattr(
         "atlas.optimizer.scan_site",

@@ -15,7 +15,12 @@ atlas doctor
 ```
 
 `atlas --version` confirms which executable your shell found. Doctor then checks
-Python, paths, TLS, and the optional runtime tools.
+Python, paths, TLS, `yt-dlp`, `mutagen`, required media tools, and optional
+transfer backends. Every Doctor run makes one verified HTTPS GET to
+`https://www.python.org/` with a three-second timeout to validate Python's TLS
+and CA path. Default human mode also creates/checks Atlas directories with
+temporary write probes; `--json` and `--fix --no-install` use non-mutating path
+checks but still perform the HTTPS probe.
 
 > [!NOTE]
 > Missing `aria2c`, `wget2`, or `wget` does not block ordinary media and native
@@ -71,7 +76,7 @@ Remove `--dry-run` when the source, scope, backend, and output look right:
 atlas get "https://example.com/archive.zip"
 ```
 
-The normal macOS output folder is:
+The normal output folder on macOS and supported Linux hosts is:
 
 ```text
 ~/Downloads/atlas
@@ -113,8 +118,9 @@ atlas retry ~/Downloads/atlas --canceled-only
 atlas export-failed ~/Downloads/atlas --output failed.txt
 ```
 
-`resume` includes failed, skipped-unknown, and canceled-before-start items.
-`retry` defaults to failed items and can target a more specific status.
+`resume` includes failed, skipped-unknown, and canceled items, whether they were
+canceled while queued or during controllable active work. `retry` defaults to
+failed items and can target a more specific status.
 
 ## Choose the next guide
 

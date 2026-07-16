@@ -113,9 +113,7 @@ class OperatorKeymap:
 
     def fields(self, *, include_disabled: bool = True) -> tuple[ViewField, ...]:
         return tuple(
-            action.to_view_field()
-            for action in self.actions
-            if include_disabled or action.enabled
+            action.to_view_field() for action in self.actions if include_disabled or action.enabled
         )
 
     def action_for_key(self, key: str) -> OperatorAction | None:
@@ -146,21 +144,36 @@ class SmartSessionView:
         fields: Sequence[ViewField] = (),
         subtitle: str | None = None,
     ) -> Panel:
-        body = Table.grid(padding=(0, 2))
-        body.add_column(style=ATLAS_MUTED_STYLE, no_wrap=True)
-        body.add_column(ratio=1)
-        body.add_row(Text(heading, style=ATLAS_ACTIVE_STYLE), "")
-        if subtitle or self.subtitle:
-            body.add_row("", Text(subtitle or self.subtitle or "", style=ATLAS_SUBTITLE_STYLE))
-        for field in fields:
-            body.add_row(field.label, _field_value(field))
+        narrow = self.console.width < 40
+        body = Table.grid(padding=(0, 0) if narrow else (0, 2), expand=narrow)
+        if narrow:
+            body.add_column(ratio=1, overflow="fold")
+            body.add_row(Text(heading, style=ATLAS_ACTIVE_STYLE))
+            if subtitle or self.subtitle:
+                body.add_row(Text(subtitle or self.subtitle or "", style=ATLAS_SUBTITLE_STYLE))
+            for field in fields:
+                body.add_row(Text(field.label, style=ATLAS_MUTED_STYLE))
+                value = Text("  ")
+                value.append_text(_field_value(field))
+                body.add_row(value)
+        else:
+            body.add_column(style=ATLAS_MUTED_STYLE, no_wrap=True)
+            body.add_column(ratio=1)
+            body.add_row(Text(heading, style=ATLAS_ACTIVE_STYLE), "")
+            if subtitle or self.subtitle:
+                body.add_row(
+                    "",
+                    Text(subtitle or self.subtitle or "", style=ATLAS_SUBTITLE_STYLE),
+                )
+            for field in fields:
+                body.add_row(field.label, _field_value(field))
         return Panel(
             body,
             title=Text(f" {self.title} ", style=ATLAS_TITLE_STYLE),
             border_style=ATLAS_PANEL_STYLE,
             box=atlas_box(),
             padding=(0, 1),
-            expand=False,
+            expand=narrow,
         )
 
     def scan_panel(

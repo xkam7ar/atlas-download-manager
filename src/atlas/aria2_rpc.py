@@ -175,6 +175,7 @@ class Aria2RpcSession:
         self._client: Aria2RpcClientProtocol | None = None
         self._secret: str | None = None
         self._endpoint: str | None = None
+        self._last_adaptive_options: dict[str, str] | None = None
 
     @staticmethod
     def redacted_command(
@@ -258,6 +259,7 @@ class Aria2RpcSession:
         results: list[Aria2RpcQueuedDownloadResult | None] = [None] * len(downloads)
         gids_by_index: dict[int, list[str]] = {}
         active_gids: list[str] = []
+        pending: set[int] = set()
         try:
             for index, item in enumerate(downloads):
                 item.output.parent.mkdir(parents=True, exist_ok=True)
@@ -344,6 +346,24 @@ class Aria2RpcSession:
                 )
                 for index, result in enumerate(results)
             ]
+        except (EngineError, OSError, TimeoutError, URLError, json.JSONDecodeError) as exc:
+            message = str(exc) or type(exc).__name__
+            unresolved = pending or {index for index in gids_by_index if results[index] is None}
+            for index in unresolved:
+                item = downloads[index]
+                _emit_queue_error(item, message)
+                results[index] = Aria2RpcQueuedDownloadResult(item=item, error=message)
+            for active_gid in active_gids:
+                self._try_remove(active_gid)
+            return [
+                result
+                if result is not None
+                else Aria2RpcQueuedDownloadResult(
+                    item=downloads[index],
+                    error=message,
+                )
+                for index, result in enumerate(results)
+            ]
         except BaseException:
             for active_gid in active_gids:
                 self._try_remove(active_gid)
@@ -354,6 +374,7 @@ class Aria2RpcSession:
     def start(self) -> None:
         if self._process is not None:
             return
+        self._last_adaptive_options = None
         port = self._port_factory()
         secret = self._token_factory()
         endpoint = f"http://127.0.0.1:{port}/jsonrpc"
@@ -399,6 +420,7 @@ class Aria2RpcSession:
             self._client = None
             self._secret = None
             self._endpoint = None
+            self._last_adaptive_options = None
 
     def _command(self, *, port: int, secret: str) -> list[str]:
         command = self.redacted_command(
@@ -413,8 +435,7 @@ class Aria2RpcSession:
             uri_selector=self.uri_selector,
         )
         resolved = [
-            arg.replace("<ephemeral>", str(port)).replace("<redacted>", secret)
-            for arg in command
+            arg.replace("<ephemeral>", str(port)).replace("<redacted>", secret) for arg in command
         ]
         return resolved
 
@@ -512,7 +533,10 @@ class Aria2RpcSession:
         options = {"max-concurrent-downloads": str(max(1, scheduler.current_concurrency))}
         if scheduler.current_speed_limit:
             options["max-overall-download-limit"] = scheduler.current_speed_limit
+        if options == self._last_adaptive_options:
+            return
         self._rpc("aria2.changeGlobalOption", options)
+        self._last_adaptive_options = options
 
     def _rpc(self, method: str, *params: object) -> object:
         if self._client is None or self._secret is None:
@@ -806,9 +830,7 @@ def _aggregate_statuses(statuses: Sequence[Mapping[str, object]]) -> Mapping[str
         _int_from_status(status.get("completedLength")) or 0 for status in statuses
     )
     total_length = sum(_int_from_status(status.get("totalLength")) or 0 for status in statuses)
-    download_speed = sum(
-        _int_from_status(status.get("downloadSpeed")) or 0 for status in statuses
-    )
+    download_speed = sum(_int_from_status(status.get("downloadSpeed")) or 0 for status in statuses)
     connections = sum(_int_from_status(status.get("connections")) or 0 for status in statuses)
     verified_length = sum(
         _int_from_status(status.get("verifiedLength")) or 0 for status in statuses

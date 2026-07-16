@@ -134,7 +134,7 @@ class WorkPanelContext:
     output: str | None = None
     mode_label: str | None = None
     backends: tuple[str, ...] = ()
-    steps: tuple[str, ...] = ()
+    steps: tuple[str, ...] | None = None
 
 
 class _TerminalKeySource:
@@ -237,11 +237,11 @@ def resolve_progress_mode(
 ) -> ProgressMode:
     """Resolve auto progress mode without mixing live progress into JSON output."""
 
-    if quiet:
+    if quiet or json_output:
         return ProgressMode.none
     if mode != ProgressMode.auto:
         return mode
-    if json_output or not console.is_terminal:
+    if not console.is_terminal:
         return ProgressMode.none
     return ProgressMode.compact
 
@@ -333,6 +333,7 @@ def _render_context_card(
     events: list[ProgressEvent],
     *,
     default_operation: str,
+    console: Console | None = None,
 ) -> Panel:
     """Render the compact atlas card shown above progress surfaces."""
 
@@ -351,9 +352,7 @@ def _render_context_card(
     backends = visual_join(context.backends) if context.backends else None
     safety = visual_join(context.safety_badges) if context.safety_badges else None
     subtitle = (
-        _compact_title(item_title, limit=72)
-        if item_title and operation != item_title
-        else None
+        _compact_title(item_title, limit=72) if item_title and operation != item_title else None
     )
     fields = _view_fields(
         [
@@ -366,7 +365,7 @@ def _render_context_card(
             ("Safety", safety, "info"),
         ]
     )
-    return SmartSessionView(title=context.title).header_card(
+    return SmartSessionView(title=context.title, console=console).header_card(
         heading=operation,
         subtitle=subtitle,
         fields=fields,
@@ -414,6 +413,18 @@ def _render_single_progress_stack(
     download_event = _latest_phase_event(events, ProgressPhase.download) or latest
     grid.add_row(_semantic_event_row("Download", download_event))
 
+    if _has_postprocess_events(events) and not _events_are_media(events):
+        for label, phase in (
+            ("Extract", ProgressPhase.extract),
+            ("Verify", ProgressPhase.verify),
+            ("Post-process", ProgressPhase.postprocess),
+            ("Finalize", ProgressPhase.finalize),
+        ):
+            phase_event = _latest_phase_event(events, phase)
+            if phase_event is not None:
+                grid.add_row(_phase_state_row(label, phase_event))
+        return grid
+
     if _has_postprocess_events(events):
         for label, phase, matcher in [
             ("Merge", ProgressPhase.merge, None),
@@ -442,6 +453,10 @@ def _render_single_progress_stack(
     return grid
 
 
+def _events_are_media(events: list[ProgressEvent]) -> bool:
+    return any(event.kind in {HubKind.audio, HubKind.video} for event in events)
+
+
 def _render_media_job_status(
     context: WorkPanelContext,
     events: list[ProgressEvent],
@@ -457,7 +472,7 @@ def _render_media_job_status(
         _media_progress_table(progress_event),
         Text(),
     ]
-    steps = context.steps or _default_media_steps(kind)
+    steps = _default_media_steps(kind) if context.steps is None else context.steps
     if steps:
         blocks.append(Text("Steps", style=ATLAS_ACTIVE_STYLE))
         blocks.extend(_media_step_rows(steps, events))
@@ -651,6 +666,7 @@ class RichProgressReporter:
                 self.work_context,
                 self._events,
                 default_operation="Download",
+                console=self.console,
             ),
             _render_single_progress_stack(self._events, started_at=self._started_at),
         )
@@ -820,10 +836,7 @@ class BatchProgressReporter:
         return result
 
     def _start_operator_input(self) -> None:
-        if (
-            self.mode != ProgressMode.full
-            or self._operator_input_loop is not None
-        ):
+        if self.mode != ProgressMode.full or self._operator_input_loop is not None:
             return
         key_source = self._operator_key_source or _default_operator_key_source(self.console)
         if key_source is None:
@@ -930,20 +943,31 @@ class BatchProgressReporter:
     def _render(self) -> Group:
         focused_line = self._focused_line if self.mode == ProgressMode.full else None
         table_states = self._table_states_for_active_panel()
+        visible_states, hidden_states = _height_aware_batch_states(
+            table_states,
+            height=self.console.height,
+            compact=(self.layout_width or self.console.width) < _FULL_BATCH_TABLE_MIN_WIDTH,
+            has_context=self.work_context is not None,
+            full_mode=self.mode == ProgressMode.full,
+            focused_line=focused_line,
+        )
         table: RenderableType
         layout_width = self.layout_width or self.console.width
         if layout_width < _FULL_BATCH_TABLE_MIN_WIDTH:
             table = _render_compact_batch_rows(
-                table_states,
+                visible_states,
                 width=layout_width,
                 focused_line=focused_line,
             )
         else:
             table = _render_full_batch_table(
-                table_states,
+                visible_states,
                 width=layout_width,
                 focused_line=focused_line,
             )
+
+        if hidden_states:
+            table = Group(table, _hidden_batch_rows_note(hidden_states))
 
         events = [state.event for state in self._states.values()]
         if self.work_context is None:
@@ -965,6 +989,7 @@ class BatchProgressReporter:
                 self.work_context,
                 events,
                 default_operation="Batch Download",
+                console=self.console,
             ),
             _render_batch_bars(
                 events,
@@ -993,9 +1018,7 @@ class BatchProgressReporter:
         ]
         if self._show_shortcut_overlay:
             keymap = (
-                _BATCH_LIVE_KEYMAP
-                if self.operator_controller is not None
-                else _BATCH_VIEW_KEYMAP
+                _BATCH_LIVE_KEYMAP if self.operator_controller is not None else _BATCH_VIEW_KEYMAP
             )
             blocks.append(view.shortcut_help_overlay(keymap=keymap))
         return blocks
@@ -1038,9 +1061,7 @@ class BatchProgressReporter:
         if key == "?":
             self._show_shortcut_overlay = not self._show_shortcut_overlay
             message = (
-                "showing shortcut help"
-                if self._show_shortcut_overlay
-                else "hid shortcut help"
+                "showing shortcut help" if self._show_shortcut_overlay else "hid shortcut help"
             )
             return self._operator_result(key, "toggle_help", True, message)
         if key == "tab":
@@ -1170,6 +1191,72 @@ def create_batch_postprocessor_hook(
         kind=kind,
         postprocessor=True,
     )
+
+
+def _height_aware_batch_states(
+    states: dict[int, BatchProgressState],
+    *,
+    height: int,
+    compact: bool,
+    has_context: bool,
+    full_mode: bool,
+    focused_line: int | None,
+) -> tuple[dict[int, BatchProgressState], dict[int, BatchProgressState]]:
+    """Keep actionable and recent rows visible without overflowing the terminal."""
+
+    fixed_rows = 7 + (6 if has_context else 0) + (3 if full_mode else 0)
+    row_height = 3 if compact and height < 24 else 1
+    limit = max(3, (height - fixed_rows) // row_height)
+    if len(states) <= limit:
+        return dict(states), {}
+
+    def priority(item: tuple[int, BatchProgressState]) -> tuple[int, float, int]:
+        line_no, state = item
+        event = state.event
+        if line_no == focused_line:
+            rank = -1
+        elif _event_is_running(event):
+            rank = 0
+        elif _event_is_warning(event):
+            rank = 1
+        elif _event_is_error(event):
+            rank = 2
+        else:
+            rank = 3
+        return rank, -state.updated_at, -line_no
+
+    selected_lines = {line_no for line_no, _state in sorted(states.items(), key=priority)[:limit]}
+    visible = {line_no: state for line_no, state in states.items() if line_no in selected_lines}
+    hidden = {line_no: state for line_no, state in states.items() if line_no not in selected_lines}
+    return visible, hidden
+
+
+def _hidden_batch_rows_note(states: dict[int, BatchProgressState]) -> Text:
+    counts = {
+        "active": 0,
+        "retrying": 0,
+        "failed": 0,
+        "queued": 0,
+        "done": 0,
+        "other": 0,
+    }
+    for state in states.values():
+        event = state.event
+        if _event_is_running(event):
+            label = "active"
+        elif _event_is_warning(event):
+            label = "retrying"
+        elif _event_is_error(event):
+            label = "failed"
+        elif event.status in {"queued", "planned"}:
+            label = "queued"
+        elif _event_is_done(event) or event.status == "skipped":
+            label = "done"
+        else:
+            label = "other"
+        counts[label] += 1
+    details = visual_join(tuple(f"{count} {label}" for label, count in counts.items() if count))
+    return Text(f"  +{len(states)} hidden ({details})", style=ATLAS_MUTED_STYLE)
 
 
 def _render_full_batch_table(
@@ -1397,8 +1484,7 @@ def _compact_batch_detail(event: ProgressEvent, snapshot: ProgressSnapshot, *, w
     details: list[str] = []
     if (
         width >= 84
-        and
-        (event.downloaded_bytes is not None or event.total_bytes is not None)
+        and (event.downloaded_bytes is not None or event.total_bytes is not None)
         and snapshot.amount_label not in {event.status, "done", "finished", "queued", "skipped"}
     ):
         details.append(_compact_transfer_label(event))
@@ -1594,6 +1680,7 @@ class FileProgressReporter:
                 self.work_context,
                 self._events,
                 default_operation="Download",
+                console=self.console,
             ),
             _render_single_progress_stack(self._events, started_at=self._started_at),
         )
@@ -1961,9 +2048,7 @@ def _view_fields(rows: Iterable[tuple[str, str | None, str]]) -> tuple[ViewField
 def _total_event_speed(events: list[ProgressEvent]) -> float:
     latest = _latest_events_by_item(events)
     return sum(
-        event.speed_bytes_per_sec or 0.0
-        for event in latest.values()
-        if _event_is_running(event)
+        event.speed_bytes_per_sec or 0.0 for event in latest.values() if _event_is_running(event)
     )
 
 
@@ -1987,10 +2072,14 @@ def _render_batch_operator_hint(
     controls_available: bool = True,
 ) -> Text:
     keymap = _BATCH_LIVE_KEYMAP if controls_available else _BATCH_VIEW_KEYMAP
-    keys = ("↑/↓", "tab", "?", "g", "h", "s", "x", "X") if controls_available else (
-        "↑/↓",
-        "tab",
-        "?",
+    keys = (
+        ("↑/↓", "tab", "?", "g", "h", "s", "x", "X")
+        if controls_available
+        else (
+            "↑/↓",
+            "tab",
+            "?",
+        )
     )
     parts: list[str] = []
     for key in keys:
@@ -2162,15 +2251,15 @@ def _latest_phase_event(
 
 def _has_postprocess_events(events: list[ProgressEvent]) -> bool:
     return any(
-        event.phase in {
+        event.phase
+        in {
             ProgressPhase.merge,
             ProgressPhase.postprocess,
             ProgressPhase.finalize,
             ProgressPhase.verify,
         }
         or (
-            event.phase == ProgressPhase.extract
-            and "extractaudio" in (event.message or "").lower()
+            event.phase == ProgressPhase.extract and "extractaudio" in (event.message or "").lower()
         )
         for event in events
     )
@@ -2551,11 +2640,7 @@ def _transfer_totals(events: list[ProgressEvent]) -> tuple[int, int, int]:
 
 
 def _lane_counts(events: list[ProgressEvent], kinds: set[HubKind]) -> tuple[int, int]:
-    lane = [
-        event
-        for event in _latest_events_by_item(events).values()
-        if event.kind in kinds
-    ]
+    lane = [event for event in _latest_events_by_item(events).values() if event.kind in kinds]
     return sum(1 for event in lane if _event_is_done(event)), len(lane)
 
 

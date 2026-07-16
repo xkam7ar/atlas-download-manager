@@ -49,6 +49,8 @@ URL  ->  detect  ->  review  ->  download  ->  summary
 
 Atlas requires Python 3.12 or newer. Media workflows also need `ffmpeg` and
 `ffprobe`; accelerated files and mirrors can use `aria2c`, `wget2`, and `wget`.
+Atlas installs `yt-dlp` and `mutagen` with its Python package so extraction and
+audio artwork embedding are ready by default.
 
 ### Guided installer
 
@@ -56,9 +58,10 @@ Atlas requires Python 3.12 or newer. Media workflows also need `ffmpeg` and
 curl -fsSL https://raw.githubusercontent.com/xkam7ar/atlas/main/install.sh | bash
 ```
 
-The installer shows its plan, checks Homebrew and runtime tools, installs Atlas,
-runs setup and Doctor, and can open the menu. It never installs Homebrew
-silently.
+The installer supports macOS plus apt-, dnf-, and pacman-based Linux. It shows
+one complete plan, asks once, installs every missing runtime tool, installs Atlas,
+runs setup and Doctor, and can open the menu. Missing Homebrew is included in
+the approved plan on macOS; pacman hosts use Linuxbrew only for `wget2`.
 
 > [!TIP]
 > Inspect before executing:
@@ -75,7 +78,7 @@ From GitHub:
 
 ```bash
 uv tool install git+https://github.com/xkam7ar/atlas.git
-atlas setup
+atlas setup --full --install
 ```
 
 From this checkout:
@@ -141,6 +144,7 @@ and recovery behavior in one short path.
 | Download video | `atlas video URL --quality compatible` |
 | Extract audio | `atlas audio URL --codec mp3` |
 | Download a playlist | `atlas playlist PLAYLIST_URL --type audio` |
+| Download one channel item | `atlas video CHANNEL_URL --playlist --playlist-items 1` |
 | Download a file | `atlas file URL --backend aria2` |
 | Mirror a website | `atlas site URL --depth 2 --dry-run` |
 | Mirror an open directory | `atlas dir URL --depth 2 --dry-run` |
@@ -192,6 +196,10 @@ atlas batch urls.txt --json
 atlas file URL --progress json
 ```
 
+`--json` always wins over `--progress`: it emits one final JSON document and
+suppresses human/live progress. Use `--progress json` without `--json` for an
+NDJSON event stream.
+
 Completed batch, site, and directory runs write private artifacts under
 `<output>/.atlas/`. The stable newest generation is under
 `<output>/.atlas/latest/`:
@@ -237,11 +245,16 @@ atlas config path
 atlas config show
 ```
 
-The default macOS configuration path is:
+Atlas uses `platformdirs` for host-native locations. Common configuration paths
+are:
 
 ```text
-~/Library/Application Support/atlas/config.toml
+macOS  ~/Library/Application Support/atlas/config.toml
+Linux  ~/.config/atlas/config.toml
 ```
+
+`atlas config path` is authoritative for the current host. The default download
+directory is `~/Downloads/atlas` on both supported platform families.
 
 See [Configuration](docs/configuration.md) for keys, environment variables,
 output organization, archive behavior, and authorized cookie use.
@@ -276,7 +289,9 @@ The [documentation home](docs/README.md) organizes the full set by reader goal.
 uv sync --group dev
 uv run pytest
 uv run ruff check .
+uv run ruff format --check .
 uv run mypy src
+sh -n install.sh
 uv build
 git diff --check
 ```

@@ -275,9 +275,7 @@ def _apply_console_color_policy(console: Console, options: VisualOptions) -> Non
     if not hasattr(console, _CONSOLE_COLOR_SYSTEM_ATTR):
         setattr(console, _CONSOLE_COLOR_SYSTEM_ATTR, console._color_system)
     console.no_color = not options.color
-    console._color_system = (
-        getattr(console, _CONSOLE_COLOR_SYSTEM_ATTR) if options.color else None
-    )
+    console._color_system = getattr(console, _CONSOLE_COLOR_SYSTEM_ATTR) if options.color else None
 
 
 def _console_visual_marker(options: VisualOptions) -> tuple[str, bool]:

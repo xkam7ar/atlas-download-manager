@@ -40,14 +40,22 @@ def _item(
     )
 
 
-def _fetch_response(url: str, body: bytes, *, warnings: tuple[str, ...] = ()) -> FetchResponse:
+def _fetch_response(
+    url: str,
+    body: bytes,
+    *,
+    warnings: tuple[str, ...] = (),
+    content_type: str = "text/html; charset=utf-8",
+    body_truncated: bool = False,
+) -> FetchResponse:
     return FetchResponse(
         url=url,
         final_url=url,
         status_code=200,
-        headers={"Content-Type": "text/html; charset=utf-8", "Content-Length": str(len(body))},
+        headers={"Content-Type": content_type, "Content-Length": str(len(body))},
         body=body,
         warnings=warnings,
+        body_truncated=body_truncated,
     )
 
 
@@ -219,12 +227,126 @@ def test_scan_site_empty_document_is_empty_not_success(
     assert scan.error is None
 
 
+def test_scan_site_recognizes_copyparty_plain_text_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    listing = (
+        b"# acct: *\n# perms: ['read', 'get']\n# srvinf: public archive\n"
+        b"\x1b[36m20260626161231 95.7G ## Documentation/\x1b[0m\n"
+        b"\x1b[36m20260626155850 638B README.md\x1b[0m\n"
+    )
+    monkeypatch.setattr(
+        "atlas.adaptive.FetchClient.get",
+        lambda *_args, **_kwargs: _fetch_response(
+            "https://example.com/pub/",
+            listing,
+            content_type="text/plain; charset=utf-8",
+        ),
+    )
+    monkeypatch.setattr("atlas.adaptive._robots_hints", lambda _url, *, timeout: (None, []))
+
+    scan = scan_site("https://example.com/pub/")
+
+    assert scan.scan_status == "success"
+    assert scan.scan_type == "directory-style text index"
+    assert scan.scan_counts["folders"] == 1
+    assert scan.scan_counts["files"] == 1
+    assert scan.discovered_links == [
+        "https://example.com/pub/Documentation/",
+        "https://example.com/pub/README.md",
+    ]
+
+
+def test_scan_site_rejects_ambiguous_plain_text_as_parse_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "atlas.adaptive.FetchClient.get",
+        lambda *_args, **_kwargs: _fetch_response(
+            "https://example.com/readme.txt",
+            b"ordinary prose with no directory structure",
+            content_type="text/plain",
+        ),
+    )
+    monkeypatch.setattr("atlas.adaptive._robots_hints", lambda _url, *, timeout: (None, []))
+
+    scan = scan_site("https://example.com/readme.txt")
+
+    assert scan.scan_status == "failed"
+    assert scan.scan_errors[0]["code"] == "parse_error"
+    assert "not a recognized" in scan.scan_errors[0]["message"]
+    assert scan.error == scan.scan_errors[0]["message"]
+
+
+def test_scan_site_marks_link_limit_as_partial_and_omits_total_estimate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    html = "\n".join(
+        f'<a href="file-{index}.txt">file {index}</a>' for index in range(2_001)
+    ).encode()
+    monkeypatch.setattr(
+        "atlas.adaptive.FetchClient.get",
+        lambda *_args, **_kwargs: _fetch_response("https://example.com/files/", html),
+    )
+    monkeypatch.setattr("atlas.adaptive._robots_hints", lambda _url, *, timeout: (None, []))
+
+    scan = scan_site("https://example.com/files/")
+
+    assert scan.scan_status == "partial"
+    assert scan.scan_counts["links"] == 2_000
+    assert scan.scan_counts["complete"] == 0
+    assert scan.scan_counts["links_truncated"] == 1
+    assert scan.scan_estimated_bytes is None
+    assert any("2,000" in warning and "partial" in warning for warning in scan.scan_warnings)
+
+
+def test_scan_site_marks_body_limit_as_partial_and_omits_total_estimate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    html = b'<a href="one.txt">one</a>'
+    monkeypatch.setattr(
+        "atlas.adaptive.FetchClient.get",
+        lambda *_args, **_kwargs: _fetch_response(
+            "https://example.com/files/",
+            html,
+            body_truncated=True,
+        ),
+    )
+    monkeypatch.setattr("atlas.adaptive._robots_hints", lambda _url, *, timeout: (None, []))
+
+    scan = scan_site("https://example.com/files/")
+
+    assert scan.scan_status == "partial"
+    assert scan.scan_counts["complete"] == 0
+    assert scan.scan_counts["body_truncated"] == 1
+    assert scan.scan_estimated_bytes is None
+    assert any("512 KiB" in warning and "partial" in warning for warning in scan.scan_warnings)
+
+
+def test_scan_site_estimate_uses_visible_sizes_and_excludes_skipped_links(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    html = b"""
+    <a href="../">Parent Directory</a> -
+    <a href="one.txt">one</a> 10B
+    <a href="https://other.example/two.txt">two</a> 20B
+    """
+    monkeypatch.setattr(
+        "atlas.adaptive.FetchClient.get",
+        lambda *_args, **_kwargs: _fetch_response("https://example.com/files/", html),
+    )
+    monkeypatch.setattr("atlas.adaptive._robots_hints", lambda _url, *, timeout: (None, []))
+
+    scan = scan_site("https://example.com/files/")
+
+    assert scan.scan_estimated_bytes == 10
+    assert scan.scan_counts["same_host"] == 1
+
+
 def test_scan_site_warns_for_unbounded_query_and_parent_links(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    query_links = "\n".join(
-        f'<a href="?page={index}">page {index}</a>' for index in range(10)
-    )
+    query_links = "\n".join(f'<a href="?page={index}">page {index}</a>' for index in range(10))
     html = f"""
     <html><body>
       <a href="../">Parent Directory</a>
@@ -251,15 +373,66 @@ def test_scan_site_warns_for_unbounded_query_and_parent_links(
     assert "Query-based navigation detected; keep recursive depth bounded." in scan.scan_warnings
     assert "Input URL resolved to a trailing-slash directory." in scan.classification_notes
 
-    parent_item = next(item for item in scan.discovered_work_items if item.url == "https://example.com/")
+    parent_item = next(
+        item for item in scan.discovered_work_items if item.url == "https://example.com/"
+    )
     assert parent_item.error == "parent directory link skipped by no-parent policy"
     same_directory_item = next(
-        item for item in scan.discovered_work_items if item.url == "https://example.com/pub/File.txt"
+        item
+        for item in scan.discovered_work_items
+        if item.url == "https://example.com/pub/File.txt"
     )
     assert same_directory_item.error is None
     planned_urls = {item.url for item in plan_items_from_site_scan(scan, kind=HubKind.dir)}
     assert "https://example.com/" not in planned_urls
     assert "https://example.com/pub/File.txt" in planned_urls
+
+
+def test_scan_site_enforces_canonical_origin_and_no_parent_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    html = b"""
+    <a href="inside.bin#fragment">inside</a>
+    <a href="sub/../../sibling.bin">literal escape</a>
+    <a href="%2e%2e/encoded.bin">encoded escape</a>
+    <a href="/a/c/side.bin">sideways</a>
+    <a href="//example.com/a/b/default.bin">default port</a>
+    <a href="//example.com:444/a/b/other-port.bin">other port</a>
+    <a href="//other.example/a/b/external.bin">external</a>
+    <a href="java&#x73;cript:alert(1)">unsafe</a>
+    """
+    monkeypatch.setattr(
+        "atlas.adaptive.FetchClient.get",
+        lambda *_args, **_kwargs: _fetch_response("https://example.com:443/a/b/", html),
+    )
+    monkeypatch.setattr("atlas.adaptive._robots_hints", lambda _url, *, timeout: (None, []))
+
+    scan = scan_site("https://example.com:443/a/b/")
+    items = {item.url: item for item in scan.discovered_work_items}
+
+    assert set(scan.discovered_links) == set(items)
+    assert "https://example.com/a/b/inside.bin" in items
+    assert "https://example.com/a/b/default.bin" in items
+    assert items["https://example.com/a/sibling.bin"].error == (
+        "parent directory link skipped by no-parent policy"
+    )
+    assert items["https://example.com/a/b/%2e%2e/encoded.bin"].error == (
+        "parent directory link skipped by no-parent policy"
+    )
+    assert items["https://example.com/a/c/side.bin"].error == (
+        "parent directory link skipped by no-parent policy"
+    )
+    assert items["https://example.com:444/a/b/other-port.bin"].error == (
+        "external link skipped by default"
+    )
+    assert items["https://other.example/a/b/external.bin"].error == (
+        "external link skipped by default"
+    )
+    planned_urls = {item.url for item in plan_items_from_site_scan(scan, kind=HubKind.dir)}
+    assert planned_urls == {
+        "https://example.com/a/b/inside.bin",
+        "https://example.com/a/b/default.bin",
+    }
 
 
 def test_adaptive_ramp_up_and_down() -> None:
@@ -348,10 +521,7 @@ def test_huge_file_without_ranges_disables_segments() -> None:
 
 def test_many_small_files_use_queue_concurrency_without_splitting() -> None:
     scheduler = AdaptiveScheduler(max_concurrency=100)
-    items = [
-        _item(f"https://example.com/{index}.txt", 64 * 1024)
-        for index in range(10)
-    ]
+    items = [_item(f"https://example.com/{index}.txt", 64 * 1024) for index in range(10)]
 
     plan = scheduler.plan(items, kind=HubKind.file, backend="auto")
 

@@ -11,12 +11,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Any
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
@@ -61,7 +62,7 @@ from atlas.batch import (
 )
 from atlas.config import AtlasSettings, load_config, settings_as_toml
 from atlas.doctor import run_doctor
-from atlas.errors import AtlasError, ConfigError, EngineError
+from atlas.errors import AtlasError, ConfigError
 from atlas.formats import filter_formats, format_bytes, format_duration, sort_formats
 from atlas.hub import EngineRouter
 from atlas.logging import configure_logging
@@ -161,6 +162,8 @@ from atlas.setup import (
     apply_setup_plan,
     build_setup_plan,
     build_update_plan,
+    install_hint_for_tool,
+    package_for_environment,
     run_update_plan,
 )
 from atlas.theme import (
@@ -250,6 +253,13 @@ class SessionStatusFilter(StrEnum):
     skipped = "skipped"
     canceled = "canceled"
     dry_run = "dry-run"
+
+
+class PlaylistDownloadKind(StrEnum):
+    """The only two valid outcomes for the playlist convenience command."""
+
+    video = "video"
+    audio = "audio"
 
 
 app = typer.Typer(
@@ -345,9 +355,7 @@ def _settings() -> AtlasSettings:
     try:
         return load_config()
     except ConfigError as exc:
-        console.print(
-            f"[{ATLAS_ERROR_STYLE}]Config error:[/{ATLAS_ERROR_STYLE}] {exc}"
-        )
+        console.print(f"[{ATLAS_ERROR_STYLE}]Config error:[/{ATLAS_ERROR_STYLE}] {exc}")
         raise typer.Exit(2) from exc
 
 
@@ -473,9 +481,11 @@ def _recovery_hint(message: str) -> str | None:
     if "metalink" in lowered and "native file downloads" in lowered:
         return "Use --backend aria2 to expand the manifest, or --no-metalink to save it."
     if "aria2c is required for metalink" in lowered:
-        return "Install aria2 with `brew install aria2`, or pass --no-metalink."
+        return f"Install aria2 with `{install_hint_for_tool('aria2c')}`, or pass --no-metalink."
     if "aria2c is not installed" in lowered:
-        return "Install aria2 with `brew install aria2`, or choose --backend native."
+        return (
+            f"Install aria2 with `{install_hint_for_tool('aria2c')}`, or choose --backend native."
+        )
     if "curl_cffi" in lowered or "--impersonate" in lowered or "impersonate" in lowered:
         return "Install curl_cffi for impersonation support, or remove --impersonate."
     if "byte-range support" in lowered:
@@ -483,20 +493,35 @@ def _recovery_hint(message: str) -> str | None:
     if "checksum mismatch" in lowered:
         return "Verify the checksum string, delete the bad output, then retry."
     if "ffmpeg" in lowered or "ffprobe" in lowered:
-        return "Install ffmpeg with `brew install ffmpeg`."
+        return f"Install ffmpeg with `{install_hint_for_tool('ffmpeg')}`."
     return None
 
 
 def _print_dry_run(result_opts: dict[str, object] | None) -> None:
     console.print(
-        f"[{ATLAS_WARNING_STYLE}]Dry run[/{ATLAS_WARNING_STYLE}]: "
-        "resolved yt-dlp options"
+        f"[{ATLAS_WARNING_STYLE}]Dry run[/{ATLAS_WARNING_STYLE}]: resolved yt-dlp options"
     )
     console.print_json(json.dumps(result_opts or {}, default=str, indent=2))
 
 
 def _print_json(result_opts: dict[str, object] | None) -> None:
     console.print_json(json.dumps(result_opts or {}, default=str, indent=2))
+
+
+def _print_runtime_json(
+    *,
+    kind: HubKind,
+    url: str,
+    paths: Sequence[str | Path],
+) -> None:
+    _print_json(
+        {
+            "status": DownloadStatus.success.value,
+            "kind": kind.value,
+            "url": url,
+            "files": [str(path) for path in paths],
+        }
+    )
 
 
 def _archive_settings(
@@ -718,6 +743,10 @@ def _output_preview(
 ) -> Path | str:
     if options.filename_template:
         return plan.outtmpl
+    if not plan.noplaylist:
+        # Collection probes describe the collection itself, not the selected
+        # entry. The resolved yt-dlp template is the only truthful preview.
+        return plan.outtmpl
     return _planned_output_path(
         output_dir=options.output_dir,
         organize=options.organize,
@@ -769,7 +798,6 @@ def _print_video_summary(
             ("Engine", _engine_label(plan, options.download_engine)),
         ],
     )
-    _print_smart_format_choices(getattr(media, "formats", []))
 
 
 def _print_audio_summary(
@@ -861,7 +889,7 @@ def _audio_archive_retry_options(options: AudioDownloadOptions) -> AudioDownload
 def _maybe_print_archive_retry(
     options: VideoDownloadOptions | AudioDownloadOptions,
 ) -> None:
-    if options.quiet:
+    if options.quiet or bool(getattr(options, "json_output", False)):
         return
     console.print()
     console.print(
@@ -917,11 +945,28 @@ def _media_work_context(
     is_audio = isinstance(options, AudioDownloadOptions)
     kind = HubKind.audio if is_audio else HubKind.video
     operation = "Extract audio" if is_audio else "Download video"
-    steps = (
-        ("Download audio", "Embed metadata", "Add artwork", "Finalize")
-        if is_audio
-        else ("Download video", "Merge video/audio", "Embed metadata", "Add thumbnail", "Finalize")
-    )
+    steps: list[str] = []
+    if options.subtitle_only:
+        steps.append("Download subtitles")
+    elif options.thumbnail_only:
+        steps.append("Download artwork" if is_audio else "Download thumbnail")
+    elif options.info_only:
+        steps.append("Save metadata")
+    else:
+        steps.append("Download audio" if is_audio else "Download video")
+        if not is_audio and "+" in plan.format:
+            steps.append("Merge video/audio")
+        if options.embed_subs:
+            steps.append("Embed subtitles")
+        if options.embed_metadata:
+            steps.append("Embed metadata")
+        if options.embed_thumbnail:
+            steps.append("Embed artwork" if is_audio else "Embed thumbnail")
+        elif options.write_thumbnail:
+            steps.append("Save artwork" if is_audio else "Save thumbnail")
+        if options.split_chapters:
+            steps.append("Split chapters")
+    steps.append("Finalize")
     return WorkPanelContext(
         queue_count=1,
         kind=kind,
@@ -930,7 +975,7 @@ def _media_work_context(
         quality=_media_quality_label(options, plan),
         output=_display_path(plan.output_dir),
         safety_badges=_media_safety_badges(options, plan),
-        steps=steps,
+        steps=tuple(steps),
     )
 
 
@@ -1095,10 +1140,7 @@ def _adaptive_progress_updates(
     decision = item.scheduler_decision or adaptive_plan.strategy
     reclassified_from: str | None = None
     total_bytes = event.total_bytes if event is not None else None
-    if (
-        total_bytes is not None
-        and item.size_class == FileSizeClass.unknown
-    ):
+    if total_bytes is not None and item.size_class == FileSizeClass.unknown:
         size_class = classify_file_size(total_bytes)
         bucket = WorkBucket(size_class.value)
         if size_class != FileSizeClass.unknown:
@@ -1130,9 +1172,14 @@ def _media_safety_badges(
     plan: DownloadPlan,
 ) -> tuple[str, ...]:
     badges: list[str] = []
-    badges.append("playlist enabled" if options.playlist else "single video")
     if plan.noplaylist:
-        badges.append("playlist disabled")
+        badges.append("single item")
+    elif options.playlist:
+        badges.append(
+            "bounded playlist" if options.playlist_items or options.playlist_end else "playlist"
+        )
+    else:
+        badges.append("collection disabled")
     if options.browser_cookies or options.cookies_file:
         badges.append("cookies active")
     if plan.use_aria2:
@@ -1178,6 +1225,25 @@ def _emit_media_startup_phases(
             url=options.url,
             title=title,
             message=message,
+        )
+    )
+
+
+def _emit_media_probe_started(
+    reporter: RichProgressReporter,
+    options: VideoDownloadOptions | AudioDownloadOptions,
+) -> None:
+    if not hasattr(reporter, "hook"):
+        return
+    reporter.hook(
+        ProgressEvent(
+            engine=EngineKind.ytdlp,
+            status="running",
+            phase=ProgressPhase.probe,
+            kind=(HubKind.audio if isinstance(options, AudioDownloadOptions) else HubKind.video),
+            url=options.url,
+            title="metadata",
+            message="inspecting bounded media metadata",
         )
     )
 
@@ -1602,6 +1668,10 @@ def _backend_plan_sections(
 ) -> dict[str, tuple[ViewField, ...]]:
     sections: dict[str, tuple[ViewField, ...]] = {}
 
+    discovery_rows = _scan_discovery_rows(adaptive)
+    if discovery_rows:
+        sections["Discovery"] = discovery_rows
+
     scope_rows = _plan_rows(
         (
             ("Kind", route.get("kind") or summary.get("mirror_kind")),
@@ -1675,6 +1745,97 @@ def _backend_plan_sections(
         )
 
     return sections
+
+
+def _scan_discovery_rows(adaptive: dict[str, object]) -> tuple[ViewField, ...]:
+    status = adaptive.get("scan_status")
+    if status in {"partial", "empty"}:
+        rows = [
+            ViewField(
+                "Scan",
+                str(status),
+                "warning" if status == "partial" else "info",
+            )
+        ]
+        counts = adaptive.get("scan_counts")
+        if isinstance(counts, dict):
+            visible = counts.get("same_host")
+            if not isinstance(visible, int):
+                visible = counts.get("links")
+            if isinstance(visible, int):
+                rows.append(ViewField("Visible", f"{visible:,} item(s)", "info"))
+        if status == "partial":
+            rows.append(
+                ViewField(
+                    "Coverage",
+                    "visible discovery is incomplete; backend limits remain authoritative",
+                    "warning",
+                )
+            )
+        else:
+            rows.append(
+                ViewField(
+                    "Result",
+                    "no downloadable links were discovered at this level",
+                    "info",
+                )
+            )
+        scan_warnings = adaptive.get("scan_warnings")
+        if isinstance(scan_warnings, list):
+            rows.extend(
+                ViewField(f"Warning {index}", str(warning), "warning")
+                for index, warning in enumerate(scan_warnings[:2], start=1)
+                if warning
+            )
+        return tuple(rows)
+
+    work_items = adaptive.get("work_items")
+    failed_items = (
+        [adaptive]
+        if status == "failed"
+        else (
+            [
+                item
+                for item in work_items
+                if isinstance(item, dict) and item.get("scan_status") == "failed"
+            ]
+            if isinstance(work_items, list)
+            else []
+        )
+    )
+    if not failed_items:
+        return ()
+
+    first_failure = failed_items[0]
+    detail = _scan_failure_detail(first_failure)
+    status = "failed" if detail is None else f"failed · {detail}"
+    rows = [
+        ViewField("Scan", status, "error"),
+        ViewField(
+            "Fallback",
+            "backend mirror plan continues without verified discovery",
+            "warning",
+        ),
+    ]
+    if len(failed_items) > 1:
+        rows.append(ViewField("Failures", str(len(failed_items)), "error"))
+    return tuple(rows)
+
+
+def _scan_failure_detail(item: dict[str, object]) -> str | None:
+    scan_errors = item.get("scan_errors")
+    if isinstance(scan_errors, list):
+        for error in scan_errors:
+            if not isinstance(error, dict):
+                continue
+            message = error.get("message")
+            if message:
+                return str(message)
+            code = error.get("code")
+            if code:
+                return str(code).replace("_", " ")
+    error = item.get("error")
+    return str(error) if error else None
 
 
 def _plan_rows(
@@ -1803,12 +1964,14 @@ def _run_backend_passthrough(
         raise typer.Exit(1) from exc
 
 
-def _resolve_playlist_kind(kind: BatchKind | None, *, yes: bool, quiet: bool) -> BatchKind:
+def _resolve_playlist_kind(
+    kind: PlaylistDownloadKind | None,
+    *,
+    yes: bool,
+    quiet: bool,
+) -> BatchKind:
     if kind is not None:
-        if kind == BatchKind.auto:
-            msg = "Playlist type must be video or audio."
-            raise AtlasError(msg)
-        return kind
+        return BatchKind(kind.value)
     if yes:
         return BatchKind.video
     if quiet:
@@ -1832,23 +1995,29 @@ def _run_video_download(settings: AtlasSettings, options: VideoDownloadOptions) 
             _print_json(result.ydl_opts) if options.json_output else _print_dry_run(result.ydl_opts)
             return []
         ensure_download_dependencies(settings, BatchKind.video, plan)
-        media = _probe(engine).probe(
-            InfoOptions(
-                url=options.url,
-                browser_cookies=options.browser_cookies,
-                cookies_file=options.cookies_file,
-                playlist=options.playlist,
-                verbose=options.verbose,
-            )
-        )
-        if not options.quiet:
-            _print_video_summary(media, options, plan)
         progress_mode = _active_progress_mode(options)
         with _rich_progress_reporter(
             progress_mode,
             HubKind.video,
             work_context=_media_work_context(options, plan),
         ) as reporter:
+            _emit_media_probe_started(reporter, options)
+            media = _probe(engine).probe(
+                InfoOptions(
+                    url=options.url,
+                    browser_cookies=options.browser_cookies,
+                    cookies_file=options.cookies_file,
+                    playlist=options.playlist,
+                    playlist_items=options.playlist_items,
+                    playlist_start=options.playlist_start,
+                    playlist_end=options.playlist_end,
+                    socket_timeout=options.socket_timeout,
+                    json_output=options.json_output,
+                    verbose=options.verbose,
+                )
+            )
+            if not options.quiet and not options.json_output:
+                _print_video_summary(media, options, plan)
             _emit_media_startup_phases(reporter, options, plan)
             engine.download_video(
                 options,
@@ -1870,7 +2039,13 @@ def _run_video_download(settings: AtlasSettings, options: VideoDownloadOptions) 
                     postprocessor_hooks=_media_postprocessor_hooks(retry_reporter, HubKind.video),
                 )
             reporter = retry_reporter
-        if not options.quiet:
+        if options.json_output:
+            _print_runtime_json(
+                kind=HubKind.video,
+                url=options.url,
+                paths=reporter.saved_paths,
+            )
+        elif not options.quiet:
             _print_saved_result(
                 "Download complete",
                 reporter,
@@ -1893,23 +2068,29 @@ def _run_audio_download(settings: AtlasSettings, options: AudioDownloadOptions) 
             _print_json(result.ydl_opts) if options.json_output else _print_dry_run(result.ydl_opts)
             return []
         ensure_download_dependencies(settings, BatchKind.audio, plan)
-        media = _probe(engine).probe(
-            InfoOptions(
-                url=options.url,
-                browser_cookies=options.browser_cookies,
-                cookies_file=options.cookies_file,
-                playlist=options.playlist,
-                verbose=options.verbose,
-            )
-        )
-        if not options.quiet:
-            _print_audio_summary(media, options, plan)
         progress_mode = _active_progress_mode(options)
         with _rich_progress_reporter(
             progress_mode,
             HubKind.audio,
             work_context=_media_work_context(options, plan),
         ) as reporter:
+            _emit_media_probe_started(reporter, options)
+            media = _probe(engine).probe(
+                InfoOptions(
+                    url=options.url,
+                    browser_cookies=options.browser_cookies,
+                    cookies_file=options.cookies_file,
+                    playlist=options.playlist,
+                    playlist_items=options.playlist_items,
+                    playlist_start=options.playlist_start,
+                    playlist_end=options.playlist_end,
+                    socket_timeout=options.socket_timeout,
+                    json_output=options.json_output,
+                    verbose=options.verbose,
+                )
+            )
+            if not options.quiet and not options.json_output:
+                _print_audio_summary(media, options, plan)
             _emit_media_startup_phases(reporter, options, plan)
             engine.download_audio(
                 options,
@@ -1931,7 +2112,13 @@ def _run_audio_download(settings: AtlasSettings, options: AudioDownloadOptions) 
                     postprocessor_hooks=_media_postprocessor_hooks(retry_reporter, HubKind.audio),
                 )
             reporter = retry_reporter
-        if not options.quiet:
+        if options.json_output:
+            _print_runtime_json(
+                kind=HubKind.audio,
+                url=options.url,
+                paths=reporter.saved_paths,
+            )
+        elif not options.quiet:
             _print_saved_result(
                 "Audio saved",
                 reporter,
@@ -1965,9 +2152,9 @@ def _run_file_download(
                 explain=True,
             )
             return []
-        if not options.quiet:
+        if not options.quiet and not options.json_output:
             _print_file_summary(options, plan.backend, plan.output, preview=preview)
-        if options.quiet:
+        if options.quiet or options.json_output:
             result = DirectFileAdapter().run(options)
         else:
             progress_mode = _active_progress_mode(options)
@@ -1979,7 +2166,9 @@ def _run_file_download(
                 alternate_screen=_alternate_screen_enabled(progress_mode),
             ) as reporter:
                 result = DirectFileAdapter().run(options, progress_callback=reporter.handle_event)
-        if not options.quiet:
+        if options.json_output:
+            _print_runtime_json(kind=HubKind.file, url=options.url, paths=[plan.output])
+        elif not options.quiet:
             _print_backend_result("File saved", result.message, options.output_dir)
         return [plan.output]
     except AtlasError as exc:
@@ -2007,10 +2196,10 @@ def _run_site_download(
                 explain=True,
             )
             return []
-        if not options.quiet:
+        if not options.quiet and not options.json_output:
             _print_site_summary(options, plan.backend, preview=preview)
         try:
-            if options.quiet:
+            if options.quiet or options.json_output:
                 result = SiteMirrorAdapter().run(options)
             else:
                 progress_mode = _active_progress_mode(options)
@@ -2055,7 +2244,13 @@ def _run_site_download(
                 )
             raise
         artifact_paths = _write_mirror_artifacts(options, result, backend=plan.backend)
-        if not options.quiet:
+        if options.json_output:
+            _print_runtime_json(
+                kind=(HubKind.dir if isinstance(options, DirectoryMirrorOptions) else HubKind.site),
+                url=options.url,
+                paths=[plan.output],
+            )
+        elif not options.quiet:
             label = (
                 "Directory mirror complete"
                 if isinstance(options, DirectoryMirrorOptions)
@@ -2561,6 +2756,44 @@ def _apply_batch_filename_override(
     return DownloadOptimizer(settings).optimize_options(plan.route, options)
 
 
+def _reserve_batch_file_destination(
+    settings: AtlasSettings,
+    plan: HubExecutionPlan,
+    entry: BatchEntry,
+    reserved: set[str],
+) -> HubExecutionPlan:
+    """Reserve a case-insensitive destination before concurrent transfer starts."""
+
+    output = plan.preview.output
+    if output is None or not isinstance(plan.options, FileDownloadOptions):
+        return plan
+    key = str(output.absolute()).casefold()
+    if key not in reserved:
+        reserved.add(key)
+        return plan
+
+    parsed = urlparse(entry.url)
+    segments = [
+        safe_filename(segment, default="")
+        for segment in unquote(parsed.path).split("/")
+        if segment.strip()
+    ]
+    scope = next((segment for segment in reversed(segments[:-1]) if segment), "download")
+    candidate = f"{scope}__{output.name}"
+    counter = 1
+    while str(output.with_name(candidate).absolute()).casefold() in reserved:
+        path = Path(output.name)
+        suffix = path.suffix
+        stem = path.stem if suffix else output.name
+        counter += 1
+        candidate = f"{scope}__{stem}__line-{entry.line_no}-{counter}{suffix}"
+    options = plan.options.model_copy(update={"filename": candidate})
+    reserved_plan = DownloadOptimizer(settings).optimize_options(plan.route, options)
+    assert reserved_plan.preview.output is not None
+    reserved.add(str(reserved_plan.preview.output.absolute()).casefold())
+    return reserved_plan
+
+
 def _batch_hub_plan_from_url(
     settings: AtlasSettings,
     *,
@@ -2684,6 +2917,8 @@ def _run_batch_hub_plan(
             message=_batch_plan_message(plan),
             ydl_opts=plan_preview,
         )
+    if process_control is not None:
+        process_control.raise_if_canceled(["atlas", plan.route.kind.value])
     if isinstance(options, AudioDownloadOptions):
         ensure_download_dependencies(
             settings,
@@ -2692,8 +2927,16 @@ def _run_batch_hub_plan(
         )
         result = _engine(settings).download_audio(
             options,
-            progress_hooks=progress_hooks,
-            postprocessor_hooks=postprocessor_hooks,
+            progress_hooks=_batch_controlled_media_hooks(
+                progress_hooks,
+                process_control,
+                kind=HubKind.audio,
+            ),
+            postprocessor_hooks=_batch_controlled_media_hooks(
+                postprocessor_hooks,
+                process_control,
+                kind=HubKind.audio,
+            ),
         )
         return _download_result_with_batch_plan(result, plan_preview)
     if isinstance(options, VideoDownloadOptions):
@@ -2704,8 +2947,16 @@ def _run_batch_hub_plan(
         )
         result = _engine(settings).download_video(
             options,
-            progress_hooks=progress_hooks,
-            postprocessor_hooks=postprocessor_hooks,
+            progress_hooks=_batch_controlled_media_hooks(
+                progress_hooks,
+                process_control,
+                kind=HubKind.video,
+            ),
+            postprocessor_hooks=_batch_controlled_media_hooks(
+                postprocessor_hooks,
+                process_control,
+                kind=HubKind.video,
+            ),
         )
         return _download_result_with_batch_plan(result, plan_preview)
     if isinstance(options, SiteDownloadOptions):
@@ -2715,8 +2966,47 @@ def _run_batch_hub_plan(
             control=process_control,
         )
         return _download_result_with_batch_plan(result, plan_preview)
-    result = DirectFileAdapter().run(options, progress_callback=progress_callback)
+    result = DirectFileAdapter().run(
+        options,
+        progress_callback=_batch_controlled_file_progress(
+            progress_callback,
+            process_control,
+        ),
+    )
     return _download_result_with_batch_plan(result, plan_preview)
+
+
+def _batch_controlled_file_progress(
+    callback: Callable[[ProgressEvent], None] | None,
+    control: ProcessControl | None,
+) -> Callable[[ProgressEvent], None] | None:
+    if control is None:
+        return callback
+
+    def controlled(event: ProgressEvent) -> None:
+        control.raise_if_canceled(["atlas", "file"])
+        if callback is not None:
+            callback(event)
+        control.raise_if_canceled(["atlas", "file"])
+
+    return controlled
+
+
+def _batch_controlled_media_hooks(
+    hooks: list[ProgressHook] | None,
+    control: ProcessControl | None,
+    *,
+    kind: HubKind,
+) -> list[ProgressHook] | None:
+    if control is None:
+        return hooks
+    controlled_hooks = list(hooks or ())
+
+    def check_canceled(_event: dict[str, Any]) -> None:
+        control.raise_if_canceled(["yt-dlp", kind.value])
+
+    controlled_hooks.append(check_canceled)
+    return controlled_hooks
 
 
 def _download_result_with_batch_plan(
@@ -2760,20 +3050,13 @@ def _batch_progress_callback(
                 "item_id": str(entry.line_no),
             }
         )
-        reporter.hook(
-            event.model_copy(
-                update=updates
-            )
-        )
+        reporter.hook(event.model_copy(update=updates))
 
     return callback
 
 
 def _event_is_tls_fallback_retry(event: ProgressEvent) -> bool:
-    return (
-        event.status in {"error", "failed"}
-        and is_tls_certificate_failure(event.message)
-    )
+    return event.status in {"error", "failed"} and is_tls_certificate_failure(event.message)
 
 
 def _tls_fallback_retry_event(event: ProgressEvent) -> ProgressEvent:
@@ -2826,9 +3109,7 @@ def _emit_batch_result_event(
         adaptive_scheduler=adaptive_scheduler,
         adaptive_items_by_url=adaptive_items_by_url,
     )
-    reporter.hook(
-        event.model_copy(update=updates) if updates else event
-    )
+    reporter.hook(event.model_copy(update=updates) if updates else event)
 
 
 def _batch_result_event_engine(
@@ -2914,6 +3195,7 @@ def _try_run_aria2_batch_queue(
         return BatchSummary(kind=kind, total=skipped, skipped=skipped)
 
     planned_items: list[tuple[BatchEntry, FileDownloadOptions, Path, HubExecutionPlan]] = []
+    reserved_destinations: set[str] = set()
     for entry in entries:
         try:
             planned = _batch_hub_plan_from_url(
@@ -2941,6 +3223,12 @@ def _try_run_aria2_batch_queue(
         if isinstance(planned, DownloadResult):
             return None
         planned = _apply_batch_filename_override(settings, planned, filename_overrides, entry)
+        planned = _reserve_batch_file_destination(
+            settings,
+            planned,
+            entry,
+            reserved_destinations,
+        )
         if not isinstance(planned.options, FileDownloadOptions):
             return None
         if planned.options.backend != FileBackendChoice.aria2:
@@ -2993,19 +3281,45 @@ def _try_run_aria2_batch_queue(
         return None
 
     if results and all(
-        result.error and is_tls_certificate_failure(result.error)
-        for result in results
+        result.error and is_tls_certificate_failure(result.error) for result in results
     ):
         return None
 
     summary = BatchSummary(kind=kind, total=len(entries) + skipped, skipped=skipped)
-    for (entry, _options, _output, plan), result in zip(planned_items, results, strict=True):
+    for (entry, options, output, plan), result in zip(planned_items, results, strict=True):
         plan_payload = plan_as_dict(plan.preview)
         plan_payload["queue"] = {
             "engine": EngineKind.aria2.value,
             "session": "shared",
             "max_concurrent_downloads": resolved_concurrency,
         }
+        if result.error and is_tls_certificate_failure(result.error):
+            try:
+                fallback = FileDownloadEngine().download_with_verified_curl(
+                    options,
+                    output=output,
+                    progress_callback=result.item.progress_callback,
+                    message="aria2 TLS chain failed; retrying with verified curl",
+                )
+            except Exception as exc:
+                result = type(result)(item=result.item, error=str(exc))
+            else:
+                plan_payload["queue"] = {
+                    "engine": EngineKind.curl.value,
+                    "fallback_from": EngineKind.aria2.value,
+                    "session": "per-item-retry",
+                    "max_concurrent_downloads": resolved_concurrency,
+                }
+                summary.succeeded += 1
+                summary.results.append(
+                    BatchItemResult(
+                        entry=entry,
+                        status=DownloadStatus.success,
+                        message=fallback.message,
+                        plan=plan_payload,
+                    )
+                )
+                continue
         if result.error or result.result is None:
             summary.failed += 1
             summary.results.append(
@@ -3524,9 +3838,8 @@ def _manifest_urls_for_mode(payload: dict[str, object], *, mode: str) -> list[st
             continue
         failed = status == DownloadStatus.failed.value
         canceled = status == DownloadStatus.canceled.value
-        skipped_unknown = (
-            status == DownloadStatus.skipped.value
-            and ("unknown" in message or kind in {"", "-", "unknown"})
+        skipped_unknown = status == DownloadStatus.skipped.value and (
+            "unknown" in message or kind in {"", "-", "unknown"}
         )
         selected = (
             (mode == BatchRetryMode.failed and failed)
@@ -3622,9 +3935,7 @@ def _inspect_saved_session(
         status_filter=status_filter,
         kind_filter=kind_filter,
     )
-    failed_items = [
-        item for item in items if item.get("status") == DownloadStatus.failed.value
-    ]
+    failed_items = [item for item in items if item.get("status") == DownloadStatus.failed.value]
     filtered_failed_items = [
         item for item in filtered_items if item.get("status") == DownloadStatus.failed.value
     ]
@@ -3639,16 +3950,8 @@ def _inspect_saved_session(
     retry_canceled = _batch_session_urls_for_mode(payload, manifest, mode=BatchRetryMode.canceled)
     retry_resume = _batch_session_urls_for_mode(payload, manifest, mode=BatchRetryMode.resume)
     counts = _session_counts(payload, manifest, summary)
-    session_type = str(
-        smart_session.get("session_type")
-        or ((manifest or {}).get("kind"))
-        or "-"
-    )
-    source = str(
-        smart_session.get("source")
-        or ((manifest or {}).get("source"))
-        or "-"
-    )
+    session_type = str(smart_session.get("session_type") or ((manifest or {}).get("kind")) or "-")
+    source = str(smart_session.get("source") or ((manifest or {}).get("source")) or "-")
     commands = _session_operator_commands(session_path)
     backend_commands = _session_backend_commands(filtered_items, limit=limit)
     return {
@@ -3881,9 +4184,7 @@ def _session_panel_payload(
         payload["sample"] = filtered_items[:limit]
         return payload
 
-    panel_items = [
-        item for item in filtered_items if _item_in_session_panel(item, panel)
-    ]
+    panel_items = [item for item in filtered_items if _item_in_session_panel(item, panel)]
     payload["total"] = len(panel_items)
     payload["sample"] = panel_items[:limit]
     return payload
@@ -4254,9 +4555,7 @@ def _session_preview_content(
     if preview == SessionPreviewChoice.failed:
         failed_urls = _dict_value(_dict_value(report, "retry"), "failed").get("urls")
         content = (
-            "\n".join(str(url) for url in failed_urls)
-            if isinstance(failed_urls, list)
-            else ""
+            "\n".join(str(url) for url in failed_urls) if isinstance(failed_urls, list) else ""
         )
         return ("Failed URLs", content or "No failed URLs", "text")
     if preview == SessionPreviewChoice.errors:
@@ -5238,6 +5537,14 @@ def video(
     _execute_options_or_exit(settings, options, HubKind.video)
 
 
+def _file_options_or_exit(handler_verbose: bool, **values: object) -> FileDownloadOptions:
+    try:
+        return FileDownloadOptions.model_validate(values)
+    except ValidationError as exc:
+        _handle_error(exc, verbose=handler_verbose)
+        raise typer.Exit(1) from exc
+
+
 @app.command(name="file")
 def file_download(
     url: Annotated[str, typer.Argument(help="Direct file URL.")],
@@ -5486,7 +5793,8 @@ def file_download(
 
     configure_logging(verbose)
     settings = _settings()
-    options = FileDownloadOptions(
+    options = _file_options_or_exit(
+        verbose,
         url=url,
         output_dir=output_dir or settings.output_dir,
         backend=backend if backend != FileBackendChoice.auto else settings.file_backend,
@@ -6843,7 +7151,7 @@ def audio(
 def playlist_command(
     url: Annotated[str, typer.Argument(help="Explicit playlist URL.")],
     kind: Annotated[
-        BatchKind | None,
+        PlaylistDownloadKind | None,
         typer.Option("--type", help="Download playlist as video or audio."),
     ] = None,
     output_dir: Annotated[
@@ -7022,10 +7330,11 @@ def info(
                 browser_cookies=browser_cookies,
                 cookies_file=cookies_file,
                 playlist=playlist,
+                json_output=json_output,
                 verbose=verbose,
             )
         )
-    except EngineError as exc:
+    except AtlasError as exc:
         _handle_error(exc, verbose=verbose)
         raise typer.Exit(1) from exc
 
@@ -7103,10 +7412,11 @@ def formats(
                 browser_cookies=browser_cookies,
                 cookies_file=cookies_file,
                 playlist=playlist,
+                json_output=json_output,
                 verbose=verbose,
             )
         )
-    except EngineError as exc:
+    except AtlasError as exc:
         _handle_error(exc, verbose=verbose)
         raise typer.Exit(1) from exc
 
@@ -7293,6 +7603,8 @@ def batch(
     active_runtime_scheduler: AdaptiveScheduler | None = None
     batch_control = BatchControl()
     batch_operator_controller = BatchOperatorController(batch_control)
+    reserved_destinations: set[str] = set()
+    destination_lock = threading.Lock()
 
     def handler(
         entry: BatchEntry,
@@ -7335,6 +7647,13 @@ def batch(
             filename_overrides,
             entry,
         )
+        with destination_lock:
+            planned = _reserve_batch_file_destination(
+                settings,
+                planned,
+                entry,
+                reserved_destinations,
+            )
         try:
             result = _run_batch_hub_plan(
                 settings,
@@ -7385,9 +7704,7 @@ def batch(
     ) -> BatchSummary:
         nonlocal active_runtime_scheduler
         active_runtime_scheduler = (
-            _adaptive_batch_runtime_scheduler(adaptive_plan)
-            if adaptive_plan is not None
-            else None
+            _adaptive_batch_runtime_scheduler(adaptive_plan) if adaptive_plan is not None else None
         )
         hook_factory = (
             (
@@ -7519,27 +7836,7 @@ def batch(
             raise typer.Exit(1)
         return
 
-    table = Table(
-        title=Text(f"Batch {kind.value}", style=ATLAS_TITLE_STYLE),
-        box=table_box(),
-        header_style=ATLAS_MUTED_STYLE,
-    )
-    table.add_column("line", justify="right")
-    table.add_column("status")
-    table.add_column("kind")
-    table.add_column("engine")
-    table.add_column("url")
-    table.add_column("message")
-    for result in summary.results:
-        table.add_row(
-            str(result.entry.line_no),
-            Text(result.status.value, style=_download_status_style(result.status)),
-            _batch_result_plan_value(result.plan, "kind"),
-            _batch_result_plan_value(result.plan, "engine"),
-            result.entry.url,
-            _batch_result_display_message(result),
-        )
-    console.print(table)
+    console.print(_batch_result_table(summary, kind=kind, width=console.width))
     console.print(_batch_summary_text(summary))
     if artifact_paths:
         _print_artifact_panel(artifact_paths)
@@ -7556,6 +7853,54 @@ def _batch_result_display_message(result: BatchItemResult) -> str:
         if lowered.startswith("saved to "):
             return "Saved"
     return message
+
+
+def _batch_result_table(summary: BatchSummary, *, kind: BatchKind, width: int) -> Table:
+    table = Table(
+        title=Text(f"Batch {kind.value}", style=ATLAS_TITLE_STYLE),
+        box=table_box(),
+        header_style=ATLAS_MUTED_STYLE,
+        expand=width < 72,
+    )
+    if width < 72:
+        table.show_header = False
+        table.add_column("result", overflow="fold")
+        for result in summary.results:
+            status = result.status.value.replace("_", "-")
+            result_kind = _batch_result_plan_value(result.plan, "kind")
+            result_engine = _batch_result_plan_value(result.plan, "engine")
+            item = Text()
+            item.append(
+                f"#{result.entry.line_no} {status}",
+                style=_download_status_style(result.status),
+            )
+            item.append(
+                f"\n{result_kind} via {result_engine}",
+                style=ATLAS_MUTED_STYLE,
+            )
+            item.append(f"\n{result.entry.url}")
+            message = _batch_result_display_message(result)
+            if message and not message.lower().startswith(f"{result_kind.lower()} via "):
+                item.append(f"\n{message}", style=ATLAS_MUTED_STYLE)
+            table.add_row(item)
+        return table
+
+    table.add_column("line", justify="right")
+    table.add_column("status")
+    table.add_column("kind")
+    table.add_column("engine")
+    table.add_column("url")
+    table.add_column("message")
+    for result in summary.results:
+        table.add_row(
+            str(result.entry.line_no),
+            Text(result.status.value, style=_download_status_style(result.status)),
+            _batch_result_plan_value(result.plan, "kind"),
+            _batch_result_plan_value(result.plan, "engine"),
+            result.entry.url,
+            _batch_result_display_message(result),
+        )
+    return table
 
 
 def _run_saved_batch_session(
@@ -7648,7 +7993,7 @@ def retry_command(
     ] = False,
     canceled_only: Annotated[
         bool,
-        typer.Option("--canceled-only", help="Retry URLs canceled before item start."),
+        typer.Option("--canceled-only", help="Retry canceled URLs."),
     ] = False,
     output_dir: Annotated[
         Path | None, typer.Option("--output-dir", "-o", help="Download output directory.")
@@ -7840,7 +8185,7 @@ def export_failed_command(
     ] = False,
     canceled_only: Annotated[
         bool,
-        typer.Option("--canceled-only", help="Export URLs canceled before item start."),
+        typer.Option("--canceled-only", help="Export canceled URLs."),
     ] = False,
     output_dir: Annotated[
         Path | None,
@@ -8105,7 +8450,7 @@ def setup_command(
     ] = False,
     no_install: Annotated[
         bool,
-        typer.Option("--no-install", help="Print the plan and create Atlas paths only."),
+        typer.Option("--no-install", help="Print the plan without changing the host."),
     ] = False,
     yes: Annotated[
         bool,
@@ -8131,13 +8476,15 @@ def setup_command(
         )
         settings = _settings()
         plan = build_setup_plan(settings, mode=mode)
+        if install and no_install:
+            raise AtlasError("Choose either --install or --no-install, not both.")
         if json_output:
             console.print_json(json.dumps(_setup_plan_as_dict(plan)))
             return
         _print_setup_plan(plan)
-        install_requested = install and not no_install
-        if install and no_install:
-            raise AtlasError("Choose either --install or --no-install, not both.")
+        if no_install:
+            return
+        install_requested = install
         if install_requested and not plan.can_install and plan.missing_tools:
             raise AtlasError(
                 "Atlas cannot install missing tools automatically on this host. "
@@ -8150,8 +8497,7 @@ def setup_command(
         if install_requested:
             console.print()
             console.print(
-                f"[{ATLAS_TITLE_STYLE}]Verifying runtime with atlas doctor..."
-                f"[/{ATLAS_TITLE_STYLE}]"
+                f"[{ATLAS_TITLE_STYLE}]Verifying runtime with atlas doctor...[/{ATLAS_TITLE_STYLE}]"
             )
             report = run_doctor(settings)
             if not report.ok:
@@ -8236,7 +8582,8 @@ def doctor(
     """Check runtime dependencies and writable paths."""
 
     settings = _settings()
-    report = run_doctor(settings)
+    plan_only = json_output or no_install
+    report = run_doctor(settings, create_paths=False) if plan_only else run_doctor(settings)
     if network:
         report = _network_doctor_report(report)
     network_failed = network and any(not check.ok for check in report.checks)
@@ -8309,13 +8656,14 @@ def doctor(
         console.print()
         plan = build_setup_plan(settings, mode=SetupMode.full)
         _print_setup_plan(plan)
-        install_requested = not no_install and plan.can_install and bool(plan.missing_tools)
-        if install_requested and not yes:
-            install_requested = typer.confirm("Run these install commands?", default=True)
-        result = apply_setup_plan(plan, settings, install=install_requested)
-        _print_setup_result(result, install_requested=install_requested)
-        if install_requested:
-            report = run_doctor(settings)
+        if not no_install:
+            install_requested = plan.can_install and bool(plan.missing_tools)
+            if install_requested and not yes:
+                install_requested = typer.confirm("Run these install commands?", default=True)
+            result = apply_setup_plan(plan, settings, install=install_requested)
+            _print_setup_result(result, install_requested=install_requested)
+            if install_requested:
+                report = run_doctor(settings)
     if not report.ok or network_failed:
         raise typer.Exit(1)
 
@@ -8346,8 +8694,7 @@ def _certificate_repair_plan(report: DoctorReport) -> dict[str, object]:
         "steps": [
             "Run atlas doctor --network to verify Python TLS and CA bundle state.",
             "Run atlas setup --minimal to repair Atlas runtime dependencies.",
-            "If installed with Homebrew, run "
-            "brew reinstall ca-certificates openssl@3 python@3.12.",
+            "If installed with Homebrew, run brew reinstall ca-certificates openssl@3 python@3.12.",
             "Retry the scan before considering any no-check-certificate backend option.",
         ],
     }
@@ -8356,15 +8703,12 @@ def _certificate_repair_plan(report: DoctorReport) -> dict[str, object]:
 def _print_certificate_repair_plan(report: DoctorReport) -> None:
     plan = _certificate_repair_plan(report)
     console.print()
-    console.print(
-        f"[{ATLAS_TITLE_STYLE}]Certificate repair[/{ATLAS_TITLE_STYLE}]"
-    )
+    console.print(f"[{ATLAS_TITLE_STYLE}]Certificate repair[/{ATLAS_TITLE_STYLE}]")
     console.print("Atlas will not disable TLS verification or mutate system trust silently.")
     ca_bundle = plan.get("ca_bundle")
     if ca_bundle:
         console.print(
-            f"[{ATLAS_MUTED_STYLE}]CA bundle:[/{ATLAS_MUTED_STYLE}] "
-            f"{escape(str(ca_bundle))}"
+            f"[{ATLAS_MUTED_STYLE}]CA bundle:[/{ATLAS_MUTED_STYLE}] {escape(str(ca_bundle))}"
         )
     https_verification = plan.get("https_verification")
     if https_verification:
@@ -8408,19 +8752,7 @@ def _doctor_label(name: str) -> str:
 
 
 def _install_command(name: str) -> str:
-    if name in {"ffmpeg", "ffprobe"}:
-        return "brew install ffmpeg"
-    if name == "aria2c":
-        return "brew install aria2"
-    if name == "wget2":
-        return "brew install wget2"
-    if name == "wget":
-        return "brew install wget"
-    if name == "yt-dlp":
-        return "uv tool install --force ."
-    if name == "atlas package":
-        return "brew install xkam7ar/tap/atlas"
-    return "atlas doctor"
+    return install_hint_for_tool(name)
 
 
 def _setup_mode_from_flags(
@@ -8454,7 +8786,11 @@ def _setup_plan_as_dict(plan: SetupPlan) -> dict[str, object]:
             "os": plan.environment.os_name,
             "architecture": plan.environment.architecture,
             "shell": plan.environment.shell,
-            "package_manager": plan.environment.package_manager,
+            "package_manager": (
+                str(plan.environment.package_manager)
+                if plan.environment.package_manager is not None
+                else None
+            ),
             "package_manager_path": plan.environment.package_manager_path,
             "install_method": plan.environment.install_method,
             "atlas_executable": plan.environment.atlas_executable,
@@ -8462,7 +8798,7 @@ def _setup_plan_as_dict(plan: SetupPlan) -> dict[str, object]:
         "tools": [
             {
                 "executable": tool.executable,
-                "package": tool.package,
+                "package": package_for_environment(tool, plan.environment),
                 "purpose": tool.purpose,
                 "required": tool.required,
                 "installed": tool in plan.existing_tools,
@@ -8471,8 +8807,7 @@ def _setup_plan_as_dict(plan: SetupPlan) -> dict[str, object]:
         ],
         "missing_tools": [tool.executable for tool in plan.missing_tools],
         "install_commands": [
-            " ".join(shlex.quote(part) for part in command)
-            for command in plan.install_commands
+            " ".join(shlex.quote(part) for part in command) for command in plan.install_commands
         ],
         "manual_commands": list(plan.manual_commands),
         "config_file": str(plan.config_file),
@@ -8528,27 +8863,29 @@ def _print_setup_plan(plan: SetupPlan) -> None:
             if installed
             else (ATLAS_WARNING_STYLE if tool.required else ATLAS_MUTED_STYLE)
         )
-        table.add_row(marker, tool.executable, tool.package, tool.purpose, style=style)
+        table.add_row(
+            marker,
+            tool.executable,
+            package_for_environment(tool, plan.environment),
+            tool.purpose,
+            style=style,
+        )
     console.print(table)
 
     if plan.install_commands:
         console.print(
-            f"[{ATLAS_TITLE_STYLE}]Will install missing tools with:"
-            f"[/{ATLAS_TITLE_STYLE}]"
+            f"[{ATLAS_TITLE_STYLE}]Will install missing tools with:[/{ATLAS_TITLE_STYLE}]"
         )
         for command in plan.install_commands:
             console.print("  " + " ".join(shlex.quote(part) for part in command))
     elif plan.manual_commands:
         console.print(
-            f"[{ATLAS_WARNING_STYLE}]Install missing tools manually:"
-            f"[/{ATLAS_WARNING_STYLE}]"
+            f"[{ATLAS_WARNING_STYLE}]Install missing tools manually:[/{ATLAS_WARNING_STYLE}]"
         )
         for manual_command in plan.manual_commands:
             console.print(f"  {escape(manual_command)}")
     else:
-        console.print(
-            Text("All selected runtime tools are installed.", style=ATLAS_SUCCESS_STYLE)
-        )
+        console.print(Text("All selected runtime tools are installed.", style=ATLAS_SUCCESS_STYLE))
     for note in plan.notes:
         console.print(Text(f"! {note}", style=ATLAS_WARNING_STYLE))
 

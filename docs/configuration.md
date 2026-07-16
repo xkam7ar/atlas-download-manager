@@ -1,6 +1,6 @@
 # Configuration
 
-`atlas` uses `pydantic-settings`, TOML, environment variables, and macOS-aware
+`atlas` uses `pydantic-settings`, TOML, environment variables, and host-native
 paths from `platformdirs`.
 
 The TOML file is loaded by `pydantic-settings` through
@@ -13,16 +13,21 @@ The TOML file is loaded by `pydantic-settings` through
 5. File secrets
 6. Defaults
 
-## macOS paths
+## Platform paths
 
-| Purpose | Default |
-| --- | --- |
-| Config file | `~/Library/Application Support/atlas/config.toml` |
-| Data dir | `~/Library/Application Support/atlas` |
-| Cache dir | `~/Library/Caches/atlas` |
-| Log dir | `~/Library/Logs/atlas` |
-| Output dir | `~/Downloads/atlas` |
-| Archive file | `~/Library/Application Support/atlas/download-archive.txt` |
+| Purpose | macOS | Linux |
+| --- | --- | --- |
+| Config file | `~/Library/Application Support/atlas/config.toml` | `~/.config/atlas/config.toml` |
+| Data dir | `~/Library/Application Support/atlas` | `~/.local/share/atlas` |
+| Cache dir | `~/Library/Caches/atlas` | `~/.cache/atlas` |
+| Log dir | `~/Library/Logs/atlas` | `~/.local/state/atlas/log` |
+| Output dir | `~/Downloads/atlas` | `~/Downloads/atlas` |
+| Archive file | `~/Library/Application Support/atlas/download-archive.txt` | `~/.local/share/atlas/download-archive.txt` |
+
+The Linux rows follow the standard XDG defaults. `XDG_CONFIG_HOME`,
+`XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_STATE_HOME` can move them. Always use
+`atlas config path` and `atlas config show` as the authoritative values for the
+current environment.
 
 See [Atlas Migration Notes](migration.md) before moving config, archive, or
 output directories.
@@ -52,7 +57,7 @@ with owner-only permissions.
 
 ## Config file
 
-Example:
+Example with explicit mirror safety bounds:
 
 ```toml
 default_output_dir = "~/Downloads/atlas"

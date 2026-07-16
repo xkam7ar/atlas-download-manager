@@ -98,8 +98,9 @@ non-interactive paths remain inline.
 
 ## Installation Contract
 
-Atlas must provide a one-command guided installer for normal users and a
-Homebrew-first install path for macOS.
+Atlas must provide a one-command guided installer for normal users on macOS,
+Debian/Ubuntu, Fedora, and Arch-family Linux. Runtime packages use Homebrew,
+apt, dnf, or pacman as appropriate; Arch uses Homebrew on Linux for `wget2`.
 
 Supported install paths:
 
@@ -115,19 +116,39 @@ The installer/setup layer must:
 - detect OS, architecture, shell, package manager, and likely install method
 - install or verify required media tools: `ffmpeg` and `ffprobe`
 - install or verify full-runtime tools in full mode: `aria2c`, `wget2`, `wget`
+- install Atlas with its declared Python dependencies, including `yt-dlp` and
+  `mutagen` for audio artwork embedding
 - create config, data, cache, log, and output directories
 - run `atlas doctor` before declaring guided installer success
 - never install system packages during Python import or package installation
-- never silently install Homebrew or another package manager
-- show package-manager commands before running them
-- support `--no-install` and JSON planning output
-- allow `install.sh --no-install` to report missing Homebrew without failing as
-  an attempted install
+- install Homebrew only after showing its bootstrap in the approved plan
+- show every package-manager and bootstrap command before running it
+- keep `--no-install` and JSON planning output non-mutating
+- allow `install.sh --no-install` to report every missing prerequisite without
+  attempting installation
 - verify an existing `atlas` command supports `atlas setup` before treating it
   as a complete installation
-- use the detected package-manager executable path in generated install
-  commands instead of assuming a fixed Homebrew prefix
+- use the detected package-manager executable path in generated install commands
+- require root or `sudo` for native Linux changes and print exact manual commands
+  when elevation is unavailable
 - keep `atlas setup`, `atlas doctor --fix`, and `atlas update` reachable from the menu
+
+The guided installer must finish planning before its first mutation:
+
+```text
+detect host and missing executables
+  -> build Atlas/runtime/bootstrap plan
+  -> show the complete plan
+  -> obtain one Atlas-level approval (`--yes` supplies it)
+  -> run every approved bootstrap/package/Atlas step in order
+  -> run `atlas setup --MODE` to initialize paths and configuration
+  -> run `atlas setup --MODE --no-install` for final plan-only verification
+  -> run `atlas doctor`
+  -> report success only when required checks pass
+```
+
+OS authentication may still ask for a sudo password. A failed command stops the
+sequence. A second run omits tools that are already present.
 
 ## Core Data Flow
 
@@ -171,6 +192,14 @@ valid actions for the current state. The full visible root-file list belongs in
 a searchable picker opened by `Only visible files at this level`, not in the
 primary browse screen.
 
+Exact-index rule: a complete signature-recognized CopyParty HTML or text index
+may become a `native-exact-index` download. Atlas must keep the walk same-host,
+apply depth and file filters, refuse partial/unsupported nested indexes, enforce
+the 2,000-file hard cap plus user file/size/runtime bounds, and validate every
+relative destination against traversal, symlink escape, and case-folded
+collision before transfer. Conventional HTML indexes stay on explicit recursive
+Wget2/Wget policy.
+
 ## Ownership Boundaries
 
 | Layer | Owns | Must not own |
@@ -196,6 +225,9 @@ primary browse screen.
 | `progress.py` | Live progress policy and human/JSON progress reporters. | Backend execution or planner decisions. |
 | `views.py` / `theme.py` | Shared visual components, styles, glyphs, plain/NO_COLOR fallbacks. | Backend or planner state mutation. |
 | `runner.py` | Safe subprocess execution and cancellation. | Shell-string execution or UI policy. |
+| `setup.py` / `doctor.py` | Host detection, package plans, approved plan execution, and verification reports. | Unapproved package-manager mutation. |
+| `config.py` / `paths.py` | Effective settings and `platformdirs`-based host paths. | Download planning or UI policy. |
+| `redaction.py` / `private_files.py` | Shared secret removal and owner-only atomic artifact writes. | Session semantics or backend routing. |
 
 ## SmartDownloadSession Contract
 
@@ -279,7 +311,7 @@ contract.
 
 ## Adaptive Scheduler Contract
 
-Adaptive planning is three-level:
+Adaptive planning is three-level for the mixed-engine executor:
 
 - Queue concurrency controls how many URLs/items run at once.
 - Host budgets cap how much work can hit one host at the same time.
@@ -298,6 +330,9 @@ as a socket cap. The scheduler derives and records a separate
 `max_total_connections` budget from the selected politeness profile and clamps
 queue and segment choices so the plan cannot accidentally create hundreds of
 sockets by combining high batch concurrency with high per-item splitting.
+For `atlas batch --adaptive`, mixed-engine execution uses the adaptive plan's
+queue value even when `--concurrency` is present. An all-aria2 shared RPC batch
+instead maps explicit `--concurrency` to aria2's global queue.
 
 `AdaptiveDownloadPlan` must preserve:
 
@@ -330,6 +365,21 @@ host cap, and the latest explainable scheduler decision. It uses AIMD behavior:
 - host-scoped backoff where possible so one unhealthy host does not unnecessarily
   punish unrelated hosts
 
+Only runnable rows may enter the mixed-engine executor. Host-capped or
+operator-paused work must remain pending rather than consuming worker threads.
+When a verified probe
+resolves an item to a different host, the runtime API may attribute feedback to
+that final/CDN host if its caller supplies a host resolver; the built-in CLI
+currently uses the original item host.
+
+The all-aria2 shared RPC path queues every item immediately and enforces only
+aria2's global adaptive queue. It binds no `BatchControl`, so per-host gating and
+pause/cancel mutation keys do not apply. Shared sessions must avoid redundant
+`changeGlobalOption` calls and clear their option cache when the process stops.
+Startup failure returns to ordinary per-item execution. Mid-session loss keeps
+completed results, fails unresolved items, and removes active GIDs best-effort;
+only TLS-chain failures receive the verified-curl per-item retry.
+
 Unknown-size items start cautiously. If progress later reports enough bytes to
 classify an item, runtime code can clamp future starts and annotate progress
 events with the reclassification. It should not pretend earlier unknown totals
@@ -350,7 +400,11 @@ All scan/probe code must go through the shared fetch layer instead of ad hoc
 - no silent downgrade to `--no-check-certificate`
 
 Doctor network diagnostics must inspect the same Python SSL and CA-bundle state
-used by the fetch layer so scan failures and doctor output stay aligned.
+used by the fetch layer so scan failures and doctor output stay aligned. Every
+Doctor mode performs one verified GET to `https://www.python.org/` with a
+three-second timeout. Default human mode may initialize Atlas directories and
+uses temporary write probes; JSON and `--fix --no-install` use non-mutating path
+checks but are not offline modes.
 
 Direct-file execution may use a separate verified curl retry from
 `FileDownloadEngine` when Python, aria2c, or Wget2 fail on an issuer-chain error
@@ -370,6 +424,11 @@ Human progress must:
 - never fake a percent for unknown totals
 - render tiny nonzero warning/error ratios as `<1%` with a visible sliver
 - throttle live rendering to avoid terminal churn
+- switch live batch tables to compact rows below 110 columns and stacked rows
+  below 64 while retaining speed and ETA at very narrow widths
+- budget rows against terminal height; keep the focused row first, then active,
+  retry/backoff, failed, and recent rows, and report omitted state counts in a
+  `+N hidden (...)` summary
 - preserve plain/NO_COLOR/no-unicode fallbacks
 
 Machine progress must:
@@ -378,10 +437,14 @@ Machine progress must:
 - never include Rich markup, ANSI control codes, tables, or human cards
 - keep field names stable for automation
 
+Final `--json` result mode has precedence over every `--progress` value and
+emits exactly one JSON document. NDJSON is available only through
+`--progress json` when final JSON mode is not active.
+
 Direct-file progress uses file-specific next phases such as verify/finalize.
-Media progress uses media-specific phases such as merge, extract, metadata,
-thumbnail, and finalize. Mirror progress uses discovery/mirror/verify/finalize
-language.
+Media progress derives its steps from the resolved plan and must not display
+disabled merge, metadata, subtitle, thumbnail, or artwork stages. Mirror
+progress uses discovery/mirror/verify/finalize language.
 
 ## Artifact Contract
 
@@ -401,15 +464,19 @@ Non-dry-run batch sessions write timestamped history plus stable latest files:
     retry.atlas.json
 ```
 
-Completed standalone site and directory mirrors write the stable `latest/`
-files. They do not create batch history files unless they are running as batch
-items.
+Successful and failed non-dry-run standalone site and directory mirror attempts
+write the stable `latest/` files. They do not create batch history files unless
+they are running as batch items. A failed Wget2 exception can retain failed-row
+samples for its displayed error, while the current saved recovery item is the
+mirror seed URL.
 
 Artifact rules:
 
 - `summary.json` is the compact result view.
 - `manifest.json` is the durable item/session view.
 - `failed.txt`, `skipped.txt`, and `canceled.txt` exist even when empty.
+- `canceled` is a subset of batch `skipped` accounting and must not be added to
+  it when reconciling `total`.
 - `retry.atlas.json` points to retry, resume, export, save, and load flows.
 - Saved backend argv must be redacted before entering manifests, previews,
   copy actions, or JSON reports.
@@ -418,17 +485,26 @@ Artifact rules:
 
 ## Cancellation And Operator Controls
 
-Queue controls and subprocess controls are separate.
+Queue controls and active-work controls are separate but coordinated.
 
-`BatchControl` can pause global starts, pause one host, pause one queued line,
-cancel queued work, and mark pre-start rows as canceled. It does not freeze an
+On the mixed-engine executor, `BatchControl` can pause global starts, pause one
+host, pause one queued line, cancel queued work, and forward cancellation to the
+`ProcessControl` registered for an active row. It does not freeze an
 already-running transfer.
 
-`ProcessControl` belongs to subprocess-backed work. A UI/controller can request
-cancellation, `runner.py` terminates the child, and the adapter maps that to a
-canceled result or progress event.
+`ProcessControl` is the per-item cancellation signal. For Wget2/Wget and other
+controlled subprocesses, `runner.py` terminates the child. Native direct files,
+exact-index work, and yt-dlp media check the same signal at transfer progress,
+between exact-index files, and at media progress/postprocessor hooks. These
+in-process paths are cooperative: they must stop at the next checkpoint and map
+the outcome to `DownloadStatus.canceled`, but they must not claim arbitrary
+mid-instruction suspension.
 
-The full-progress batch UI owns key interpretation:
+Both queued and active-controlled cancellations are written to `canceled.txt`
+and are eligible for `resume`, `retry --canceled-only`, and canceled-only export.
+
+The mixed-engine full-progress batch UI owns key interpretation. The shared
+aria2 RPC path does not advertise these mutation keys:
 
 | Key | Contract |
 | --- | --- |
@@ -436,7 +512,7 @@ The full-progress batch UI owns key interpretation:
 | `h` | Pause or resume focused host starts. |
 | `s` | Pause or resume focused queued line. |
 | `x` | Cancel focused queued or controllable active item. |
-| `X` | Cancel queued work and active controlled subprocesses. |
+| `X` | Cancel queued work and every controlled active item. |
 | `tab` | Cycle queue, active, completed, failed, scheduler, logs, summary panels. |
 | `?` | Toggle help overlay. |
 
@@ -479,6 +555,7 @@ When a system behavior changes, update the docs that own that contract:
 | Progress/UI change | `ui-ux.md`, `architecture.md` progress section, this file. |
 | Backend or scheduler behavior | `download-planning.md`, `architecture.md`, `mirror-policy.md` or `media-edge-cases.md` when relevant. |
 | Installer/setup/update behavior | `installation.md`, `commands.md`, `troubleshooting.md`, `development.md`, this file. |
+| Supported host paths or package mappings | `configuration.md`, `installation.md`, `migration.md`, `commands.md`, this file. |
 | Security/access policy | `responsible-use.md`, `media-edge-cases.md` or `mirror-policy.md`, this file. |
 | Developer workflow | `development.md`. |
 
@@ -488,8 +565,11 @@ Before declaring architecture or system documentation current:
 
 ```bash
 uv run pytest
-uv run mypy
-uv run ruff check src/atlas tests
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src
+sh -n install.sh
+uv build
 git diff --check
 ```
 

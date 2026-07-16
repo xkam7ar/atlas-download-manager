@@ -6,23 +6,26 @@ import csv
 import hashlib
 import json
 import os
+import re
 import shutil
 import ssl
 import subprocess
 import tempfile
 import time
+import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from email.utils import formatdate, parsedate_to_datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
 
 from atlas.aria2_rpc import Aria2RpcSession, Aria2RpcStartupError
 from atlas.errors import DependencyMissingError, EngineError
 from atlas.models import (
+    DirectFileProbe,
     DirectoryMirrorOptions,
     DownloadResult,
     DownloadStatus,
@@ -34,12 +37,14 @@ from atlas.models import (
     ProgressPhase,
     SiteBackendChoice,
     SiteDownloadOptions,
+    WorkItem,
 )
 from atlas.paths import safe_filename
 from atlas.private_files import replace_private_text
 from atlas.progress_events import progress_event_from_aria2_line, progress_event_from_wget2_line
-from atlas.redaction import redact_url
+from atlas.redaction import redact_text, redact_url
 from atlas.runner import ProcessCanceled, ProcessControl, run_args_stream
+from atlas.setup import install_hint_for_tool
 from atlas.urls import is_metalink_url
 
 ProgressCallback = Callable[[ProgressEvent], None]
@@ -52,6 +57,14 @@ class BackendPlan:
     output: Path
     stats_files: dict[str, Path] | None = None
     warnings: list[str] = field(default_factory=list)
+
+
+class MirrorDownloadError(EngineError):
+    """Mirror failure retaining any wget2 statistics produced before exit."""
+
+    def __init__(self, message: str, *, stats: Mapping[str, object] | None = None) -> None:
+        super().__init__(message)
+        self.stats = dict(stats or {})
 
 
 class FileDownloadEngine:
@@ -79,8 +92,16 @@ class FileDownloadEngine:
         options: FileDownloadOptions,
         *,
         progress_callback: ProgressCallback | None = None,
+        max_output_bytes: int | None = None,
+        required_url_scope: str | None = None,
+        deadline: float | None = None,
     ) -> DownloadResult:
+        if max_output_bytes is not None and max_output_bytes < 0:
+            raise EngineError("Download byte limit cannot be negative")
         plan = self.plan(options)
+        hard_native_constraints = (
+            max_output_bytes is not None or required_url_scope is not None or deadline is not None
+        )
         if options.dry_run:
             return DownloadResult(
                 status=DownloadStatus.dry_run,
@@ -88,12 +109,24 @@ class FileDownloadEngine:
                 message="Dry run; no network request or download performed.",
                 ydl_opts={"backend": plan.backend, "args": plan.args, "output": str(plan.output)},
             )
+        if (
+            not _is_metalink_download(options)
+            and options.probe is not None
+            and options.probe.content_length is not None
+        ):
+            existing_bytes = plan.output.stat().st_size if plan.output.is_file() else 0
+            _require_free_space(
+                plan.output,
+                required_bytes=max(0, options.probe.content_length - existing_bytes),
+            )
         backend_progress_callback = _curl_fallback_progress_callback(
             options,
             plan,
             progress_callback,
         )
-        if _should_start_with_verified_curl_fallback(options, plan):
+        if hard_native_constraints and plan.backend != FileBackendChoice.native.value:
+            raise EngineError("Hard byte/scope constraints require the native file backend")
+        if not hard_native_constraints and _should_start_with_verified_curl_fallback(options, plan):
             return self._download_with_verified_curl_fallback(
                 options,
                 plan,
@@ -113,12 +146,17 @@ class FileDownloadEngine:
                     plan,
                     progress_callback=backend_progress_callback,
                 )
-            return self._download_native(
+            return self._download_native_with_retries(
                 options,
                 plan,
                 progress_callback=backend_progress_callback,
+                max_output_bytes=max_output_bytes,
+                required_url_scope=required_url_scope,
+                deadline=deadline,
             )
         except Exception as exc:
+            if hard_native_constraints:
+                raise
             fallback = self._download_with_curl_after_tls_failure(
                 options,
                 plan,
@@ -128,6 +166,78 @@ class FileDownloadEngine:
             if fallback is not None:
                 return fallback
             raise
+
+    def _download_native_with_retries(
+        self,
+        options: FileDownloadOptions,
+        plan: BackendPlan,
+        *,
+        progress_callback: ProgressCallback | None,
+        max_output_bytes: int | None,
+        required_url_scope: str | None,
+        deadline: float | None,
+    ) -> DownloadResult:
+        attempts = max(1, options.max_tries or 1)
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._download_native(
+                    options,
+                    plan,
+                    progress_callback=progress_callback,
+                    max_output_bytes=max_output_bytes,
+                    required_url_scope=required_url_scope,
+                    deadline=deadline,
+                )
+            except Exception as exc:
+                if attempt >= attempts or not _native_failure_is_retryable(exc):
+                    raise
+                _require_native_deadline(deadline)
+                retry_wait = options.retry_wait or 0.0
+                if deadline is not None and time.monotonic() + retry_wait >= deadline:
+                    raise EngineError("Native download exceeded the mirror max runtime") from exc
+                _emit(
+                    progress_callback,
+                    ProgressEvent(
+                        engine=EngineKind.native,
+                        status="retrying",
+                        phase=ProgressPhase.download,
+                        kind=HubKind.file,
+                        filename=plan.output.name,
+                        url=options.url,
+                        message=f"retrying native download ({attempt + 1}/{attempts})",
+                    ),
+                )
+                if retry_wait:
+                    time.sleep(retry_wait)
+        raise AssertionError("native retry loop exhausted without returning or raising")
+
+    def download_with_verified_curl(
+        self,
+        options: FileDownloadOptions,
+        *,
+        output: Path | None = None,
+        progress_callback: ProgressCallback | None = None,
+        message: str,
+    ) -> DownloadResult:
+        """Retry a planned direct-file transfer with certificate-verifying curl."""
+
+        plan = self.plan(options)
+        if output is not None:
+            plan = BackendPlan(
+                backend=plan.backend,
+                args=plan.args,
+                output=output,
+                stats_files=plan.stats_files,
+                warnings=plan.warnings,
+            )
+        if not can_attempt_verified_curl_fallback(options, plan.output):
+            raise EngineError("Verified curl fallback is unsafe for these download options")
+        return self._download_with_verified_curl_fallback(
+            options,
+            plan,
+            progress_callback=progress_callback,
+            message=message,
+        )
 
     def _resolve_backend(
         self,
@@ -149,7 +259,8 @@ class FileDownloadEngine:
                     return FileBackendChoice.aria2
                 raise DependencyMissingError(
                     "aria2c is required for Metalink downloads. "
-                    "Install it with `brew install aria2` or pass --no-metalink."
+                    f"Install it with `{install_hint_for_tool('aria2c')}` or pass "
+                    "--no-metalink."
                 )
         if selected == FileBackendChoice.auto:
             return FileBackendChoice.aria2 if shutil.which("aria2c") else FileBackendChoice.native
@@ -157,13 +268,13 @@ class FileDownloadEngine:
             if dry_run:
                 return selected
             raise DependencyMissingError(
-                "aria2c is not installed. Install it with `brew install aria2`."
+                f"aria2c is not installed. Install it with `{install_hint_for_tool('aria2c')}`."
             )
         if selected == FileBackendChoice.wget2 and not shutil.which("wget2"):
             if dry_run:
                 return selected
             raise DependencyMissingError(
-                "wget2 is not installed. Install it with `brew install wget2`."
+                f"wget2 is not installed. Install it with `{install_hint_for_tool('wget2')}`."
             )
         return selected
 
@@ -363,7 +474,8 @@ class FileDownloadEngine:
             )
             _emit(progress_callback, event)
 
-        result = run_args_stream(plan.args, on_line=on_line, timeout=None)
+        args = self._aria2_args(options, plan.output)
+        result = run_args_stream(args, on_line=on_line, timeout=None)
         if result.returncode != 0:
             message = (
                 result.stderr or result.stdout
@@ -381,7 +493,9 @@ class FileDownloadEngine:
                 ),
             )
             raise EngineError(message)
-        downloaded = plan.output.stat().st_size if plan.output.exists() else None
+        if not _is_metalink_download(options):
+            _require_download_output(plan.output, backend="aria2c")
+        downloaded = plan.output.stat().st_size if plan.output.is_file() else None
         _emit(
             progress_callback,
             ProgressEvent(
@@ -455,6 +569,7 @@ class FileDownloadEngine:
                 ),
             )
             raise EngineError(message)
+        _require_download_output(plan.output, backend="wget2")
         _emit(
             progress_callback,
             ProgressEvent(
@@ -554,6 +669,7 @@ class FileDownloadEngine:
                 ),
             )
             raise EngineError(message)
+        _require_download_output(plan.output, backend="curl")
         _emit(
             progress_callback,
             ProgressEvent(
@@ -599,19 +715,30 @@ class FileDownloadEngine:
         plan: BackendPlan,
         *,
         progress_callback: ProgressCallback | None,
+        max_output_bytes: int | None = None,
+        required_url_scope: str | None = None,
+        deadline: float | None = None,
     ) -> DownloadResult:
         if _is_metalink_download(options):
             raise EngineError(
                 "Native file downloads cannot expand Metalink manifests. "
                 "Use --backend aria2 or pass --no-metalink to save the manifest itself."
             )
+        _require_native_deadline(deadline)
         plan.output.parent.mkdir(parents=True, exist_ok=True)
+        if required_url_scope is not None:
+            _exact_directory_relative_url_path(required_url_scope, options.url)
         resume_from = 0
-        open_mode = "wb"
+        resume_validator: tuple[str, str] | None = None
         probe = options.probe
         metadata = _read_http_metadata(plan.output)
         if plan.output.exists() and not options.overwrite:
             local_size = plan.output.stat().st_size
+            _require_output_within_byte_limit(
+                plan.output,
+                completed=local_size,
+                max_output_bytes=max_output_bytes,
+            )
             if options.timestamping and _local_file_is_current(plan.output, probe):
                 verify_checksum(plan.output, options.checksum)
                 _emit_native_skip(
@@ -626,43 +753,39 @@ class FileDownloadEngine:
                     message=f"Local file is current: {plan.output}",
                 )
             if options.timestamping:
-                open_mode = "wb"
+                resume_from = 0
             if not options.continue_download and not options.timestamping:
                 raise EngineError(f"Output file already exists: {plan.output}")
             if local_size > 0 and not options.timestamping:
-                if probe and probe.content_length is not None:
-                    if local_size == probe.content_length:
-                        verify_checksum(plan.output, options.checksum)
-                        _emit_native_skip(
-                            progress_callback,
-                            options,
-                            plan,
-                            message="file already complete",
-                        )
-                        return DownloadResult(
-                            status=DownloadStatus.skipped,
-                            url=options.url,
-                            message=f"Already complete: {plan.output}",
-                        )
-                    if local_size > probe.content_length:
-                        raise EngineError(
-                            f"Output file is larger than the remote file: {plan.output}"
-                        )
-                _require_native_resume_support(plan.output, probe)
-                resume_from = local_size
-                open_mode = "ab"
+                resume_validator = _native_resume_validator(metadata, probe)
+                if (
+                    probe
+                    and probe.content_length is not None
+                    and local_size == probe.content_length
+                    and resume_validator is not None
+                    and _probe_confirms_resume_validator(probe, resume_validator)
+                ):
+                    verify_checksum(plan.output, options.checksum)
+                    _emit_native_skip(
+                        progress_callback,
+                        options,
+                        plan,
+                        message="file already complete",
+                    )
+                    return DownloadResult(
+                        status=DownloadStatus.skipped,
+                        url=options.url,
+                        message=f"Already complete: {plan.output}",
+                    )
+                if resume_validator is not None and (
+                    not probe or probe.content_length is None or local_size < probe.content_length
+                ):
+                    _require_native_resume_support(plan.output, probe)
+                    resume_from = local_size
+                elif not probe or not getattr(probe, "probed", False):
+                    _require_native_resume_support(plan.output, probe)
 
-        headers = _native_request_headers(
-            options,
-            plan.output,
-            probe,
-            metadata,
-            resume_from=resume_from,
-        )
-        if resume_from:
-            headers["Range"] = f"bytes={resume_from}-"
         body = _request_body(options.body_data, options.body_file)
-        request = Request(options.url, data=body, headers=headers, method=options.method)
         started = time.monotonic()
         rate_limiter = _NativeRateLimiter.from_limit(options.rate_limit)
         _emit(
@@ -681,69 +804,138 @@ class FileDownloadEngine:
         response_headers: Mapping[str, str] = {}
         response_final_url: str | None = None
         total: int | None = None
-        completed = resume_from
+        completed = 0
         try:
             context = _native_ssl_context(options)
-            response_cm = (
-                urlopen(request, timeout=options.timeout)
-                if context is None
-                else urlopen(request, timeout=options.timeout, context=context)
-            )
-            with response_cm as response:
-                status = _response_status(response)
-                response_final_url = _response_url(response)
-                if resume_from and status != 206:
-                    raise EngineError(
-                        "Server did not honor the byte-range resume request; "
-                        "refusing to append a full response."
-                    )
-                remote_last_modified = response.headers.get("Last-Modified") or remote_last_modified
-                remote_etag = response.headers.get("ETag") or remote_etag
-                response_headers = dict(response.headers.items())
-                length_header = response.headers.get("Content-Length")
-                response_length = (
-                    int(length_header) if length_header and length_header.isdigit() else None
-                )
-                total = (
-                    probe.content_length
-                    if probe and probe.content_length is not None
-                    else (
-                        resume_from + response_length
-                        if resume_from and response_length is not None
-                        else response_length
-                    )
-                )
-                with plan.output.open(open_mode) as fh:
-                    while True:
-                        chunk = response.read(1024 * 256)
-                        if not chunk:
-                            break
-                        fh.write(chunk)
-                        completed += len(chunk)
-                        rate_limiter.throttle(len(chunk))
-                        if progress_callback:
-                            elapsed = max(time.monotonic() - started, 0.001)
-                            speed = (completed - resume_from) / elapsed
-                            eta = ((total - completed) / speed) if total and speed > 0 else None
-                            progress_callback(
-                                ProgressEvent(
-                                    engine=EngineKind.native,
-                                    status="downloading",
-                                    phase=ProgressPhase.download,
-                                    kind=HubKind.file,
-                                    filename=plan.output.name,
-                                    url=options.url,
-                                    downloaded_bytes=completed,
-                                    total_bytes=total,
-                                    speed_bytes_per_sec=speed,
-                                    eta_seconds=eta,
-                                )
-                            )
-                _assert_native_download_complete(
+            attempt_resume = resume_from > 0
+            while True:
+                _require_native_deadline(deadline)
+                requested_offset = resume_from if attempt_resume else 0
+                headers = _native_request_headers(
+                    options,
                     plan.output,
-                    completed=completed,
-                    total=total,
+                    probe,
+                    metadata,
+                    resume_from=requested_offset,
                 )
+                if requested_offset:
+                    headers["Range"] = f"bytes={requested_offset}-"
+                    assert resume_validator is not None
+                    headers["If-Range"] = resume_validator[1]
+                    headers["Accept-Encoding"] = "identity"
+                request = Request(options.url, data=body, headers=headers, method=options.method)
+                request_timeout = _native_request_timeout(options.timeout, deadline)
+                try:
+                    response_cm = (
+                        urlopen(request, timeout=request_timeout)
+                        if context is None
+                        else urlopen(request, timeout=request_timeout, context=context)
+                    )
+                except HTTPError as exc:
+                    if attempt_resume and exc.code in {412, 416}:
+                        attempt_resume = False
+                        continue
+                    raise
+                with response_cm as response:
+                    _require_native_deadline(deadline)
+                    status = _response_status(response)
+                    if (
+                        attempt_resume
+                        and status == 206
+                        and not _valid_resume_response(
+                            response.headers,
+                            offset=requested_offset,
+                            validator=resume_validator,
+                        )
+                    ):
+                        attempt_resume = False
+                        continue
+                    if attempt_resume and status not in {200, 206}:
+                        attempt_resume = False
+                        continue
+                    if not attempt_resume and status == 206:
+                        raise EngineError(
+                            "Server returned an unexpected partial response to a full request"
+                        )
+                    effective_offset = requested_offset if status == 206 else 0
+                    open_mode = "ab" if effective_offset else "wb"
+                    response_final_url = _response_url(response)
+                    if required_url_scope is not None and response_final_url is not None:
+                        _exact_directory_relative_url_path(
+                            required_url_scope,
+                            response_final_url,
+                        )
+                    remote_last_modified = (
+                        response.headers.get("Last-Modified") or remote_last_modified
+                    )
+                    remote_etag = response.headers.get("ETag") or remote_etag
+                    response_headers = dict(response.headers.items())
+                    length_header = response.headers.get("Content-Length")
+                    response_length = (
+                        int(length_header) if length_header and length_header.isdigit() else None
+                    )
+                    content_range_total = _content_range_total(
+                        response.headers.get("Content-Range")
+                    )
+                    total = (
+                        content_range_total
+                        if effective_offset and content_range_total is not None
+                        else (
+                            effective_offset + response_length
+                            if effective_offset and response_length is not None
+                            else response_length
+                        )
+                    )
+                    _require_output_within_byte_limit(
+                        plan.output,
+                        completed=total,
+                        max_output_bytes=max_output_bytes,
+                    )
+                    completed = effective_offset
+                    with plan.output.open(open_mode) as fh:
+                        while True:
+                            chunk = _read_native_chunk(
+                                response,
+                                size=1024 * 256,
+                                deadline=deadline,
+                            )
+                            if not chunk:
+                                break
+                            _require_output_within_byte_limit(
+                                plan.output,
+                                completed=completed + len(chunk),
+                                max_output_bytes=max_output_bytes,
+                            )
+                            fh.write(chunk)
+                            completed += len(chunk)
+                            rate_limiter.throttle(len(chunk), deadline=deadline)
+                            _require_native_deadline(deadline)
+                            if progress_callback:
+                                elapsed = max(time.monotonic() - started, 0.001)
+                                speed = (completed - effective_offset) / elapsed
+                                eta = (total - completed) / speed if total and speed > 0 else None
+                                progress_callback(
+                                    ProgressEvent(
+                                        engine=EngineKind.native,
+                                        status="downloading",
+                                        phase=ProgressPhase.download,
+                                        kind=HubKind.file,
+                                        filename=plan.output.name,
+                                        url=options.url,
+                                        downloaded_bytes=completed,
+                                        total_bytes=total,
+                                        speed_bytes_per_sec=speed,
+                                        eta_seconds=eta,
+                                    )
+                                )
+                    _assert_native_download_complete(
+                        plan.output,
+                        completed=completed,
+                        total=total,
+                    )
+                    if total is not None:
+                        response_headers["Content-Length"] = str(total)
+                    break
         except HTTPError as exc:
             if exc.code == 304 and options.timestamping:
                 _write_http_metadata(
@@ -823,6 +1015,20 @@ class SiteMirrorEngine:
         *,
         stats_dir: Path | None = None,
     ) -> BackendPlan:
+        if isinstance(options, DirectoryMirrorOptions) and options.exact_directory_index:
+            return BackendPlan(
+                backend="native-exact-index",
+                args=[
+                    "native-exact-index",
+                    options.url,
+                    "--files",
+                    str(len(options.exact_directory_items)),
+                    "--output-dir",
+                    str(options.output_dir),
+                ],
+                output=options.output_dir,
+                warnings=["Supported directory index; downloading its bounded exact file list."],
+            )
         backend = self._resolve_backend(options.backend, dry_run=options.dry_run)
         executable = shutil.which(backend.value) or backend.value
         is_wget2 = backend == SiteBackendChoice.wget2
@@ -841,9 +1047,7 @@ class SiteMirrorEngine:
                 args.append("--timestamping")
             if options.if_modified_since is not None:
                 args.append(
-                    "--if-modified-since"
-                    if options.if_modified_since
-                    else "--no-if-modified-since"
+                    "--if-modified-since" if options.if_modified_since else "--no-if-modified-since"
                 )
             args.append(f"--directory-prefix={options.output_dir}")
             if options.user_agent:
@@ -973,15 +1177,9 @@ class SiteMirrorEngine:
             args.append("--random-wait")
         if options.timestamping and not directory_wget2_baseline:
             args.append("--timestamping")
-        if (
-            is_wget2
-            and options.if_modified_since is not None
-            and not directory_wget2_baseline
-        ):
+        if is_wget2 and options.if_modified_since is not None and not directory_wget2_baseline:
             args.append(
-                "--if-modified-since"
-                if options.if_modified_since
-                else "--no-if-modified-since"
+                "--if-modified-since" if options.if_modified_since else "--no-if-modified-since"
             )
         if options.continue_download and not directory_wget2_baseline:
             args.append("--continue")
@@ -1055,6 +1253,8 @@ class SiteMirrorEngine:
                     "warnings": plan.warnings,
                 },
             )
+        execution_started = time.monotonic()
+        runtime_deadline = _mirror_runtime_deadline(options, execution_started)
         with tempfile.TemporaryDirectory(prefix="atlas-wget2-") as runtime_tmp:
             runtime_options = options
             if options.browser_cookies:
@@ -1067,8 +1267,19 @@ class SiteMirrorEngine:
                     Path(runtime_tmp),
                 )
                 runtime_options = options.model_copy(update={"load_cookies": cookies_path})
+            if (
+                isinstance(runtime_options, DirectoryMirrorOptions)
+                and runtime_options.exact_directory_index
+            ):
+                return self._mirror_exact_directory_index(
+                    runtime_options,
+                    progress_callback=progress_callback,
+                    control=control,
+                    deadline=runtime_deadline,
+                )
             plan = self.plan(runtime_options, stats_dir=Path(runtime_tmp))
             plan.output.mkdir(parents=True, exist_ok=True)
+            payload_before = _mirror_payload_snapshot(plan.output)
             engine_kind = EngineKind.wget if plan.backend == "wget" else EngineKind.wget2
             mirror_kind = _mirror_hub_kind(runtime_options)
             _emit(
@@ -1098,13 +1309,17 @@ class SiteMirrorEngine:
             try:
                 stream_kwargs: dict[str, Any] = {
                     "on_line": on_line,
-                    "timeout": runtime_options.max_runtime,
+                    "timeout": _mirror_runtime_remaining(
+                        runtime_options,
+                        runtime_deadline,
+                    ),
                 }
                 if control is not None:
                     stream_kwargs["control"] = control
                 result = run_args_stream(plan.args, **stream_kwargs)
             except ProcessCanceled as exc:
-                message = f"Mirror canceled: {exc.reason}"
+                stats = parse_wget2_stats_files(plan.stats_files or {})
+                message = _wget2_error_message(f"Mirror canceled: {exc.reason}", stats)
                 _emit(
                     progress_callback,
                     ProgressEvent(
@@ -1117,10 +1332,13 @@ class SiteMirrorEngine:
                         message=message,
                     ),
                 )
-                raise EngineError(message) from exc
+                raise MirrorDownloadError(message, stats=stats) from exc
             except subprocess.TimeoutExpired as exc:
                 stats = parse_wget2_stats_files(plan.stats_files or {})
-                message = f"Mirror stopped after max runtime of {exc.timeout:g} seconds."
+                message = _wget2_error_message(
+                    f"Mirror stopped after max runtime of {exc.timeout:g} seconds.",
+                    stats,
+                )
                 _emit(
                     progress_callback,
                     ProgressEvent(
@@ -1133,7 +1351,7 @@ class SiteMirrorEngine:
                         message=message,
                     ),
                 )
-                raise EngineError(message) from exc
+                raise MirrorDownloadError(message, stats=stats) from exc
             stats = parse_wget2_stats_files(plan.stats_files or {})
             if result.returncode != 0:
                 base_message = (
@@ -1152,30 +1370,298 @@ class SiteMirrorEngine:
                         message=message,
                     ),
                 )
-                raise EngineError(message)
+                raise MirrorDownloadError(message, stats=stats)
+            payload_after = _mirror_payload_snapshot(plan.output)
+            payload_required = not runtime_options.spider
+            if payload_required and not payload_after:
+                message = (
+                    f"{plan.backend} exited successfully but produced no downloaded payload "
+                    f"under {plan.output}"
+                )
+                _emit(
+                    progress_callback,
+                    ProgressEvent(
+                        engine=engine_kind,
+                        status="error",
+                        phase=ProgressPhase.error,
+                        kind=mirror_kind,
+                        filename=str(plan.output),
+                        url=runtime_options.url,
+                        message=message,
+                    ),
+                )
+                raise MirrorDownloadError(message, stats=stats)
+            no_change = (
+                payload_required and bool(payload_before) and payload_after == payload_before
+            )
             _emit(
                 progress_callback,
                 ProgressEvent(
                     engine=engine_kind,
-                    status="done",
+                    status="skipped" if no_change else "done",
                     phase=ProgressPhase.done,
                     kind=mirror_kind,
                     filename=str(plan.output),
                     url=runtime_options.url,
-                    message=f"{plan.backend} finished",
+                    message=(
+                        f"{plan.backend} found no remote changes"
+                        if no_change
+                        else f"{plan.backend} finished"
+                    ),
                 ),
             )
             return DownloadResult(
-                status=DownloadStatus.success,
+                status=DownloadStatus.skipped if no_change else DownloadStatus.success,
                 url=options.url,
-                message=f"Saved under {plan.output}",
+                message=(
+                    f"No remote changes under {plan.output}"
+                    if no_change
+                    else f"Saved under {plan.output}"
+                ),
                 ydl_opts={
                     "backend": plan.backend,
                     "output": str(plan.output),
                     "stats": stats,
                     "warnings": plan.warnings,
+                    "no_change": no_change,
+                    "payload_required": payload_required,
                 },
             )
+
+    def _mirror_exact_directory_index(
+        self,
+        options: DirectoryMirrorOptions,
+        *,
+        progress_callback: ProgressCallback | None,
+        control: ProcessControl | None,
+        deadline: float | None,
+    ) -> DownloadResult:
+        items = options.exact_directory_items
+        if not items:
+            raise MirrorDownloadError("Exact directory index contained no downloadable files")
+        base_url = options.exact_directory_base_url or options.url
+        _require_exact_directory_base_url(options.url, base_url)
+        if options.max_files is not None and len(items) > options.max_files:
+            raise MirrorDownloadError(
+                f"Exact directory index selected {len(items)} files, exceeding max-files "
+                f"{options.max_files}."
+            )
+        quota = _mirror_quota(options)
+        quota_bytes = _parse_byte_rate(quota)
+        if quota_bytes is not None:
+            if any(item.content_length is None for item in items):
+                raise MirrorDownloadError(
+                    "Exact directory index omitted one or more file sizes; "
+                    "the configured total-size limit cannot be guaranteed."
+                )
+            declared_bytes = sum(item.content_length or 0 for item in items)
+            if declared_bytes > quota_bytes:
+                raise MirrorDownloadError(
+                    f"Exact directory index selected {declared_bytes} bytes, exceeding "
+                    f"the configured total-size limit {quota}."
+                )
+        destinations: list[tuple[WorkItem, Path]] = []
+        reserved_files: set[tuple[str, ...]] = set()
+        reserved_directories: set[tuple[str, ...]] = set()
+        output_root = options.output_dir.resolve(strict=False)
+        for item in items:
+            safe_item_url = redact_url(item.url)
+            if item.external_host or not item.same_host or item.error is not None:
+                raise MirrorDownloadError(f"Unsafe directory index item refused: {safe_item_url}")
+            if item.kind == HubKind.dir:
+                raise MirrorDownloadError(
+                    f"Directory item reached exact file execution: {safe_item_url}"
+                )
+            url_relative = _safe_exact_directory_relative_path(
+                _exact_directory_relative_url_path(base_url, item.url).as_posix()
+            )
+            relative = _safe_exact_directory_relative_path(item.filename)
+            if relative != url_relative:
+                raise MirrorDownloadError(
+                    f"Directory index URL/output path mismatch: {safe_item_url}"
+                )
+            relative_key = tuple(
+                unicodedata.normalize("NFC", part).casefold() for part in relative.parts
+            )
+            ancestor_keys = {relative_key[:index] for index in range(1, len(relative_key))}
+            if (
+                relative_key in reserved_files
+                or relative_key in reserved_directories
+                or any(ancestor in reserved_files for ancestor in ancestor_keys)
+            ):
+                raise MirrorDownloadError(
+                    f"Directory entries collide as files and folders: {relative.as_posix()}"
+                )
+            reserved_files.add(relative_key)
+            reserved_directories.update(ancestor_keys)
+            destination = options.output_dir.joinpath(*relative.parts)
+            resolved_destination = destination.resolve(strict=False)
+            if not resolved_destination.is_relative_to(output_root):
+                raise MirrorDownloadError(
+                    f"Directory output path escapes through a symlink: {relative.as_posix()}"
+                )
+            destinations.append((item, destination))
+
+        if all(item.content_length is not None for item, _destination in destinations):
+            required_bytes = sum(
+                max(
+                    0,
+                    (item.content_length or 0)
+                    - (destination.stat().st_size if destination.is_file() else 0),
+                )
+                for item, destination in destinations
+            )
+            _require_free_space(
+                options.output_dir / ".atlas-capacity-check",
+                required_bytes=required_bytes,
+            )
+
+        rows: list[dict[str, object]] = []
+        downloaded = 0
+        skipped = 0
+        selected_bytes = 0
+        file_engine = FileDownloadEngine()
+        for item, destination in destinations:
+            safe_item_url = redact_url(item.url)
+            command = ["native-exact-index", safe_item_url]
+            if control is not None:
+                control.raise_if_canceled(command)
+            timeout = options.timeout if options.timeout and options.timeout > 0 else 30.0
+            if deadline is not None:
+                remaining = _mirror_runtime_remaining(options, deadline)
+                assert remaining is not None
+                timeout = min(timeout, remaining)
+            file_options = FileDownloadOptions(
+                url=item.url,
+                output_dir=destination.parent,
+                backend=FileBackendChoice.native,
+                filename=destination.name,
+                probe=DirectFileProbe(
+                    url=item.url,
+                    final_url=item.final_url,
+                    content_type=item.content_type,
+                    content_length=item.content_length,
+                    content_disposition=item.content_disposition,
+                    filename=destination.name,
+                    accept_ranges=item.accept_ranges,
+                    supports_ranges=item.supports_ranges,
+                    etag=item.etag,
+                    last_modified=item.last_modified,
+                    host=item.host,
+                    final_host=item.final_host,
+                    redirect_target=item.redirect_target,
+                    same_host=item.same_host,
+                    external_host=item.external_host,
+                    probed=item.probed,
+                    error=item.error,
+                ),
+                content_disposition=False,
+                timestamping=options.timestamping,
+                timeout=timeout,
+                overwrite=options.overwrite,
+                continue_download=options.continue_download,
+                rate_limit=options.limit_rate,
+                user_agent=options.user_agent,
+                headers=options.headers,
+                referer=options.referer,
+                compression=options.compression,
+                no_compression=options.no_compression,
+                load_cookies=options.load_cookies,
+                proxy=(options.proxy_url if options.proxy is not False else None),
+                max_tries=options.tries,
+                retry_wait=options.waitretry,
+                connect_timeout=options.connect_timeout,
+                http_user=options.http_user,
+                http_password=options.http_password,
+                check_certificate=options.check_certificate,
+                ca_certificate=options.ca_certificate,
+                ca_directory=options.ca_directory,
+                certificate=options.certificate,
+                private_key=options.private_key,
+                secure_protocol=options.secure_protocol,
+                quiet=options.quiet,
+                json_output=options.json_output,
+                progress_mode=options.progress_mode,
+                verbose=options.verbose,
+            )
+            remaining_quota = (
+                max(0, quota_bytes - selected_bytes) if quota_bytes is not None else None
+            )
+
+            def exact_progress(
+                event: ProgressEvent,
+                *,
+                _command: tuple[str, ...] = tuple(command),
+            ) -> None:
+                if control is not None:
+                    control.raise_if_canceled(_command)
+                if progress_callback is not None:
+                    progress_callback(
+                        event.model_copy(update={"url": redact_url(event.url)} if event.url else {})
+                    )
+                if control is not None:
+                    control.raise_if_canceled(_command)
+
+            try:
+                result = file_engine.download(
+                    file_options,
+                    progress_callback=exact_progress,
+                    max_output_bytes=remaining_quota,
+                    required_url_scope=base_url,
+                    deadline=deadline,
+                )
+            except ProcessCanceled as exc:
+                rows.append({"URL": safe_item_url, "Status": 499, "Error": exc.reason})
+                raise MirrorDownloadError(
+                    f"Mirror canceled: {exc.reason}",
+                    stats={"site": {"rows": rows}},
+                ) from exc
+            except Exception as exc:
+                safe_error = redact_text(str(exc))
+                rows.append({"URL": safe_item_url, "Status": 500, "Error": safe_error})
+                raise MirrorDownloadError(
+                    f"Exact directory file failed: {safe_item_url}: {safe_error}",
+                    stats={"site": {"rows": rows}},
+                ) from exc
+            _require_download_output(destination, backend="native exact-index")
+            selected_bytes += destination.stat().st_size
+            if quota_bytes is not None and selected_bytes > quota_bytes:
+                raise MirrorDownloadError(
+                    f"Exact directory output exceeded the configured total-size limit {quota}.",
+                    stats={"site": {"rows": rows}},
+                )
+            was_skipped = result.status == DownloadStatus.skipped
+            skipped += int(was_skipped)
+            downloaded += int(not was_skipped)
+            rows.append(
+                {
+                    "URL": safe_item_url,
+                    "Status": 304 if was_skipped else 200,
+                    "Local": str(destination),
+                }
+            )
+
+        message = (
+            f"Exact directory download complete: {downloaded} downloaded, "
+            f"{skipped} already current."
+        )
+        return DownloadResult(
+            status=DownloadStatus.success if downloaded else DownloadStatus.skipped,
+            url=options.url,
+            message=message,
+            ydl_opts={
+                "backend": "native-exact-index",
+                "output": str(options.output_dir),
+                "stats": {
+                    "summary": {
+                        "selected": len(items),
+                        "downloaded": downloaded,
+                        "skipped": skipped,
+                    },
+                    "site": {"rows": rows},
+                },
+            },
+        )
 
     def _resolve_backend(
         self,
@@ -1191,15 +1677,16 @@ class SiteMirrorEngine:
             if dry_run:
                 return SiteBackendChoice.wget2
             raise DependencyMissingError(
-                "wget2 or wget is not installed. Install wget2 with `brew install wget2` "
-                "or wget with `brew install wget`."
+                "wget2 or wget is not installed. Install wget2 with "
+                f"`{install_hint_for_tool('wget2')}` or wget with "
+                f"`{install_hint_for_tool('wget')}`."
             )
         if not shutil.which(selected.value):
             if dry_run:
                 return selected
             raise DependencyMissingError(
                 f"{selected.value} is not installed. "
-                f"Install it with `brew install {selected.value}`."
+                f"Install it with `{install_hint_for_tool(selected.value)}`."
             )
         return selected
 
@@ -1213,7 +1700,224 @@ def _safe_output_path(output_dir: Path, filename: str) -> Path:
     output = output_dir / safe_filename(filename, default="download")
     if output.is_symlink():
         raise EngineError(f"Refusing to write through symlink: {output}")
+    if output.exists() and not output.is_file():
+        raise EngineError(f"Output path is not a regular file: {output}")
     return output
+
+
+def _require_download_output(path: Path, *, backend: str) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise EngineError(
+            f"{backend} reported success but no regular output file was found: {path}"
+        )
+
+
+def _require_free_space(path: Path, *, required_bytes: int) -> None:
+    if required_bytes <= 0:
+        return
+    anchor = path.parent
+    while not anchor.exists() and anchor != anchor.parent:
+        anchor = anchor.parent
+    try:
+        free_bytes = shutil.disk_usage(anchor).free
+    except OSError:
+        return
+    if free_bytes < required_bytes:
+        raise EngineError(
+            f"Insufficient free space under {anchor}: need {_compact_bytes(required_bytes)}, "
+            f"have {_compact_bytes(free_bytes)}."
+        )
+
+
+def _require_output_within_byte_limit(
+    path: Path,
+    *,
+    completed: int | None,
+    max_output_bytes: int | None,
+) -> None:
+    if max_output_bytes is not None and completed is not None and completed > max_output_bytes:
+        raise EngineError(
+            f"Native download would exceed the {max_output_bytes}-byte output limit: {path}"
+        )
+
+
+def _require_native_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise EngineError("Native download exceeded the mirror max runtime")
+
+
+def _native_failure_is_retryable(error: BaseException) -> bool:
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, HTTPError):
+            return current.code in {408, 425, 429, 500, 502, 503, 504}
+        if isinstance(current, (URLError, TimeoutError, ConnectionError, ssl.SSLError)):
+            return True
+        current = current.__cause__ or current.__context__
+    return isinstance(error, EngineError) and str(error).startswith("Downloaded size mismatch")
+
+
+def _native_request_timeout(configured: float, deadline: float | None) -> float:
+    if deadline is None:
+        return configured
+    _require_native_deadline(deadline)
+    remaining = max(0.001, deadline - time.monotonic())
+    return min(configured, remaining) if configured > 0 else remaining
+
+
+def _read_native_chunk(response: object, *, size: int, deadline: float | None) -> bytes:
+    _require_native_deadline(deadline)
+    if deadline is not None:
+        remaining = max(0.001, deadline - time.monotonic())
+        for attributes in (
+            ("fp", "raw", "_sock"),
+            ("fp", "fp", "raw", "_sock"),
+            ("raw", "_sock"),
+        ):
+            socket_object = response
+            for attribute in attributes:
+                socket_object = getattr(socket_object, attribute, None)
+                if socket_object is None:
+                    break
+            settimeout = getattr(socket_object, "settimeout", None)
+            if callable(settimeout):
+                settimeout(remaining)
+                break
+    read = getattr(response, "read1", None)
+    if not callable(read):
+        read = response.read  # type: ignore[attr-defined]
+    chunk = read(size)
+    _require_native_deadline(deadline)
+    return bytes(chunk)
+
+
+def _mirror_runtime_deadline(
+    options: SiteDownloadOptions,
+    execution_started: float,
+) -> float | None:
+    if options.max_runtime is None:
+        return None
+    budget = options.max_runtime - options.planning_runtime_seconds
+    if budget <= 0:
+        raise MirrorDownloadError(
+            f"Mirror stopped after max runtime of {options.max_runtime:g} seconds; "
+            "discovery used the available budget."
+        )
+    return execution_started + budget
+
+
+def _mirror_runtime_remaining(
+    options: SiteDownloadOptions,
+    deadline: float | None,
+) -> float | None:
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        configured = options.max_runtime or 0
+        raise MirrorDownloadError(f"Mirror stopped after max runtime of {configured:g} seconds.")
+    return remaining
+
+
+def _directory_url_components(
+    value: str,
+) -> tuple[str, str, int, bool, tuple[str, ...]]:
+    parsed = urlparse(value)
+    scheme = parsed.scheme.casefold()
+    if (
+        scheme not in {"http", "https"}
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise MirrorDownloadError(f"Unsafe directory index URL refused: {redact_url(value)}")
+    try:
+        explicit_port = parsed.port is not None
+        port = parsed.port or (443 if scheme == "https" else 80)
+        host = parsed.hostname.rstrip(".").encode("idna").decode("ascii").casefold()
+    except (UnicodeError, ValueError) as exc:
+        raise MirrorDownloadError(
+            f"Unsafe directory index URL refused: {redact_url(value)}"
+        ) from exc
+    path_parts: list[str] = []
+    for raw_part in parsed.path.split("/"):
+        if not raw_part:
+            continue
+        if re.search(r"%(?![0-9A-Fa-f]{2})", raw_part):
+            raise MirrorDownloadError(f"Unsafe directory index URL refused: {redact_url(value)}")
+        part = raw_part
+        for _ in range(8):
+            if re.search(r"%[0-9A-Fa-f]{2}", part) is None:
+                break
+            decoded = unquote(part)
+            if decoded == part:
+                break
+            part = decoded
+        else:
+            if re.search(r"%[0-9A-Fa-f]{2}", part):
+                raise MirrorDownloadError(
+                    f"Unsafe directory index URL refused: {redact_url(value)}"
+                )
+        part = unicodedata.normalize("NFC", part)
+        if (
+            part in {".", ".."}
+            or "/" in part
+            or "\\" in part
+            or any(ord(char) < 32 or ord(char) == 127 for char in part)
+        ):
+            raise MirrorDownloadError(f"Unsafe directory index URL refused: {redact_url(value)}")
+        path_parts.append(part)
+    return scheme, host, port, explicit_port, tuple(path_parts)
+
+
+def _require_exact_directory_base_url(requested_url: str, base_url: str) -> None:
+    requested = _directory_url_components(requested_url)
+    base = _directory_url_components(base_url)
+    same_default_port_upgrade = (
+        requested[0] == "http" and base[0] == "https" and not requested[3] and not base[3]
+    )
+    if (
+        requested[1] != base[1]
+        or requested[4] != base[4]
+        or ((requested[0], requested[2]) != (base[0], base[2]) and not same_default_port_upgrade)
+    ):
+        raise MirrorDownloadError("Resolved directory index escaped the requested origin or folder")
+
+
+def _exact_directory_relative_url_path(base_url: str, item_url: str) -> PurePosixPath:
+    base = _directory_url_components(base_url)
+    item = _directory_url_components(item_url)
+    if (base[0], base[1], base[2]) != (item[0], item[1], item[2]):
+        raise MirrorDownloadError(
+            f"Directory index item escaped the requested origin: {redact_url(item_url)}"
+        )
+    base_parts = base[4]
+    item_parts = item[4]
+    if item_parts[: len(base_parts)] != base_parts or len(item_parts) <= len(base_parts):
+        raise MirrorDownloadError(
+            f"Directory index item escaped the requested folder: {redact_url(item_url)}"
+        )
+    return PurePosixPath(*item_parts[len(base_parts) :])
+
+
+def _safe_exact_directory_relative_path(value: str | None) -> PurePosixPath:
+    if not value:
+        raise MirrorDownloadError("Directory index item has no relative output path")
+    candidate = PurePosixPath(value)
+    if candidate.is_absolute() or not candidate.parts:
+        raise MirrorDownloadError("Directory index item has an unsafe absolute output path")
+    safe_parts: list[str] = []
+    for part in candidate.parts:
+        if (
+            part in {"", ".", ".."}
+            or "\\" in part
+            or any(ord(char) < 32 or ord(char) == 127 for char in part)
+        ):
+            raise MirrorDownloadError("Directory index item has an unsafe output path")
+        safe_parts.append(safe_filename(unicodedata.normalize("NFC", part)))
+    return PurePosixPath(*safe_parts)
 
 
 def parse_checksum(value: str | None) -> tuple[str, str] | None:
@@ -1249,6 +1953,26 @@ def parse_wget2_stats_files(files: Mapping[str, Path]) -> dict[str, Any]:
     if summary:
         parsed["summary"] = summary
     return parsed
+
+
+def _mirror_payload_snapshot(root: Path) -> dict[str, tuple[int, int]]:
+    """Snapshot user payload while excluding Atlas runtime artifacts."""
+
+    snapshot: dict[str, tuple[int, int]] = {}
+    if not root.exists():
+        return snapshot
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root)
+        if ".atlas" in relative.parts or path.name.endswith(".atlas-http.json"):
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        snapshot[str(relative)] = (stat.st_size, stat.st_mtime_ns)
+    return snapshot
 
 
 def _wget2_error_message(base_message: str, stats: Mapping[str, Any]) -> str:
@@ -1404,8 +2128,19 @@ def _curl_file_args(curl: str, options: FileDownloadOptions, output: Path) -> li
         "--output",
         str(output),
     ]
-    if options.continue_download and output.exists() and output.stat().st_size > 0:
-        args.extend(["--continue-at", "-"])
+    resume_validator: tuple[str, str] | None = None
+    if (
+        options.continue_download
+        and not options.overwrite
+        and output.exists()
+        and output.stat().st_size > 0
+    ):
+        resume_validator = _native_resume_validator(
+            _read_http_metadata(output),
+            options.probe,
+        )
+        if resume_validator is not None:
+            args.extend(["--continue-at", "-"])
     if options.timeout:
         args.extend(["--max-time", f"{options.timeout:g}"])
     if options.connect_timeout is not None:
@@ -1418,6 +2153,8 @@ def _curl_file_args(curl: str, options: FileDownloadOptions, output: Path) -> li
         args.extend(["--referer", options.referer])
     for header in options.headers:
         args.extend(["--header", header])
+    if resume_validator is not None:
+        args.extend(["--header", f"If-Range: {resume_validator[1]}"])
     if options.cache is False:
         args.extend(["--header", "Cache-Control: no-cache"])
     if options.no_compression:
@@ -1590,14 +2327,17 @@ class _NativeRateLimiter:
     def from_limit(cls, value: str | None) -> _NativeRateLimiter:
         return cls(_parse_byte_rate(value))
 
-    def throttle(self, chunk_size: int) -> None:
+    def throttle(self, chunk_size: int, *, deadline: float | None = None) -> None:
         if not self._bytes_per_second:
             return
         self._transferred += chunk_size
         target_elapsed = self._transferred / self._bytes_per_second
         actual_elapsed = time.monotonic() - self._started
         if target_elapsed > actual_elapsed:
-            time.sleep(target_elapsed - actual_elapsed)
+            delay = target_elapsed - actual_elapsed
+            if deadline is not None and time.monotonic() + delay >= deadline:
+                raise EngineError("Native download exceeded the mirror max runtime")
+            time.sleep(delay)
 
 
 def _parse_byte_rate(value: str | None) -> int | None:
@@ -2061,6 +2801,72 @@ def _require_native_resume_support(path: Path, probe: object | None) -> None:
             f"Cannot resume {path}: server did not advertise byte-range support. "
             "Remove the partial file or pass --overwrite."
         )
+
+
+def _native_resume_validator(
+    metadata: Mapping[str, str],
+    probe: object | None,
+) -> tuple[str, str] | None:
+    """Return a validator only when stored and freshly probed identity agree."""
+
+    for metadata_key, probe_key in (
+        ("etag", "etag"),
+        ("last_modified", "last_modified"),
+    ):
+        stored = metadata.get(metadata_key)
+        current = str(getattr(probe, probe_key, "") or "")
+        if not stored:
+            continue
+        if metadata_key == "etag" and stored.lstrip().startswith("W/"):
+            continue
+        if current and current != stored:
+            return None
+        return metadata_key, stored
+    return None
+
+
+def _probe_confirms_resume_validator(
+    probe: object,
+    validator: tuple[str, str],
+) -> bool:
+    probe_key = "etag" if validator[0] == "etag" else "last_modified"
+    return str(getattr(probe, probe_key, "") or "") == validator[1]
+
+
+_CONTENT_RANGE_PATTERN = re.compile(r"^bytes\s+(\d+)-(\d+)/(\d+|\*)$", re.IGNORECASE)
+
+
+def _valid_resume_response(
+    headers: Mapping[str, str],
+    *,
+    offset: int,
+    validator: tuple[str, str] | None,
+) -> bool:
+    header_map = _casefold_headers(headers)
+    match = _CONTENT_RANGE_PATTERN.fullmatch(header_map.get("content-range", "").strip())
+    if match is None or int(match.group(1)) != offset:
+        return False
+    end = int(match.group(2))
+    if end < offset:
+        return False
+    length = header_map.get("content-length", "")
+    if length.isdigit() and int(length) != end - offset + 1:
+        return False
+    if match.group(3) != "*" and int(match.group(3)) <= end:
+        return False
+    if validator is None:
+        return False
+    validator_header = "etag" if validator[0] == "etag" else "last-modified"
+    return header_map.get(validator_header) == validator[1]
+
+
+def _content_range_total(value: str | None) -> int | None:
+    if not value:
+        return None
+    match = _CONTENT_RANGE_PATTERN.fullmatch(value.strip())
+    if match is None or match.group(3) == "*":
+        return None
+    return int(match.group(3))
 
 
 def _local_file_is_current(path: Path, probe: object | None) -> bool:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from atlas.theme import (
     ATLAS_PROGRESS_MIRROR_STYLE,
     ATLAS_PROGRESS_SHIMMER_STYLE,
@@ -215,9 +217,7 @@ def test_smart_session_narrow_layout_stacks_work_and_shrinks_metrics() -> None:
             width=48,
         )
         progress = view.render_to_text(
-            view.progress_panel(
-                metrics=(ProgressMetric("Download", 31, "622 files", "file"),)
-            ),
+            view.progress_panel(metrics=(ProgressMetric("Download", 31, "622 files", "file"),)),
             width=48,
         )
 
@@ -229,6 +229,32 @@ def test_smart_session_narrow_layout_stacks_work_and_shrinks_metrics() -> None:
         assert "Download" in progress
         assert "622 files" in progress
         assert max(len(line) for line in (work + progress).splitlines()) <= 48
+    finally:
+        _restore_visuals()
+
+
+@pytest.mark.parametrize("width", [20, 24])
+def test_header_card_stacks_narrow_fields_without_dropping_safety(width: int) -> None:
+    try:
+        configure_visuals(color=False, unicode=False, motion=False, env={})
+        view = SmartSessionView(title="atlas", width=width)
+
+        rendered = view.render_to_text(
+            view.header_card(
+                heading="Download",
+                fields=(
+                    ViewField("Source", "example.com"),
+                    ViewField("Safety", "single-host no-parent bounded"),
+                ),
+            ),
+            width=width,
+        )
+
+        assert "Safety" in rendered
+        assert "single-host" in rendered
+        assert "no-parent" in rendered
+        assert "bounded" in rendered
+        assert max(len(line) for line in rendered.splitlines()) <= width
     finally:
         _restore_visuals()
 
