@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/xkam7ar/atlas/security/advisories/new
+    about: Report vulnerabilities privately. Do not disclose security details in an issue.
+  - name: Support and usage questions
+    url: https://github.com/xkam7ar/atlas/blob/main/SUPPORT.md
+    about: Read the support policy before opening an issue.

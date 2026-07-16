@@ -1,0 +1,534 @@
+"""Shared HTTP fetch helpers for scan/probe code."""
+
+from __future__ import annotations
+
+import ssl
+import tempfile
+import zlib
+from base64 import b64encode
+from collections.abc import Callable
+from dataclasses import dataclass
+from enum import StrEnum
+from http.cookiejar import MozillaCookieJar
+from pathlib import Path
+from shutil import which
+from subprocess import TimeoutExpired
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import unquote, urlsplit
+from urllib.request import (
+    HTTPCookieProcessor,
+    HTTPRedirectHandler,
+    HTTPSHandler,
+    ProxyHandler,
+    Request,
+    build_opener,
+    urlopen,
+)
+
+from atlas.models import ScanErrorCode
+from atlas.redaction import is_sensitive_header, text_contains_secret
+from atlas.runner import run_args
+
+
+class FetchErrorCode(StrEnum):
+    tls_cert_verify_failed = "tls_cert_verify_failed"
+    timeout = "timeout"
+    connection_failed = "connection_failed"
+    http_error = "http_error"
+
+
+@dataclass(frozen=True)
+class FetchOptions:
+    timeout: float = 30.0
+    user_agent: str = "atlas/0.1"
+    verify_tls: bool = True
+    ca_bundle: Path | None = None
+    proxy: str | None = None
+    headers: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class FetchResponse:
+    url: str
+    final_url: str
+    status_code: int
+    headers: dict[str, str]
+    body: bytes
+    warnings: tuple[str, ...] = ()
+    body_truncated: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "headers", _normalize_response_headers(self.headers))
+
+
+@dataclass(frozen=True)
+class FetchFailure:
+    code: FetchErrorCode
+    message: str
+    url: str
+    recoverable: bool = True
+    status_code: int | None = None
+
+
+class FetchError(RuntimeError):
+    """Raised when Atlas cannot fetch a URL for lightweight scanning."""
+
+    def __init__(self, failure: FetchFailure) -> None:
+        self.failure = failure
+        super().__init__(failure.message)
+
+
+class _ValidatingRedirectHandler(HTTPRedirectHandler):
+    """Validate every redirect target before urllib is allowed to contact it."""
+
+    def __init__(self, validator: Callable[[str], None]) -> None:
+        super().__init__()
+        self._validator = validator
+
+    def redirect_request(
+        self,
+        req: Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> Request | None:
+        self._validator(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class FetchClient:
+    """Small verified HTTP client with safe backend fallback for scanner fetches."""
+
+    def get(
+        self,
+        url: str,
+        options: FetchOptions | None = None,
+        *,
+        fallback_tools: bool = False,
+    ) -> FetchResponse:
+        return self.request(url, options, method="GET", fallback_tools=fallback_tools)
+
+    def head(
+        self,
+        url: str,
+        options: FetchOptions | None = None,
+    ) -> FetchResponse:
+        return self.request(url, options, method="HEAD", body_limit=0)
+
+    def request(
+        self,
+        url: str,
+        options: FetchOptions | None = None,
+        *,
+        method: str = "GET",
+        fallback_tools: bool = False,
+        extra_headers: dict[str, str] | None = None,
+        body_limit: int = 512 * 1024,
+    ) -> FetchResponse:
+        opts = options or FetchOptions()
+        try:
+            return self._request_urllib(
+                url,
+                opts,
+                method=method,
+                extra_headers=extra_headers,
+                body_limit=body_limit,
+            )
+        except FetchError as exc:
+            if (
+                fallback_tools
+                and method.upper() == "GET"
+                and exc.failure.code == FetchErrorCode.tls_cert_verify_failed
+            ):
+                fallback = self._get_with_tool(url, opts, body_limit=body_limit)
+                if fallback is not None:
+                    return FetchResponse(
+                        url=fallback.url,
+                        final_url=fallback.final_url,
+                        status_code=fallback.status_code,
+                        headers=fallback.headers,
+                        body=fallback.body,
+                        warnings=("Python TLS verification failed; scanned using curl fallback.",),
+                        body_truncated=fallback.body_truncated,
+                    )
+            raise
+
+    def _request_urllib(
+        self,
+        url: str,
+        options: FetchOptions,
+        *,
+        method: str,
+        extra_headers: dict[str, str] | None,
+        body_limit: int,
+    ) -> FetchResponse:
+        headers = _request_headers(options)
+        if extra_headers:
+            headers.update(extra_headers)
+        request = redirect_safe_request(url, headers=headers, method=method.upper())
+        try:
+            with open_request(
+                request,
+                timeout=options.timeout,
+                context=_ssl_context(options),
+                proxy=options.proxy,
+            ) as response:
+                raw_body = response.read(body_limit + 1) if body_limit > 0 else b""
+                response_headers = dict(response.headers.items())
+                body = raw_body[:body_limit] if body_limit > 0 else b""
+                body, decoding_truncated = _decode_response_body(
+                    body,
+                    response_headers,
+                    body_limit=body_limit,
+                )
+                return FetchResponse(
+                    url=url,
+                    final_url=response.geturl(),
+                    status_code=getattr(response, "status", 200),
+                    headers=response_headers,
+                    body=body,
+                    body_truncated=(
+                        body_limit > 0 and (len(raw_body) > body_limit or decoding_truncated)
+                    ),
+                )
+        except HTTPError as exc:
+            failure = FetchFailure(
+                code=FetchErrorCode.http_error,
+                message=f"HTTP {exc.code}: {exc.reason}",
+                url=url,
+                recoverable=exc.code >= 500 or exc.code in {408, 429},
+                status_code=exc.code,
+            )
+            exc.close()
+            raise FetchError(failure) from exc
+        except TimeoutError as exc:
+            raise FetchError(
+                FetchFailure(
+                    code=FetchErrorCode.timeout,
+                    message=str(exc) or "timed out",
+                    url=url,
+                )
+            ) from exc
+        except URLError as exc:
+            raise FetchError(_failure_from_url_error(url, exc)) from exc
+        except OSError as exc:
+            raise FetchError(
+                FetchFailure(
+                    code=FetchErrorCode.connection_failed,
+                    message=str(exc),
+                    url=url,
+                )
+            ) from exc
+
+    def _get_with_tool(
+        self,
+        url: str,
+        options: FetchOptions,
+        *,
+        body_limit: int,
+    ) -> FetchResponse | None:
+        curl = which("curl")
+        if curl is None:
+            return None
+        return _fetch_with_curl(curl, url, options, body_limit=body_limit)
+
+
+def scan_error_code_from_fetch(code: FetchErrorCode) -> ScanErrorCode:
+    if code == FetchErrorCode.tls_cert_verify_failed:
+        return ScanErrorCode.tls_failed
+    if code == FetchErrorCode.timeout:
+        return ScanErrorCode.timeout
+    if code == FetchErrorCode.http_error:
+        return ScanErrorCode.http_error
+    return ScanErrorCode.connection_failed
+
+
+def _ssl_context(options: FetchOptions) -> ssl.SSLContext | None:
+    if not options.verify_tls:
+        return ssl._create_unverified_context()
+    cafile = str(options.ca_bundle) if options.ca_bundle else _certifi_bundle()
+    return ssl.create_default_context(cafile=cafile)
+
+
+def _certifi_bundle() -> str | None:
+    try:
+        import certifi
+    except ImportError:
+        return None
+    return certifi.where()
+
+
+def _request_headers(options: FetchOptions) -> dict[str, str]:
+    headers = {"User-Agent": options.user_agent}
+    for raw in options.headers:
+        key, separator, value = raw.partition(":")
+        if separator:
+            headers[key.strip()] = value.strip()
+    return headers
+
+
+def redirect_safe_request(
+    url: str,
+    *,
+    headers: dict[str, str],
+    method: str,
+    data: bytes | None = None,
+) -> Request:
+    """Build a request whose private headers apply only to the first hop."""
+
+    def initial_hop_only(name: str, value: str) -> bool:
+        return (
+            is_sensitive_header(name)
+            or name.strip().casefold() == "referer"
+            or text_contains_secret(value)
+        )
+
+    ordinary = {name: value for name, value in headers.items() if not initial_hop_only(name, value)}
+    request = Request(url, data=data, headers=ordinary, method=method)
+    for name, value in headers.items():
+        if initial_hop_only(name, value):
+            request.add_unredirected_header(name, value)
+    return request
+
+
+def open_request(
+    request: Request,
+    *,
+    timeout: float,
+    context: ssl.SSLContext | None = None,
+    proxy: str | None = None,
+    cookie_file: Path | None = None,
+    redirect_validator: Callable[[str], None] | None = None,
+) -> Any:
+    """Open one request with an explicit proxy when configured."""
+
+    handlers: list[Any] = []
+    if proxy:
+        parsed_proxy = urlsplit(proxy if "://" in proxy else f"http://{proxy}")
+        if not parsed_proxy.hostname:
+            raise ValueError("Explicit proxy must include a hostname")
+        proxy_host = parsed_proxy.hostname
+        if ":" in proxy_host and not proxy_host.startswith("["):
+            proxy_host = f"[{proxy_host}]"
+        if parsed_proxy.port is not None:
+            proxy_host = f"{proxy_host}:{parsed_proxy.port}"
+        request.set_proxy(proxy_host, parsed_proxy.scheme or "http")
+        if parsed_proxy.username is not None:
+            credential = f"{unquote(parsed_proxy.username)}:{unquote(parsed_proxy.password or '')}"
+            request.add_unredirected_header(
+                "Proxy-Authorization",
+                f"Basic {b64encode(credential.encode('utf-8')).decode('ascii')}",
+            )
+        # The Request is already bound to the configured proxy.  An empty
+        # handler prevents environment proxies and NO_PROXY from changing that
+        # explicit choice.
+        handlers.append(ProxyHandler({}))
+    if cookie_file is not None:
+        cookie_jar = MozillaCookieJar(str(cookie_file))
+        cookie_jar.load(ignore_discard=True, ignore_expires=True)
+        handlers.append(HTTPCookieProcessor(cookie_jar))
+    if redirect_validator is not None:
+        handlers.append(_ValidatingRedirectHandler(redirect_validator))
+    if handlers:
+        handlers.append(HTTPSHandler(context=context))
+        opener = build_opener(*handlers)
+        return opener.open(request, timeout=timeout)
+    return urlopen(request, timeout=timeout, context=context)
+
+
+def _decode_response_body(
+    body: bytes,
+    headers: dict[str, str],
+    *,
+    body_limit: int,
+) -> tuple[bytes, bool]:
+    """Decode common HTTP content encodings without exceeding the scan body limit."""
+
+    if not body or body_limit <= 0:
+        return body, False
+    content_encoding = next(
+        (value for name, value in headers.items() if name.casefold() == "content-encoding"),
+        "",
+    )
+    encodings = [value.strip().casefold() for value in content_encoding.split(",")]
+    encodings = [value for value in encodings if value and value != "identity"]
+    if len(encodings) != 1:
+        return body, False
+    encoding = encodings[0]
+    if encoding in {"gzip", "x-gzip"}:
+        try:
+            return _decompress_response_body(
+                body,
+                body_limit=body_limit,
+                wbits=16 + zlib.MAX_WBITS,
+            )
+        except zlib.error:
+            return body, False
+    if encoding == "deflate":
+        try:
+            return _decompress_response_body(body, body_limit=body_limit, wbits=zlib.MAX_WBITS)
+        except zlib.error:
+            try:
+                return _decompress_response_body(
+                    body,
+                    body_limit=body_limit,
+                    wbits=-zlib.MAX_WBITS,
+                )
+            except zlib.error:
+                return body, False
+    return body, False
+
+
+def _decompress_response_body(
+    body: bytes,
+    *,
+    body_limit: int,
+    wbits: int,
+) -> tuple[bytes, bool]:
+    decompressor = zlib.decompressobj(wbits)
+    decoded = decompressor.decompress(body, body_limit + 1)
+    remaining = body_limit + 1 - len(decoded)
+    if remaining > 0:
+        decoded += decompressor.flush(remaining)
+    truncated = (
+        len(decoded) > body_limit or bool(decompressor.unconsumed_tail) or not decompressor.eof
+    )
+    return decoded[:body_limit], truncated
+
+
+def _normalize_response_headers(headers: dict[str, str]) -> dict[str, str]:
+    normalized: dict[str, str] = {}
+    for raw_name, value in headers.items():
+        name = raw_name.strip()
+        if not name:
+            continue
+        canonical = "-".join(part.capitalize() for part in name.split("-"))
+        if name.casefold() == "etag":
+            canonical = "ETag"
+        normalized[canonical] = value
+    return normalized
+
+
+def _failure_from_url_error(url: str, exc: URLError) -> FetchFailure:
+    if _is_tls_certificate_error(exc):
+        return FetchFailure(
+            code=FetchErrorCode.tls_cert_verify_failed,
+            message="TLS certificate verification failed",
+            url=url,
+            recoverable=True,
+        )
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, TimeoutError):
+        return FetchFailure(code=FetchErrorCode.timeout, message=str(reason), url=url)
+    return FetchFailure(
+        code=FetchErrorCode.connection_failed,
+        message=str(reason or exc),
+        url=url,
+    )
+
+
+def _is_tls_certificate_error(exc: BaseException) -> bool:
+    reason = getattr(exc, "reason", None)
+    return (
+        isinstance(reason, ssl.SSLCertVerificationError)
+        or (isinstance(reason, ssl.SSLError) and "CERTIFICATE_VERIFY_FAILED" in str(reason))
+        or "CERTIFICATE_VERIFY_FAILED" in str(exc)
+    )
+
+
+def _fetch_with_curl(
+    curl: str,
+    url: str,
+    options: FetchOptions,
+    *,
+    body_limit: int,
+) -> FetchResponse | None:
+    with tempfile.TemporaryDirectory(prefix="atlas-fetch-") as tmp:
+        tmp_path = Path(tmp)
+        header_path = tmp_path / "headers.txt"
+        body_path = tmp_path / "body.bin"
+        command = [
+            curl,
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--max-time",
+            str(max(1, int(options.timeout))),
+            "--user-agent",
+            options.user_agent,
+            "--dump-header",
+            str(header_path),
+            "--output",
+            str(body_path),
+            "--write-out",
+            "%{url_effective}\n%{http_code}",
+        ]
+        for raw in options.headers:
+            command.extend(["--header", raw])
+        if body_limit > 0:
+            command.extend(
+                [
+                    "--range",
+                    f"0-{body_limit}",
+                    "--max-filesize",
+                    str(body_limit + 1),
+                ]
+            )
+        if options.proxy:
+            command.extend(["--proxy", options.proxy])
+        command.append(url)
+        try:
+            result = run_args(command, timeout=options.timeout + 5)
+        except (OSError, TimeoutExpired):
+            return None
+        # curl exits 63 when --max-filesize stops a server that ignored Range.
+        # Preserve a bounded partial response so callers can reject it as truncated.
+        if result.returncode not in {0, 63}:
+            return None
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        final_url = lines[-2] if len(lines) >= 2 else url
+        try:
+            status_code = int(lines[-1]) if lines else 200
+        except ValueError:
+            status_code = 200
+        if body_path.exists() and body_limit > 0:
+            with body_path.open("rb") as body_file:
+                raw_body = body_file.read(body_limit + 1)
+        else:
+            raw_body = b""
+        response_headers = (
+            _parse_curl_headers(header_path.read_text(encoding="utf-8", errors="replace"))
+            if header_path.exists()
+            else {}
+        )
+        body = raw_body[:body_limit] if body_limit > 0 else b""
+        body, decoding_truncated = _decode_response_body(
+            body,
+            response_headers,
+            body_limit=body_limit,
+        )
+        return FetchResponse(
+            url=url,
+            final_url=final_url,
+            status_code=status_code,
+            headers=response_headers,
+            body=body,
+            body_truncated=(
+                body_limit > 0
+                and (result.returncode == 63 or len(raw_body) > body_limit or decoding_truncated)
+            ),
+        )
+
+
+def _parse_curl_headers(text: str) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    blocks = [block for block in text.replace("\r\n", "\n").split("\n\n") if block.strip()]
+    for line in (blocks[-1] if blocks else "").splitlines()[1:]:
+        key, separator, value = line.partition(":")
+        if separator:
+            headers[key.strip()] = value.strip()
+    return headers

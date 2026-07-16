@@ -1,0 +1,92 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "atlas"
+version = "0.1.0"
+description = "Intent-first download manager for media, files, batches, and mirrors."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+authors = [{ name = "atlas contributors" }]
+keywords = ["yt-dlp", "download-manager", "aria2", "wget2", "cli", "macos", "linux"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Multimedia :: Video",
+]
+dependencies = [
+  "certifi>=2024.8",
+  "mutagen>=1.47",
+  "platformdirs>=4.2",
+  "pydantic>=2.7",
+  "pydantic-settings>=2.14.2",
+  "questionary>=2.0",
+  "rich>=13.7",
+  "typer>=0.15.4",
+  "yt-dlp>=2026.6.9",
+]
+
+[project.urls]
+Homepage = "https://github.com/xkam7ar/atlas"
+Repository = "https://github.com/xkam7ar/atlas"
+Issues = "https://github.com/xkam7ar/atlas/issues"
+Changelog = "https://github.com/xkam7ar/atlas/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+interactive = ["questionary>=2.0"]
+dev = [
+  "mypy>=1.10",
+  "pytest>=8.2",
+  "ruff>=0.8",
+]
+
+[dependency-groups]
+dev = [
+  "mypy>=1.10",
+  "pytest>=8.2",
+  "ruff>=0.8",
+]
+
+[project.scripts]
+atlas = "atlas.cli:app"
+
+[tool.hatch.build]
+# The local codebase graph is a development aid, never a distributable asset.
+exclude = ["/.codebase-memory"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/atlas"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4", "SIM", "RUF"]
+ignore = ["B008"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_configs = true
+packages = ["atlas"]
+
+[[tool.mypy.overrides]]
+module = ["yt_dlp", "yt_dlp.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+  "integration: tests that exercise optional external downloader binaries",
+]

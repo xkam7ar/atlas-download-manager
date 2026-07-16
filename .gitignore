@@ -1,0 +1,15 @@
+.venv/
+# macOS Finder metadata
+.DS_Store
+.AppleDouble
+._*
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.coverage
+.codebase-memory/
+dist/
+build/
+*.egg-info/

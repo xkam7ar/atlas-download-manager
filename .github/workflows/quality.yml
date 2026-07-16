@@ -1,0 +1,175 @@
+name: Quality
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_NO_PROGRESS: "1"
+  UV_VERSION: "0.11.29"
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install locked dependencies
+        run: uv sync --locked --group dev
+      - name: Lint
+        run: uv run --frozen ruff check .
+      - name: Check formatting
+        run: uv run --frozen ruff format --check .
+      - name: Type-check
+        run: uv run --frozen mypy src/atlas
+      - name: Run tests
+        run: >-
+          uv run --frozen pytest -m "not integration"
+          -W error::ResourceWarning
+          -W error::pytest.PytestUnraisableExceptionWarning
+          -W error::pytest.PytestUnhandledThreadExceptionWarning
+
+  security-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install locked runtime dependencies
+        run: uv sync --locked --no-dev
+      - name: Audit the locked environment
+        run: >-
+          uv run --frozen --no-dev --with "pip-audit==2.10.1"
+          pip-audit --local --skip-editable --progress-spinner off
+
+  package:
+    needs: [test, security-audit]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Check lock file
+        run: uv lock --check
+      - name: Install locked dependencies
+        run: uv sync --locked --group dev
+      - name: Build distributions
+        run: uv build --out-dir dist
+      - name: Validate distributions
+        run: uv run --frozen --with "twine==6.2.0" python -m twine check dist/*
+      - name: Verify source package contents
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import tarfile
+
+          archive = next(Path("dist").glob("*.tar.gz"))
+          with tarfile.open(archive) as package:
+              forbidden = (
+                  ".codebase-memory",
+                  ".git",
+                  ".mypy_cache",
+                  ".pytest_cache",
+                  ".ruff_cache",
+                  ".venv",
+                  "__pycache__",
+              )
+              leaked = [
+                  item.name
+                  for item in package.getmembers()
+                  if any(part in item.name.split("/") for part in forbidden)
+              ]
+          if leaked:
+              raise SystemExit(f"source package contains generated data: {leaked}")
+          PY
+      - name: Smoke-test built wheel
+        run: |
+          uv venv --python 3.12 .package-venv
+          uv pip install --python .package-venv/bin/python dist/*.whl
+          .package-venv/bin/atlas --help
+          .package-venv/bin/atlas --version
+          .package-venv/bin/python -m atlas --help
+
+  macos-smoke:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install locked dependencies
+        run: uv sync --locked --group dev
+      - name: Run tests
+        run: >-
+          uv run --frozen pytest -m "not integration"
+          -W error::ResourceWarning
+          -W error::pytest.PytestUnraisableExceptionWarning
+          -W error::pytest.PytestUnhandledThreadExceptionWarning
+      - name: Smoke-test CLI help
+        run: uv run --frozen atlas --plain --help
+      - name: Smoke-test CLI version
+        run: uv run --frozen atlas --version
+      - name: Validate installer syntax
+        run: zsh -n install.sh
+      - name: Validate Homebrew formula syntax
+        run: ruby -c packaging/homebrew/atlas.rb
