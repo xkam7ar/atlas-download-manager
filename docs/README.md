@@ -3,13 +3,14 @@
 Use this page to choose the shortest path to an answer. User guides come first;
 implementation contracts and design specifications are grouped separately.
 
-[Project README](../README.md) · [Quick start](quick-start.md) ·
+[Project README](../README.md) · [Why Atlas](why-atlas.md) · [Quick start](quick-start.md) ·
 [Command reference](commands.md) · [Troubleshooting](troubleshooting.md)
 
 ## Choose your path
 
 | If you want to… | Go here |
 | --- | --- |
+| Decide whether Atlas fits your workflow | [Why Atlas](why-atlas.md) |
 | Install, verify, and complete a first download | [Quick start](quick-start.md) |
 | Install runtime tools or repair setup | [Installation](installation.md) |
 | Find the right command or option | [Command reference](commands.md) |
@@ -25,6 +26,7 @@ Start here for installation, daily workflows, automation, and support.
 
 | Guide | What it owns |
 | --- | --- |
+| [Why Atlas](why-atlas.md) | Audience, differentiators, backend comparison, and common questions. |
 | [Quick start](quick-start.md) | First verification, menu use, dry run, first result, and recovery. |
 | [Installation](installation.md) | Installer behavior, setup modes, runtime footprints, repair, and update paths. |
 | [Command reference](commands.md) | User-facing commands, examples, options, output, and exit behavior. |

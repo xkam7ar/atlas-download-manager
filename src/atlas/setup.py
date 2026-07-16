@@ -18,7 +18,7 @@ from atlas.config import AtlasSettings, settings_as_toml
 from atlas.paths import config_path, ensure_app_dirs
 from atlas.private_files import write_private_text
 
-ATLAS_REPOSITORY = "https://github.com/xkam7ar/atlas.git"
+ATLAS_REPOSITORY = "https://github.com/xkam7ar/atlas-download-manager.git"
 HOMEBREW_INSTALL_URL = "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
 LINUXBREW_PATH = "/home/linuxbrew/.linuxbrew/bin/brew"
 RELEASE_REF_PLACEHOLDER = "<40-character-commit-id>"
@@ -302,7 +302,7 @@ def install_hint_for_tool(
     if executable == "yt-dlp":
         return f"atlas update --release-ref {RELEASE_REF_PLACEHOLDER}"
     if executable == "atlas package":
-        return "brew install xkam7ar/tap/atlas"
+        return "brew install xkam7ar/tap/atlas-download-manager"
     tool = next((item for item in TOOL_SPECS if item.executable == executable), None)
     if tool is None:
         return "atlas doctor"
@@ -374,7 +374,7 @@ def build_update_plan(
     if method == "homebrew":
         return UpdatePlan(
             install_method=method,
-            command=("brew", "upgrade", "xkam7ar/tap/atlas"),
+            command=("brew", "upgrade", "xkam7ar/tap/atlas-download-manager"),
             detail="Atlas appears to be installed through Homebrew.",
             can_update=True,
         )

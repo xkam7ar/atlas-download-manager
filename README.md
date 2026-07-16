@@ -1,11 +1,17 @@
-# Atlas
+# Atlas Download Manager — plan-first terminal downloads
 
-**Paste a URL. Review the plan. Download with the right engine.**
+[![Quality](https://github.com/xkam7ar/atlas-download-manager/actions/workflows/quality.yml/badge.svg?branch=main)](https://github.com/xkam7ar/atlas-download-manager/actions/workflows/quality.yml)
+[![CodeQL](https://github.com/xkam7ar/atlas-download-manager/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/xkam7ar/atlas-download-manager/actions/workflows/codeql.yml)
+[![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
+[![MIT license](https://img.shields.io/badge/License-MIT-2ea44f.svg)](LICENSE)
 
-Atlas is a menu-first download utility for media, direct files, website mirrors,
-open directories, and repeatable batches. It detects intent, builds a typed plan,
-and shows what will happen before handing work to `yt-dlp`, native Python,
-`aria2c`, `wget2`, or `wget`.
+**Paste one URL. Review one plan. Let Atlas choose the right engine.**
+
+Atlas is an open-source Python CLI and interactive terminal download manager for
+video, audio, playlists, direct files, website mirrors, open directories, and
+repeatable batches. It detects intent, builds a typed plan, and shows what will
+happen before handing work to `yt-dlp`, native Python, `aria2c`, `wget2`, or
+`wget`.
 
 ```text
 URL  ->  detect  ->  review  ->  download  ->  summary
@@ -17,21 +23,53 @@ URL  ->  detect  ->  review  ->  download  ->  summary
 > other protections. Cookies and request controls are for legitimate,
 > user-authorized access.
 
+## Why Atlas
+
+Use a downloader directly when one command already does the job. Atlas is for
+workflows that benefit from a consistent layer across several engines:
+
+- **Plan before execution.** Dry runs expose the selected backend, output, and
+  recursive scope before a transfer begins.
+- **Keep one interface.** The menu and CLI cover media, files, mirrors, open
+  directories, and mixed URL batches without hiding the underlying engine.
+- **Recover instead of restart.** Batch and mirror sessions retain private
+  manifests, failure states, and narrow retry paths.
+- **Use it interactively or automate it.** Human-friendly terminal views coexist
+  with stable JSON results and NDJSON progress events.
+
+Read [Why Atlas](docs/why-atlas.md) for a practical comparison with using
+`yt-dlp`, `aria2c`, `wget2`, or `wget` directly.
+
+## Verification evidence
+
+- The [quality workflow](https://github.com/xkam7ar/atlas-download-manager/actions/workflows/quality.yml)
+  tests Python 3.12–3.14, runs Ubuntu and macOS smoke coverage, audits locked
+  dependencies, builds both distributions, and smoke-tests the installed wheel.
+- A bounded [50-target open-directory field audit](docs/open-directory-audit-2026-07-15.md)
+  finished with 50 expected outcomes after fixes under same-origin, no-parent,
+  non-recursive, no-download constraints. The audit is dated and does not claim
+  universal compatibility.
+- The first-run example below uses a small public file, supports a no-transfer
+  dry run, and verifies the real result in the [Quick start](docs/quick-start.md).
+
 ## Start here
 
 | I want to… | Start with |
 | --- | --- |
+| Decide whether Atlas fits | [Why Atlas](docs/why-atlas.md) |
 | Try Atlas for the first time | [Quick start](docs/quick-start.md) |
 | Install or repair Atlas | [Installation](docs/installation.md) |
 | Find a command | [Command reference](docs/commands.md) |
 | Fix a problem | [Troubleshooting](docs/troubleshooting.md) |
 | Automate downloads | [`atlas get`, batch, JSON, and progress](docs/commands.md) |
 | Understand the system | [Architecture](docs/architecture.md) |
-| Contribute | [Development guide](docs/development.md) |
+| Contribute | [Contribution guide](CONTRIBUTING.md) |
 
 <details>
 <summary>On this page</summary>
 
+- [Why Atlas](#why-atlas)
+- [Verification evidence](#verification-evidence)
 - [Install](#install)
 - [First run](#first-run)
 - [What Atlas handles](#what-atlas-handles)
@@ -41,21 +79,26 @@ URL  ->  detect  ->  review  ->  download  ->  summary
 - [Display and accessibility](#display-and-accessibility)
 - [Configuration](#configuration)
 - [Documentation](#documentation)
+- [Support Atlas](#support-atlas)
 - [Development](#development)
 
 </details>
 
 ## Install
 
-Atlas requires Python 3.12 or newer. Media workflows also need `ffmpeg` and
-`ffprobe`; accelerated files and mirrors can use `aria2c`, `wget2`, and `wget`.
-Atlas installs `yt-dlp` and `mutagen` with its Python package so extraction and
-audio artwork embedding are ready by default.
+Atlas requires Python 3.12 or newer. Installing the source preview also requires
+[`uv`](https://docs.astral.sh/uv/getting-started/installation/). Media workflows
+that merge streams or post-process audio or video need `ffmpeg` and `ffprobe`.
+The Python package includes `yt-dlp` and `mutagen`; accelerated files and mirrors
+can additionally use `aria2c`, `wget2`, and `wget`.
 
-### Install this checkout
+### Try the current source preview
 
 ```bash
+git clone https://github.com/xkam7ar/atlas-download-manager.git
+cd atlas-download-manager
 uv tool install . --force
+atlas --version
 atlas setup --no-install
 ```
 
@@ -65,48 +108,26 @@ To preview the local guided installer without changing the machine:
 bash install.sh --no-install --no-menu --yes
 ```
 
-> [!IMPORTANT]
-> This repository is a public-source preview, not a supported binary or package
-> release. Making the source visible does not activate `main` as an install or
-> update channel: remote Git installs require the verified release's full commit
-> ID, and no such supported release is advertised here yet.
-> The unqualified PyPI and Homebrew names `atlas` already belong to unrelated
-> projects; choose and verify a collision-free distribution identity before
-> publishing a package release.
+> [!NOTE]
+> Atlas is currently an alpha source preview for macOS and Linux. The clone path
+> above installs the checked-out source for evaluation; no supported PyPI,
+> Homebrew, or automatic-update channel exists yet. Packages named `atlas` on
+> PyPI and Homebrew are unrelated.
 
-### Remote release contract
-
-A future release must publish a version tag, its full commit ID, and checksums.
-Verify those values against the release metadata, then pin the Git install to
-the commit ID rather than the tag name:
-
-```bash
-release_commit=0123456789abcdef0123456789abcdef01234567
-uv tool install "git+https://github.com/xkam7ar/atlas.git@${release_commit}"
-atlas update --release-ref "$release_commit"
-atlas setup --full --install
-```
-
-Do not pipe `raw.githubusercontent.com/.../main/install.sh` into a shell. The
-guided installer blocks remote uv installation without `--release-ref`, and
-release installers must be downloaded from a release, checksum-verified,
-inspected, and then run.
-
-### Homebrew packaging status
-
-The checked-in Homebrew formula is a release template. It must receive a real
-release URL, checksum, generated Python resource blocks, and a collision-safe
-formula strategy before publication to a tap. See
-[Installation](docs/installation.md#homebrew-release-packaging) for the release
-contract.
+See [Installation](docs/installation.md) for the immutable-release, checksum,
+update, and packaging policy.
 
 ## First run
 
-1. Verify the environment.
+1. Verify the command and network path.
 
    ```bash
-   atlas doctor
+   atlas --version
+   atlas doctor --network
    ```
+
+   Run full `atlas doctor` before media or accelerated-transfer work; it reports
+   missing system tools that do not block this native-file first run.
 
 2. Open the menu and paste a URL.
 
@@ -117,13 +138,15 @@ contract.
 3. Review a plan without downloading.
 
    ```bash
-   atlas get "https://example.com/archive.zip" --dry-run
+   atlas get "https://raw.githubusercontent.com/xkam7ar/atlas-download-manager/main/LICENSE" \
+     --kind file --backend native --output-dir ./atlas-demo --dry-run
    ```
 
 4. Run the same intent when the plan looks right.
 
    ```bash
-   atlas get "https://example.com/archive.zip"
+   atlas get "https://raw.githubusercontent.com/xkam7ar/atlas-download-manager/main/LICENSE" \
+     --kind file --backend native --output-dir ./atlas-demo
    ```
 
 The [Quick start](docs/quick-start.md) walks through menu, CLI, dry-run, output,
@@ -282,11 +305,19 @@ The [documentation home](docs/README.md) organizes the full set by reader goal.
 
 | Use Atlas | Understand Atlas | Build Atlas |
 | --- | --- | --- |
-| [Quick start](docs/quick-start.md) | [Smart sessions](docs/smart-sessions.md) | [Architecture](docs/architecture.md) |
+| [Quick start](docs/quick-start.md) | [Why Atlas](docs/why-atlas.md) | [Architecture](docs/architecture.md) |
 | [Commands](docs/commands.md) | [Download planning](docs/download-planning.md) | [System contracts](docs/system-contracts.md) |
 | [Configuration](docs/configuration.md) | [Media edge cases](docs/media-edge-cases.md) | [UI and UX](docs/ui-ux.md) |
 | [Troubleshooting](docs/troubleshooting.md) | [Mirror policy](docs/mirror-policy.md) | [Development](docs/development.md) |
 | [Responsible use](docs/responsible-use.md) | [Migration](docs/migration.md) | [Downloader research](docs/download-research.md) |
+
+## Support Atlas
+
+If Atlas has earned a place in your workflow, consider
+[starring the repository](https://github.com/xkam7ar/atlas-download-manager)—it helps other
+people find the project. Stars do not unlock features or change support
+priority; a clear bug report, documentation fix, or focused pull request is just
+as valuable.
 
 ## Development
 

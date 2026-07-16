@@ -189,29 +189,29 @@ uv build
 This produces:
 
 ```text
-dist/atlas-0.1.0.tar.gz
-dist/atlas-0.1.0-py3-none-any.whl
+dist/atlas_download_manager-0.1.0.tar.gz
+dist/atlas_download_manager-0.1.0-py3-none-any.whl
 ```
 
 Installer and packaging checks:
 
 ```bash
 sh -n install.sh
-ruby -c packaging/homebrew/atlas.rb
+ruby -c packaging/homebrew/atlas-download-manager.rb
 ./install.sh --no-install --no-menu --yes
 uv run atlas setup --json
 uv run atlas update --dry-run --json
 ```
 
-The Homebrew formula in `packaging/homebrew/atlas.rb` is a tap template until a
+The Homebrew formula in `packaging/homebrew/atlas-download-manager.rb` is a tap template until a
 release tarball SHA and generated Python resource blocks are added. Homebrew
-core already ships an unrelated `atlas` executable, so release work must also
-choose and test an explicit collision strategy. Before publishing the tap, copy
-the formula into the tap, replace the SHA, generate resources, and test the
-chosen formula name.
+core already ships an unrelated `atlas` executable, so the template uses the
+`atlas-download-manager` formula name and declares a conflict. Before publishing
+the tap, copy the formula into the tap, replace the SHA, generate resources, and
+test both installation and the conflict behavior.
 
 ```bash
-brew install xkam7ar/tap/atlas
+brew install xkam7ar/tap/atlas-download-manager
 atlas doctor --json
 ```
 

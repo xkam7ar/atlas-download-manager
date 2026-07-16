@@ -5,8 +5,9 @@ does not include guaranteed response or resolution times.
 
 ## Where to ask
 
-- Use the bug-report template for reproducible defects.
-- Use the feature-request template for focused product proposals.
+- [Report a reproducible bug](https://github.com/xkam7ar/atlas-download-manager/issues/new?template=bug_report.yml).
+- [Request a focused feature](https://github.com/xkam7ar/atlas-download-manager/issues/new?template=feature_request.yml).
+- [Ask a usage question or discuss an idea](https://github.com/xkam7ar/atlas-download-manager/discussions).
 - For substantial code changes, read `CONTRIBUTING.md` before opening a pull
   request.
 - Report security vulnerabilities privately according to `SECURITY.md`.

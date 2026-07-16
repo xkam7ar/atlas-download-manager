@@ -164,7 +164,7 @@ def _writable_dir(path: Path, *, mutate: bool = True) -> tuple[bool, str]:
 
 def _package_version() -> str:
     try:
-        return importlib.metadata.version("atlas")
+        return importlib.metadata.version("atlas-download-manager")
     except importlib.metadata.PackageNotFoundError:
         return __version__
 

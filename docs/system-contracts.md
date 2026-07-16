@@ -105,15 +105,16 @@ apt, dnf, or pacman as appropriate; Arch uses Homebrew on Linux for `wget2`.
 Target install paths:
 
 ```bash
-brew install xkam7ar/tap/atlas
-uv tool install "git+https://github.com/xkam7ar/atlas.git@COMMIT_ID"
+brew install xkam7ar/tap/atlas-download-manager
+uv tool install "git+https://github.com/xkam7ar/atlas-download-manager.git@COMMIT_ID"
 atlas setup
 ```
 
 Repository visibility establishes a public-source preview, not a release
 channel. The unqualified PyPI and Homebrew `atlas` names belong to unrelated
-projects. Until a collision-free release identity and immutable release exist,
-the supported working path is a local checkout via `uv tool install . --force`;
+projects. Atlas uses `atlas-download-manager` for the distribution, repository,
+and formula while keeping the `atlas` command and import package. Until an
+immutable release exists, the supported working path is a local checkout via `uv tool install . --force`;
 `install.sh --no-install` is safe for plan review. A release installer must be
 downloaded with its checksum manifest from the same immutable release,
 verified, inspected, and invoked with `--release-ref`. Executing the copy on

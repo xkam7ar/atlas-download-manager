@@ -11,14 +11,17 @@ explicit.
 
 ```bash
 atlas --version
-atlas doctor
+atlas doctor --network
 ```
 
-`atlas --version` confirms which executable your shell found. Doctor then checks
-Python, paths, TLS, `yt-dlp`, `mutagen`, required media tools, and optional
-transfer backends. Every Doctor run makes one verified HTTPS GET to
-`https://www.python.org/` with a three-second timeout to validate Python's TLS
-and CA path. Default human mode also creates/checks Atlas directories with
+`atlas --version` confirms which executable your shell found. The focused
+network check then makes one verified HTTPS GET to `https://www.python.org/`
+with a three-second timeout to validate Python's TLS and CA path without making
+optional downloader tools a prerequisite for the first native-file example.
+
+Run full `atlas doctor` before media, mirror, or accelerated-transfer work. It
+checks Python, paths, TLS, `yt-dlp`, `mutagen`, required media tools, and optional
+transfer backends. Default human mode also creates/checks Atlas directories with
 temporary write probes; `--json` and `--fix --no-install` use non-mutating path
 checks but still perform the HTTPS probe.
 
@@ -51,17 +54,21 @@ Choose **Tools → Help** whenever you need the contextual key guide.
 
 ## 3. Review without downloading
 
-Use a URL you are authorized to access:
+Use Atlas's own small, public source-preview license file for a deterministic
+first run. This baseline selects the built-in backend so the reviewed and
+executed plans do not depend on optional transfer tools:
 
 ```bash
-atlas get "https://example.com/archive.zip" --dry-run
+atlas get "https://raw.githubusercontent.com/xkam7ar/atlas-download-manager/main/LICENSE" \
+  --kind file --backend native --output-dir ./atlas-demo --dry-run
 ```
 
 A dry run resolves the intent and prints the planned backend, output, and safety
 notes without starting the transfer. For automation, add `--json`:
 
 ```bash
-atlas get "https://example.com/archive.zip" --dry-run --json
+atlas get "https://raw.githubusercontent.com/xkam7ar/atlas-download-manager/main/LICENSE" \
+  --kind file --backend native --output-dir ./atlas-demo --dry-run --json
 ```
 
 Some adaptive plans perform lightweight network probes before producing a plan.
@@ -73,10 +80,12 @@ requests to inspect size, range support, or directory links.
 Remove `--dry-run` when the source, scope, backend, and output look right:
 
 ```bash
-atlas get "https://example.com/archive.zip"
+atlas get "https://raw.githubusercontent.com/xkam7ar/atlas-download-manager/main/LICENSE" \
+  --kind file --backend native --output-dir ./atlas-demo
 ```
 
-The normal output folder on macOS and supported Linux hosts is:
+This example writes `LICENSE` under `./atlas-demo`. Without an explicit output
+directory, the normal folder on macOS and supported Linux hosts is:
 
 ```text
 ~/Downloads/atlas
@@ -87,17 +96,24 @@ verification or post-processing is finished.
 
 ## 5. Confirm the result
 
-A successful run ends with a summary containing the saved path. Batch, site,
-and directory sessions also write recovery data under:
+A successful run ends with a summary containing the saved path. Confirm that
+the deterministic first-download result exists:
+
+```bash
+test -f ./atlas-demo/LICENSE && echo "Atlas first download complete"
+```
+
+Batch, site, and directory sessions also write recovery data under:
 
 ```text
 <output>/.atlas/latest/
 ```
 
-Inspect the newest session without retrying anything:
+After one of those session-producing workflows, inspect its output directory
+without retrying anything:
 
 ```bash
-atlas inspect-session ~/Downloads/atlas
+atlas inspect-session OUTPUT
 ```
 
 ## Recover an interrupted session
