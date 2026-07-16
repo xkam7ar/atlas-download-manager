@@ -47,14 +47,14 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "certifi>=2024.8",
+  "certifi>=2026.6.17",
   "mutagen>=1.47",
   "platformdirs>=4.2",
   "pydantic>=2.7",
   "pydantic-settings>=2.14.2",
   "questionary>=2.0",
   "rich>=13.7",
-  "typer>=0.15.4",
+  "typer>=0.26.8",
   "yt-dlp>=2026.6.9",
 ]
 
