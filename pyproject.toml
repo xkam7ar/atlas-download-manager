@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.25"]
+requires = ["hatchling>=1.31.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -70,16 +70,16 @@ Support = "https://github.com/xkam7ar/atlas-download-manager/blob/main/SUPPORT.m
 [project.optional-dependencies]
 interactive = ["questionary>=2.0"]
 dev = [
-  "mypy>=1.10",
-  "pytest>=8.2",
-  "ruff>=0.8",
+  "mypy>=2.2.0",
+  "pytest>=9.1.1",
+  "ruff>=0.15.21",
 ]
 
 [dependency-groups]
 dev = [
-  "mypy>=1.10",
-  "pytest>=8.2",
-  "ruff>=0.8",
+  "mypy>=2.2.0",
+  "pytest>=9.1.1",
+  "ruff>=0.15.21",
 ]
 
 [project.scripts]
