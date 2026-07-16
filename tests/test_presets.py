@@ -500,6 +500,10 @@ def test_explicit_playlist_url_still_requires_playlist_request(tmp_path: Path) -
 def test_playlist_url_classifier() -> None:
     assert is_explicit_playlist_url("https://www.youtube.com/playlist?list=PL123") is True
     assert is_explicit_playlist_url("https://www.youtube.com/embed/videoseries?list=PL123") is True
+    assert is_explicit_playlist_url("https://rumble.com/playlists/example") is True
+    assert is_explicit_playlist_url("https://example.com/users/alice/playlist/42") is True
+    assert is_explicit_playlist_url("https://example.com/not-a-playlist") is False
+    assert is_explicit_playlist_url("https://example.com/playlist-preview") is False
     assert (
         is_explicit_playlist_url(
             "https://www.youtube.com/watch?v=-EdRTo61T84&list=RD-EdRTo61T84&start_radio=1"

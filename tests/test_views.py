@@ -419,7 +419,7 @@ def test_state_panel_and_tabs_render_lazygit_style() -> None:
 
         assert "[failed]" in rendered
         assert "Failed Items" in rendered
-        assert "https://example.com/" in rendered
+        assert "bad.iso" in rendered
         assert "checksum" in rendered
         assert "mismatch" in rendered
         assert "aria2" in rendered
