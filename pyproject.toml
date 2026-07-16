@@ -23,15 +23,15 @@ classifiers = [
   "Topic :: Multimedia :: Video",
 ]
 dependencies = [
-  "certifi>=2024.8",
-  "mutagen>=1.47",
-  "platformdirs>=4.2",
-  "pydantic>=2.7",
+  "certifi>=2026.6.17",
+  "mutagen>=1.48.1",
+  "platformdirs>=4.10.0",
+  "pydantic>=2.13.4",
   "pydantic-settings>=2.14.2",
-  "questionary>=2.0",
-  "rich>=13.7",
-  "typer>=0.15.4",
-  "yt-dlp>=2026.6.9",
+  "questionary>=2.1.1",
+  "rich>=15.0.0",
+  "typer>=0.27.0",
+  "yt-dlp>=2026.7.4",
 ]
 
 [project.urls]
@@ -41,7 +41,7 @@ Issues = "https://github.com/xkam7ar/atlas/issues"
 Changelog = "https://github.com/xkam7ar/atlas/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-interactive = ["questionary>=2.0"]
+interactive = ["questionary>=2.1.1"]
 dev = [
   "mypy>=1.10",
   "pytest>=8.2",
