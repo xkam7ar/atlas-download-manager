@@ -6,11 +6,11 @@
 # A release owner must replace the disabled state with a real immutable release
 # URL, its verified SHA-256 digest, and generated Python resource blocks. Do not
 # publish this file in a tap in its current form.
-class Atlas < Formula
+class AtlasDownloadManager < Formula
   include Language::Python::Virtualenv
 
-  desc "Intent-first download hub for media, files, batches, and mirrors"
-  homepage "https://github.com/xkam7ar/atlas"
+  desc "Plan-first terminal download manager for media, files, batches, and mirrors"
+  homepage "https://github.com/xkam7ar/atlas-download-manager"
   license "MIT"
 
   disable! date: "2026-07-16", because: "Atlas has no published package release"
@@ -21,9 +21,11 @@ class Atlas < Formula
   depends_on "wget"
   depends_on "wget2"
 
+  conflicts_with "atlas", because: "both install an atlas executable"
+
   # After adding a real `url` and `sha256`, copy this template into the
   # Homebrew tap and run:
-  #   brew update-python-resources atlas
+  #   brew update-python-resources atlas-download-manager
   # before publishing. Homebrew must install Python dependencies from declared
   # resource blocks, not by fetching from the network at install time.
 

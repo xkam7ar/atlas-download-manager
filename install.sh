@@ -1,9 +1,9 @@
 #!/usr/bin/env sh
 set -eu
 
-ATLAS_REPO="${ATLAS_REPO:-https://github.com/xkam7ar/atlas.git}"
+ATLAS_REPO="${ATLAS_REPO:-https://github.com/xkam7ar/atlas-download-manager.git}"
 ATLAS_RELEASE_REF="${ATLAS_RELEASE_REF:-}"
-ATLAS_TAP_FORMULA="${ATLAS_TAP_FORMULA:-xkam7ar/tap/atlas}"
+ATLAS_TAP_FORMULA="${ATLAS_TAP_FORMULA:-xkam7ar/tap/atlas-download-manager}"
 HOMEBREW_INSTALL_URL="https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
 UV_INSTALL_URL="https://astral.sh/uv/install.sh"
 MODE="full"

@@ -178,7 +178,7 @@ jobs:
       - name: Validate installer syntax
         run: zsh -n install.sh
       - name: Validate Homebrew formula syntax
-        run: ruby -c packaging/homebrew/atlas.rb
+        run: ruby -c packaging/homebrew/atlas-download-manager.rb
 
   quality-gate:
     name: Quality Gate

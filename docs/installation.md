@@ -45,8 +45,9 @@ bash install.sh --no-install --no-menu --yes
 > Repository visibility alone does not make the raw installer, a release tag,
 > or the tap supported. Do not use
 > `pip install atlas` or `brew install atlas`: those names resolve to unrelated
-> projects. A collision-free distribution identity and public release must be
-> established before remote install instructions can become active.
+> projects. Atlas uses `atlas-download-manager` as its distribution and formula
+> identity, but a public release must still be published before remote install
+> instructions can become active.
 
 The installer detects the host and missing executables, shows every bootstrap,
 package-manager, Atlas, and verification command, then asks once. `--yes`
@@ -99,7 +100,7 @@ Once the tap contains a release-complete and collision-safe formula, the
 intended install path is:
 
 ```bash
-brew install xkam7ar/tap/atlas
+brew install xkam7ar/tap/atlas-download-manager
 ```
 
 The formula is expected to depend on the full runtime:
@@ -110,12 +111,13 @@ brew install ffmpeg aria2 wget2 wget
 
 > [!NOTE]
 > The checked-in formula is not itself a published release. The template lives at
-> [`packaging/homebrew/atlas.rb`](../packaging/homebrew/atlas.rb). Copy it into
-> the tap, replace the release SHA, and run `brew update-python-resources atlas`
+> [`packaging/homebrew/atlas-download-manager.rb`](../packaging/homebrew/atlas-download-manager.rb). Copy it into
+> the tap, replace the release SHA, and run `brew update-python-resources atlas-download-manager`
 > before publishing so Python dependencies are declared as Homebrew resources.
 > It is release-ready only after the tap has a tagged tarball SHA and generated
 > Python resource blocks. Homebrew core already has an unrelated `atlas`
-> executable, so the tap formula also needs an explicit conflict/naming plan.
+> executable; this template uses the collision-safe formula name and declares
+> the executable conflict explicitly.
 
 ## Manual and developer fallback
 
@@ -132,7 +134,7 @@ ref name:
 
 ```bash
 release_commit=0123456789abcdef0123456789abcdef01234567
-uv tool install "git+https://github.com/xkam7ar/atlas.git@${release_commit}"
+uv tool install "git+https://github.com/xkam7ar/atlas-download-manager.git@${release_commit}"
 ```
 
 Do not execute `install.sh` from `main`. Download it and the published checksum
@@ -237,9 +239,9 @@ Detected update plans:
 
 | Install method | Update command |
 | --- | --- |
-| Homebrew | `brew upgrade xkam7ar/tap/atlas` |
+| Homebrew | `brew upgrade xkam7ar/tap/atlas-download-manager` |
 | uv tool without a release ref | blocked; explain `--release-ref` and do not modify the system |
-| uv tool with a full `--release-ref COMMIT_ID` | `uv tool install --force git+https://github.com/xkam7ar/atlas.git@COMMIT_ID` |
+| uv tool with a full `--release-ref COMMIT_ID` | `uv tool install --force git+https://github.com/xkam7ar/atlas-download-manager.git@COMMIT_ID` |
 | source checkout | `git -C <checkout> pull --ff-only` |
 | unknown | explain the situation and do not modify the system |
 

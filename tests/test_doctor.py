@@ -7,6 +7,19 @@ from atlas.config import AtlasSettings
 from atlas.doctor import Wget2Capabilities, _parse_wget2_capabilities, _writable_dir, run_doctor
 
 
+def test_doctor_reads_the_collision_safe_distribution_version(monkeypatch) -> None:
+    requested: list[str] = []
+
+    def fake_version(distribution: str) -> str:
+        requested.append(distribution)
+        return "9.9.9"
+
+    monkeypatch.setattr(doctor_module.importlib.metadata, "version", fake_version)
+
+    assert doctor_module._package_version() == "9.9.9"
+    assert requested == ["atlas-download-manager"]
+
+
 def test_doctor_reports_required_checks(tmp_path: Path) -> None:
     settings = AtlasSettings(output_dir=tmp_path, archive_file=tmp_path / "archive.txt")
 

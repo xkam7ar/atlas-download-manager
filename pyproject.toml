@@ -3,24 +3,48 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [project]
-name = "atlas"
+name = "atlas-download-manager"
 version = "0.1.0"
-description = "Intent-first download manager for media, files, batches, and mirrors."
+description = "Plan-first Python CLI and TUI download manager for video, audio, files, batches, website mirrors, and open directories."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 authors = [{ name = "atlas contributors" }]
-keywords = ["yt-dlp", "download-manager", "aria2", "wget2", "cli", "macos", "linux"]
+keywords = [
+  "aria2",
+  "audio-downloader",
+  "batch-downloader",
+  "cli",
+  "download-manager",
+  "linux",
+  "macos",
+  "open-directory",
+  "terminal-app",
+  "tui",
+  "video-downloader",
+  "website-downloader",
+  "website-mirror",
+  "wget",
+  "wget2",
+  "youtube-downloader",
+  "yt-dlp",
+]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
   "Intended Audience :: End Users/Desktop",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
+  "Topic :: Internet :: WWW/HTTP",
+  "Topic :: Multimedia :: Sound/Audio",
   "Topic :: Multimedia :: Video",
+  "Topic :: Utilities",
+  "Typing :: Typed",
 ]
 dependencies = [
   "certifi>=2024.8",
@@ -35,10 +59,13 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/xkam7ar/atlas"
-Repository = "https://github.com/xkam7ar/atlas"
-Issues = "https://github.com/xkam7ar/atlas/issues"
-Changelog = "https://github.com/xkam7ar/atlas/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/xkam7ar/atlas-download-manager"
+Repository = "https://github.com/xkam7ar/atlas-download-manager"
+Issues = "https://github.com/xkam7ar/atlas-download-manager/issues"
+Changelog = "https://github.com/xkam7ar/atlas-download-manager/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/xkam7ar/atlas-download-manager/blob/main/docs/README.md"
+Security = "https://github.com/xkam7ar/atlas-download-manager/security/policy"
+Support = "https://github.com/xkam7ar/atlas-download-manager/blob/main/SUPPORT.md"
 
 [project.optional-dependencies]
 interactive = ["questionary>=2.0"]

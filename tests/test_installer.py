@@ -197,7 +197,7 @@ def test_installer_refuses_remote_uv_install_without_release_ref(tmp_path: Path)
 
     assert result.returncode == 1
     assert "remote installation is disabled without --release-ref" in result.stderr
-    assert "git+https://github.com/xkam7ar/atlas.git\n" not in result.stdout
+    assert "git+https://github.com/xkam7ar/atlas-download-manager.git\n" not in result.stdout
     assert not (tmp_path / "commands.log").exists()
 
 

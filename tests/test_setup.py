@@ -430,7 +430,7 @@ def test_update_plan_uses_install_method_specific_commands(
     assert build_update_plan(install_method="homebrew").command == (
         "brew",
         "upgrade",
-        "xkam7ar/tap/atlas",
+        "xkam7ar/tap/atlas-download-manager",
     )
     blocked_uv_update = build_update_plan(install_method="uv-tool")
     assert blocked_uv_update.command is None
@@ -442,7 +442,7 @@ def test_update_plan_uses_install_method_specific_commands(
         "tool",
         "install",
         "--force",
-        f"git+https://github.com/xkam7ar/atlas.git@{release_ref}",
+        f"git+https://github.com/xkam7ar/atlas-download-manager.git@{release_ref}",
     )
     assert build_update_plan(install_method="source-checkout").command == (
         "git",

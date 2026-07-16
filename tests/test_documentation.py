@@ -88,12 +88,28 @@ def test_documentation_code_fences_are_balanced() -> None:
     assert not unbalanced, f"Unbalanced Markdown code fences: {unbalanced}"
 
 
+def test_first_download_example_is_executable_and_explicit() -> None:
+    guides = (ROOT / "README.md", ROOT / "docs" / "quick-start.md")
+    example_url = "https://raw.githubusercontent.com/xkam7ar/atlas-download-manager/main/LICENSE"
+
+    for guide in guides:
+        text = guide.read_text(encoding="utf-8")
+        assert "https://example.com/archive.zip" not in text
+        assert example_url in text
+        assert "--output-dir ./atlas-demo" in text
+        assert "--kind file --backend native --output-dir ./atlas-demo" in text
+
+    quick_start = (ROOT / "docs" / "quick-start.md").read_text(encoding="utf-8")
+    assert "test -f ./atlas-demo/LICENSE" in quick_start
+    assert "atlas inspect-session OUTPUT" in quick_start
+
+
 def test_public_docs_do_not_activate_mutable_remote_install_sources() -> None:
     forbidden = (
-        re.compile(r"raw\.githubusercontent\.com/xkam7ar/atlas/main/install\.sh"),
+        re.compile(r"raw\.githubusercontent\.com/xkam7ar/atlas-download-manager/main/install\.sh"),
         re.compile(
             r"uv tool install(?: --force)? [\"']?"
-            r"git\+https://github\.com/xkam7ar/atlas\.git(?!@)"
+            r"git\+https://github\.com/xkam7ar/atlas-download-manager\.git(?!@)"
         ),
     )
     violations: list[str] = []

@@ -16,4 +16,4 @@ formula, or immutable release has been published yet.
   documentation.
 - Reproducible lock-derived SBOM and runtime-license audit instructions.
 
-[Unreleased]: https://github.com/xkam7ar/atlas/commits/main
+[Unreleased]: https://github.com/xkam7ar/atlas-download-manager/commits/main
