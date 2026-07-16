@@ -107,12 +107,11 @@ controls. See [Responsible use](responsible-use.md).
 
 ### Is the package available from PyPI or Homebrew?
 
-Not yet. Atlas is currently a public-source preview without a supported package
-or binary release. The unqualified PyPI and Homebrew name `atlas` belongs to
-unrelated projects. This project uses `atlas-download-manager` for its
-distribution, repository, and formula identity while keeping the `atlas`
-command; the channels remain unavailable until an immutable release is
-published.
+Atlas is available from the official Homebrew tap:
+`brew install xkam7ar/tap/atlas-download-manager`. The unqualified PyPI and
+Homebrew name `atlas` belongs to unrelated projects. This project uses
+`atlas-download-manager` for its distribution, repository, and formula identity
+while keeping the `atlas` command. It is not currently published on PyPI.
 
 ## Try the workflow
 
