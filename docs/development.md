@@ -203,17 +203,16 @@ uv run atlas setup --json
 uv run atlas update --dry-run --json
 ```
 
-The release-complete Homebrew formula lives in
-`packaging/homebrew/atlas-download-manager.rb` and is mirrored to the
-`xkam7ar/homebrew-tap` repository. It uses the immutable release sdist and
-declares every Python dependency as a resource. Homebrew core already ships an
-unrelated `atlas` executable, so the formula uses the
-`atlas-download-manager` name and declares a conflict.
+The Homebrew formula in `packaging/homebrew/atlas-download-manager.rb` is a tap template until a
+release tarball SHA and generated Python resource blocks are added. Homebrew
+core already ships an unrelated `atlas` executable, so the template uses the
+`atlas-download-manager` formula name and declares a conflict. Before publishing
+the tap, copy the formula into the tap, replace the SHA, generate resources, and
+test both installation and the conflict behavior.
 
 ```bash
-brew install --build-from-source xkam7ar/tap/atlas-download-manager
-brew test xkam7ar/tap/atlas-download-manager
-"$(brew --prefix atlas-download-manager)/bin/atlas" doctor --json
+brew install xkam7ar/tap/atlas-download-manager
+atlas doctor --json
 ```
 
 ## Manual smoke tests

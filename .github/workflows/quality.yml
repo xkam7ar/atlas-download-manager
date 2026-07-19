@@ -2,9 +2,7 @@ name: Quality
 
 on:
   pull_request:
-    branches: [main]
   push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -20,7 +18,6 @@ env:
 
 jobs:
   test:
-    name: test (${{ matrix.python-version }})
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
@@ -58,7 +55,6 @@ jobs:
           -W error::pytest.PytestUnhandledThreadExceptionWarning
 
   security-audit:
-    name: security-audit
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -84,7 +80,6 @@ jobs:
           pip-audit --local --skip-editable --progress-spinner off
 
   package:
-    name: package
     needs: [test, security-audit]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -145,7 +140,6 @@ jobs:
           .package-venv/bin/python -m atlas --help
 
   macos-smoke:
-    name: macos-smoke
     runs-on: macos-15
     timeout-minutes: 30
     steps:
@@ -179,30 +173,3 @@ jobs:
         run: zsh -n install.sh
       - name: Validate Homebrew formula syntax
         run: ruby -c packaging/homebrew/atlas-download-manager.rb
-
-  quality-gate:
-    name: Quality Gate
-    if: always()
-    needs: [test, security-audit, package, macos-smoke]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 2
-    permissions: {}
-    steps:
-      - name: Require every quality job to pass
-        env:
-          TEST_RESULT: ${{ needs.test.result }}
-          SECURITY_AUDIT_RESULT: ${{ needs.security-audit.result }}
-          PACKAGE_RESULT: ${{ needs.package.result }}
-          MACOS_SMOKE_RESULT: ${{ needs.macos-smoke.result }}
-        run: |
-          for result in \
-            "$TEST_RESULT" \
-            "$SECURITY_AUDIT_RESULT" \
-            "$PACKAGE_RESULT" \
-            "$MACOS_SMOKE_RESULT"
-          do
-            if [ "$result" != "success" ]; then
-              echo "A required quality job did not succeed: $result" >&2
-              exit 1
-            fi
-          done

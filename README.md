@@ -86,22 +86,13 @@ Read [Why Atlas](docs/why-atlas.md) for a practical comparison with using
 
 ## Install
 
-The supported macOS and Linux install is the official Homebrew tap. It installs
-Atlas with Python 3.12 and the complete runtime (`ffmpeg`, `aria2`, `wget2`, and
-`wget`):
+Atlas requires Python 3.12 or newer. Installing the source preview also requires
+[`uv`](https://docs.astral.sh/uv/getting-started/installation/). Media workflows
+that merge streams or post-process audio or video need `ffmpeg` and `ffprobe`.
+The Python package includes `yt-dlp` and `mutagen`; accelerated files and mirrors
+can additionally use `aria2c`, `wget2`, and `wget`.
 
-```bash
-brew install xkam7ar/tap/atlas-download-manager
-atlas --version
-```
-
-The unqualified `brew install atlas` and `pip install atlas` commands install
-unrelated projects; use the tap-qualified formula above.
-
-### Install from a source checkout
-
-Source contributors can install the current checkout with
-[`uv`](https://docs.astral.sh/uv/getting-started/installation/):
+### Try the current source preview
 
 ```bash
 git clone https://github.com/xkam7ar/atlas-download-manager.git
@@ -118,9 +109,10 @@ bash install.sh --no-install --no-menu --yes
 ```
 
 > [!NOTE]
-> Atlas is an alpha release for macOS and Linux. Homebrew is the supported
-> package channel. The `atlas-download-manager` project is not currently
-> published on PyPI.
+> Atlas is currently an alpha source preview for macOS and Linux. The clone path
+> above installs the checked-out source for evaluation; no supported PyPI,
+> Homebrew, or automatic-update channel exists yet. Packages named `atlas` on
+> PyPI and Homebrew are unrelated.
 
 See [Installation](docs/installation.md) for the immutable-release, checksum,
 update, and packaging policy.

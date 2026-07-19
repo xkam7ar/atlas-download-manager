@@ -76,13 +76,16 @@ def is_explicit_playlist_url(url: str) -> bool:
     """Return true only for URLs that point at a playlist page itself."""
 
     parsed = urlparse(url)
+    host = parsed.hostname or ""
     path = parsed.path.rstrip("/").lower()
 
-    if _youtube_host_kind(parsed.hostname) is not None:
+    if _youtube_host_kind(host) is not None:
         return classify_youtube_url(url) == YoutubeUrlKind.playlist
 
-    segments = {segment for segment in path.split("/") if segment}
-    return bool({"playlist", "playlists"} & segments)
+    if "rumble.com" in host:
+        return "playlist" in path or "playlists" in path
+
+    return "playlist" in path or "playlists" in path
 
 
 def is_watch_url_with_playlist_params(url: str) -> bool:

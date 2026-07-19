@@ -20,11 +20,11 @@ plain `atlas doctor` creates/checks those paths and uses temporary write probes.
 
 | Method | Availability | What it changes |
 | --- | --- | --- |
-| Local guided installer | Plan and release-asset path | `--no-install` shows the complete plan; uv installation requires a verified full `--release-ref`. |
+| Local guided installer | Source-preview plan | `--no-install` shows the complete plan; uv installation is blocked without `--release-ref`. |
 | `uv tool` | Tested on macOS and Linux | Installs Atlas only; system runtime tools remain explicit. |
 | Local checkout | Contributor path | Installs the current working tree. |
-| Remote installer / GitHub uv tool | Supported release fallback | Requires the verified release's full 40-character commit ID; the default branch and tag names are never install channels. |
-| Homebrew tap | Supported | Installs Atlas, Python 3.12, and all runtime tools from `xkam7ar/tap/atlas-download-manager`. |
+| Remote installer / GitHub uv tool | Release-only target | Requires the verified release's full 40-character commit ID; the default branch and tag names are never install channels. |
+| Homebrew tap | Pre-release packaging target | Unavailable until a complete, collision-safe formula is published to the tap. |
 
 Windows is not in the current CI or guided-installer support matrix. A Python
 installation may work, but it is best-effort and must not be advertised as
@@ -41,11 +41,13 @@ bash install.sh --no-install --no-menu --yes
 ```
 
 > [!IMPORTANT]
-> Do not use
+> This repository is a source preview rather than a supported package release.
+> Repository visibility alone does not make the raw installer, a release tag,
+> or the tap supported. Do not use
 > `pip install atlas` or `brew install atlas`: those names resolve to unrelated
 > projects. Atlas uses `atlas-download-manager` as its distribution and formula
-> identity. Install the supported formula with
-> `brew install xkam7ar/tap/atlas-download-manager`.
+> identity, but a public release must still be published before remote install
+> instructions can become active.
 
 The installer detects the host and missing executables, shows every bootstrap,
 package-manager, Atlas, and verification command, then asks once. `--yes`
@@ -87,33 +89,35 @@ bash install.sh --release-ref 0123456789abcdef0123456789abcdef01234567
 ```
 
 The installer verifies an existing `atlas` command by checking that it supports
-`atlas setup`. The supported Homebrew formula installs compatible Python and all
-runtime dependencies. The guided installer can use `uv tool` for a verified
-release commit; uv downloads compatible Python and Python dependencies.
-Installation fails unless every selected executable is present and
-`atlas doctor` succeeds.
+`atlas setup`. If the tap formula is unavailable, it installs `uv` with the
+official standalone installer and uses `uv tool`; uv downloads compatible Python
+and Python dependencies. Installation fails unless every selected executable is
+present and `atlas doctor` succeeds.
 
 ## Homebrew release packaging
 
-Install the release-complete, collision-safe formula from the official tap:
+Once the tap contains a release-complete and collision-safe formula, the
+intended install path is:
 
 ```bash
 brew install xkam7ar/tap/atlas-download-manager
 ```
 
-The formula depends on the full runtime:
+The formula is expected to depend on the full runtime:
 
 ```bash
 brew install ffmpeg aria2 wget2 wget
 ```
 
 > [!NOTE]
-> The canonical formula source lives at
-> [`packaging/homebrew/atlas-download-manager.rb`](../packaging/homebrew/atlas-download-manager.rb)
-> and is published to `xkam7ar/homebrew-tap`. It uses an immutable release asset,
-> a verified SHA-256 digest, and declared Python resources. Homebrew core already
-> has an unrelated `atlas` executable, so this formula uses the collision-safe
-> name and declares the executable conflict explicitly.
+> The checked-in formula is not itself a published release. The template lives at
+> [`packaging/homebrew/atlas-download-manager.rb`](../packaging/homebrew/atlas-download-manager.rb). Copy it into
+> the tap, replace the release SHA, and run `brew update-python-resources atlas-download-manager`
+> before publishing so Python dependencies are declared as Homebrew resources.
+> It is release-ready only after the tap has a tagged tarball SHA and generated
+> Python resource blocks. Homebrew core already has an unrelated `atlas`
+> executable; this template uses the collision-safe formula name and declares
+> the executable conflict explicitly.
 
 ## Manual and developer fallback
 

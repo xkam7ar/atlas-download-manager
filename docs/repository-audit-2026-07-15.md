@@ -5,9 +5,9 @@
 > **Status update — 2026-07-16:** The source repository is now public at
 > <https://github.com/xkam7ar/atlas-download-manager>. The repository,
 > distribution, and formula identity is `atlas-download-manager`, while the
-> command remains `atlas`. Release v0.1.0 and the official Homebrew tap resolve
-> the historical publication blockers recorded below; the findings remain here
-> as an audit-time snapshot.
+> command remains `atlas`. Atlas still has no supported package, Homebrew
+> formula, immutable tag, or release archive, so the remaining release blockers
+> recorded below remain active unless a later release says otherwise.
 
 Atlas received a repository-wide, documentation-led audit using 30 independent
 subagent passes plus a coordinating integration pass. The review covered source,
@@ -165,8 +165,8 @@ under Python 3.12 and 3.14 and reproducible consecutive local builds.
 ### P0 — public release sources
 
 - The repository was unavailable when this audit ran and became public on
-  2026-07-16. Release v0.1.0 now provides its installer, archive, checksum
-  manifest, and documented Homebrew tap.
+  2026-07-16. Its raw release installer, v0.1.0 archive, and documented tap are
+  still unavailable.
 - PyPI `atlas` is an unrelated AI-agent package.
 - Homebrew core `atlas` is the unrelated AtlasGo database tool and installs the
   same executable name.
@@ -178,11 +178,12 @@ local installer refuses uv installation without the verified release's full
 commit ID, and `atlas update` applies the same rule. Formula URLs still require
 an atomic release change.
 
-### P0 — Homebrew formula publication (resolved in v0.1.0)
+### P0 — Homebrew formula cannot be published yet
 
-The v0.1.0 formula uses an immutable release archive, verified SHA-256, generated
-Python resource blocks, and the official tap. The collision-safe formula name
-retains its declared conflict with Homebrew core's unrelated `atlas` package.
+The formula still has a placeholder SHA, a nonexistent tag URL, and no generated
+Python resource blocks. A real immutable release archive, SHA-256, resources,
+tap repository, and validation of the declared `atlas` executable conflict are
+mandatory before publication.
 
 ### P1 — uninstall and rollback contract is incomplete
 

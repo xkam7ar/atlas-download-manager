@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import ipaddress
 import re
-import tomllib
 from pathlib import Path
 from urllib.parse import SplitResult, unquote, urlsplit
 
 from typer.main import get_command
 
-from atlas import __version__
 from atlas.cli import app
 from atlas.config import AtlasSettings
 from atlas.models import ProgressMode
@@ -275,18 +273,3 @@ def test_canonical_quality_gate_is_consistent() -> None:
         text = guide.read_text(encoding="utf-8")
         missing = [command for command in commands if command not in text]
         assert not missing, f"{guide.relative_to(ROOT)} omits quality gates: {missing}"
-
-
-def test_homebrew_formula_matches_release_identity() -> None:
-    metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    formula = (ROOT / "packaging/homebrew/atlas-download-manager.rb").read_text(encoding="utf-8")
-    version = metadata["project"]["version"]
-
-    assert version == __version__
-    assert f"/v{version}/atlas_download_manager-{version}.tar.gz" in formula
-    assert re.search(r'^  sha256 "[0-9a-f]{64}"$', formula, flags=re.MULTILINE)
-    assert "disable!" not in formula
-    assert 'depends_on "maturin" => :build' in formula
-    assert 'depends_on "rust" => :build' in formula
-    assert 'system "#{bin}/atlas", "doctor"' not in formula
-    assert "/packaging" in metadata["tool"]["hatch"]["build"]["exclude"]

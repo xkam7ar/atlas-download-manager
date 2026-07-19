@@ -50,7 +50,7 @@ Linux. When missing and needed, its official bootstrap command appears in the
 complete installer plan. Approving that plan authorizes the bootstrap; Atlas
 never runs it before showing it.
 
-From a source checkout, inspect the local installer plan:
+In this pre-release checkout, inspect the local installer plan:
 
 ```bash
 bash install.sh --no-install --no-menu --yes
@@ -95,22 +95,18 @@ atlas setup --no-install
 atlas doctor
 ```
 
-## Homebrew install or upgrade fails
+## Homebrew formula is not available
 
-Refresh the tap and reinstall its formula:
+Until the tap and an immutable release are published,
+`xkam7ar/tap/atlas-download-manager` and the bootstrap installer's remote Git
+fallback are unavailable. Install this checkout with `uv tool install . --force`;
+use the installer only in `--no-install` mode to review its future plan. Do not
+replace the tap-qualified command with `brew install atlas`, which installs an
+unrelated database tool.
 
-```bash
-brew update
-brew reinstall xkam7ar/tap/atlas-download-manager
-brew test xkam7ar/tap/atlas-download-manager
-```
-
-Inspect `brew doctor` and `brew config` if the failure continues. Do not replace
-the tap-qualified command with `brew install atlas`, which installs an unrelated
-database tool. If another `atlas` command was installed earlier, compare
-`command -v atlas` with
-`"$(brew --prefix atlas-download-manager)/bin/atlas"` to identify which copy is
-running.
+The checked-in Homebrew formula under `packaging/homebrew/atlas-download-manager.rb` is a release
+template. The tap formula must have the release tarball SHA and generated Python
+resource blocks before it is publishable.
 
 ## Missing ffmpeg or ffprobe
 
