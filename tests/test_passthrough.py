@@ -15,6 +15,7 @@ from atlas.passthrough import (
     run_backend_command,
 )
 from atlas.runner import SubprocessResult
+from atlas.setup import PackageManager, SetupEnvironment
 
 runner = CliRunner()
 
@@ -76,6 +77,18 @@ def test_aria2_dry_run_uses_resolved_binary(monkeypatch) -> None:
 
 def test_missing_backend_reports_install_hint(monkeypatch) -> None:
     monkeypatch.setattr("atlas.passthrough.shutil.which", lambda _name: None)
+    monkeypatch.setattr(
+        "atlas.setup.detect_setup_environment",
+        lambda: SetupEnvironment(
+            os_name="macOS",
+            architecture="arm64",
+            shell="zsh",
+            package_manager=PackageManager.homebrew,
+            package_manager_path="/opt/homebrew/bin/brew",
+            install_method="unknown",
+            atlas_executable=None,
+        ),
+    )
 
     result = runner.invoke(app, ["wget2", "--dry-run", "--", "--version"])
 

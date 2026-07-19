@@ -1,4 +1,8 @@
 .venv/
+# macOS Finder metadata
+.DS_Store
+.AppleDouble
+._*
 .pytest_cache/
 .ruff_cache/
 __pycache__/

@@ -567,7 +567,7 @@ def test_update_json_outputs_detected_command(monkeypatch: pytest.MonkeyPatch) -
         "atlas.cli.build_update_plan",
         lambda: UpdatePlan(
             install_method="homebrew",
-            command=("brew", "upgrade", "xkam7ar/tap/atlas"),
+            command=("brew", "upgrade", "xkam7ar/tap/atlas-download-manager"),
             detail="Atlas appears to be installed through Homebrew.",
             can_update=True,
         ),
@@ -578,7 +578,29 @@ def test_update_json_outputs_detected_command(monkeypatch: pytest.MonkeyPatch) -
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["install_method"] == "homebrew"
-    assert payload["command"] == ["brew", "upgrade", "xkam7ar/tap/atlas"]
+    assert payload["command"] == ["brew", "upgrade", "xkam7ar/tap/atlas-download-manager"]
+
+
+def test_update_passes_explicit_release_ref_to_uv_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[str | None] = []
+
+    def fake_plan(*, release_ref: str | None = None) -> UpdatePlan:
+        captured.append(release_ref)
+        return UpdatePlan(
+            install_method="uv-tool",
+            command=("uv", "tool", "install", "--force", f"git+repo@{release_ref}"),
+            detail="Pinned uv-tool update.",
+            can_update=True,
+        )
+
+    monkeypatch.setattr("atlas.cli.build_update_plan", fake_plan)
+
+    release_ref = "a" * 40
+    result = runner.invoke(app, ["update", "--release-ref", release_ref, "--json"])
+
+    assert result.exit_code == 0
+    assert captured == [release_ref]
+    assert json.loads(result.output)["command"][-1] == f"git+repo@{release_ref}"
 
 
 def test_setup_and_update_panels_follow_selected_theme_styles(tmp_path: Path) -> None:
@@ -598,7 +620,7 @@ def test_setup_and_update_panels_follow_selected_theme_styles(tmp_path: Path) ->
         cli._print_update_plan(
             UpdatePlan(
                 install_method="homebrew",
-                command=("brew", "upgrade", "xkam7ar/tap/atlas"),
+                command=("brew", "upgrade", "xkam7ar/tap/atlas-download-manager"),
                 detail="Atlas appears to be installed through Homebrew.",
                 can_update=True,
             )
@@ -1199,7 +1221,10 @@ def test_file_dry_run_human_uses_smart_plan_preview() -> None:
 
     assert result.exit_code == 0
     assert "Dry Run Plan" in result.output
-    assert "Equivalent Backend Command" in result.output
+    assert "Resolved Backend Plan" in result.output
+    assert "Connections" in result.output
+    assert "Segments" in result.output
+    assert "Actions" not in result.output
     assert "rerun with --json" in result.output
     assert '"route":' not in result.output
     assert '"summary":' not in result.output
@@ -2420,7 +2445,7 @@ def test_dir_adaptive_explain_human_uses_smart_plan_preview(
     assert result.exit_code == 0
     assert "Explain Plan" in result.output
     assert "Scheduler" in result.output
-    assert "Equivalent Backend Command" in result.output
+    assert "Resolved Backend Plan" in result.output
     assert "crawler queue with per-host politeness" in result.output
     assert '"route":' not in result.output
     assert '"summary":' not in result.output
@@ -2468,7 +2493,7 @@ def test_dir_adaptive_explain_human_surfaces_failed_scan(
     assert "Scan" in result.output
     assert "failed · HTTP 403: Forbidden" in result.output
     assert "backend mirror plan continues without verified discovery" in result.output
-    assert "Equivalent Backend Command" in result.output
+    assert "Resolved Backend Plan" in result.output
 
 
 def test_dir_adaptive_explain_preserves_partial_root_discovery(
@@ -2932,6 +2957,126 @@ def test_get_routes_file_to_direct_download_dry_run() -> None:
     assert result.exit_code == 0
     assert '"backend": "native"' in result.output
     assert "archive.zip" in result.output
+
+
+def test_get_file_dry_run_human_uses_one_smart_plan_preview() -> None:
+    result = runner.invoke(
+        app,
+        [
+            "--plain",
+            "--no-unicode",
+            "get",
+            "https://example.com/archive.zip",
+            "--kind",
+            "file",
+            "--backend",
+            "native",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.output.count("Dry Run Plan") == 1
+    assert "Resolved Backend Plan" in result.output
+    assert "rerun with --json" in result.output
+    assert "Download Plan" not in result.output
+    assert "Probe" not in result.output
+    assert "Connections" not in result.output
+    assert "Segments" not in result.output
+    assert "Detected" not in result.output
+    assert "Actions" not in result.output
+    assert "built-in downloader; no external transfer tool required" in result.output
+    assert "native fallback available if aria2c is unavailable" not in result.output
+    assert all(character not in result.output for character in "╭╮╰╯│─")
+
+
+def test_get_file_explain_human_uses_one_smart_plan_preview() -> None:
+    result = runner.invoke(
+        app,
+        [
+            "get",
+            "https://example.com/archive.zip",
+            "--kind",
+            "file",
+            "--backend",
+            "native",
+            "--explain",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.output.count("Explain Plan") == 1
+    assert "Resolved Backend Plan" in result.output
+    assert "Download Plan" not in result.output
+    assert "Probe" not in result.output
+
+
+def test_get_file_execution_uses_one_focused_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "atlas.optimizer.probe_direct_file",
+        lambda url: DirectFileProbe(
+            url=url,
+            final_url=url,
+            content_type="application/zip",
+            content_length=1024,
+            supports_ranges=True,
+            file_extension=".zip",
+            host="example.com",
+            final_host="example.com",
+        ),
+    )
+    monkeypatch.setattr(
+        "atlas.cli.DirectFileAdapter.run",
+        lambda _self, options, **_kwargs: DownloadResult(
+            status=DownloadStatus.success,
+            url=options.url,
+            message="saved",
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "get",
+            "https://example.com/archive.zip",
+            "--kind",
+            "file",
+            "--backend",
+            "native",
+            "--output-dir",
+            str(tmp_path),
+            "--progress",
+            "none",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.output.count("File Download") == 1
+    assert "Download Plan" not in result.output
+    assert "'final_url':" not in result.output
+
+
+def test_get_wget2_dry_run_human_only_shows_supported_concurrency() -> None:
+    result = runner.invoke(
+        app,
+        [
+            "get",
+            "https://example.com/archive.zip",
+            "--kind",
+            "file",
+            "--backend",
+            "wget2",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Connections" in result.output
+    assert "Segments" not in result.output
+    assert "Resolved Backend Plan" in result.output
 
 
 def test_get_routes_file_to_wget2_dry_run() -> None:

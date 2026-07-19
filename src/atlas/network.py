@@ -195,15 +195,15 @@ class FetchClient:
                     ),
                 )
         except HTTPError as exc:
-            raise FetchError(
-                FetchFailure(
-                    code=FetchErrorCode.http_error,
-                    message=f"HTTP {exc.code}: {exc.reason}",
-                    url=url,
-                    recoverable=exc.code >= 500 or exc.code in {408, 429},
-                    status_code=exc.code,
-                )
-            ) from exc
+            failure = FetchFailure(
+                code=FetchErrorCode.http_error,
+                message=f"HTTP {exc.code}: {exc.reason}",
+                url=url,
+                recoverable=exc.code >= 500 or exc.code in {408, 429},
+                status_code=exc.code,
+            )
+            exc.close()
+            raise FetchError(failure) from exc
         except TimeoutError as exc:
             raise FetchError(
                 FetchFailure(

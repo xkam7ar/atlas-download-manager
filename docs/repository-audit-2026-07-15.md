@@ -2,6 +2,13 @@
 
 ## Outcome
 
+> **Status update — 2026-07-16:** The source repository is now public at
+> <https://github.com/xkam7ar/atlas-download-manager>. The repository,
+> distribution, and formula identity is `atlas-download-manager`, while the
+> command remains `atlas`. Atlas still has no supported package, Homebrew
+> formula, immutable tag, or release archive, so the remaining release blockers
+> recorded below remain active unless a later release says otherwise.
+
 Atlas received a repository-wide, documentation-led audit using 30 independent
 subagent passes plus a coordinating integration pass. The review covered source,
 tests, CLI/menu behavior, downloader backends, network and filesystem trust
@@ -9,11 +16,12 @@ boundaries, concurrency, configuration, artifacts, packaging, CI, and release
 documentation.
 
 The implementation and local package are materially stronger and all local
-quality gates pass. The project is **not public-release ready**: its documented
-GitHub repository, raw installer, release tag, and Homebrew tap are unavailable,
-and the PyPI/Homebrew name `atlas` is already owned by unrelated projects. Those
-issues require an explicit distribution-identity decision and external release
-work; they cannot be safely inferred or patched in this checkout.
+quality gates pass. At audit time, the project was **not public-release ready**:
+its documented GitHub repository, raw installer, release tag, and Homebrew tap
+were unavailable, and the PyPI/Homebrew name `atlas` was already owned by
+unrelated projects. The repository is public now and the distribution identity
+has since been selected. The remaining issues require external release work and
+cannot be activated merely by making the source visible.
 
 The initial suite collected 813 tests. The final suite collects 876 tests and
 passes with all Python warnings promoted to errors, including the two bounded
@@ -143,34 +151,39 @@ local Wget2 integration tests.
 | `git diff --check` | Pass |
 | `sh -n install.sh` | Pass |
 | `./install.sh --no-install --no-menu --yes` | Pass; plan only |
-| `ruby -c packaging/homebrew/atlas.rb` | Pass |
+| `ruby -c packaging/homebrew/atlas-download-manager.rb` | Pass |
 | `uv build` | Pass — wheel and sdist |
 | `twine check` | Pass — wheel and sdist |
 | Clean CPython 3.13 wheel install, help/version/dry-run smoke | Pass |
-| `brew style packaging/homebrew/atlas.rb` | Expected release blocker — three placeholder SHA findings |
+| `brew style packaging/homebrew/atlas-download-manager.rb` | Expected release blocker — three placeholder SHA findings |
 
 Additional specialist packaging passes verified clean-wheel CLI smoke behavior
 under Python 3.12 and 3.14 and reproducible consecutive local builds.
 
 ## Remaining ranked issues
 
-### P0 — distribution identity and public sources
+### P0 — public release sources
 
-- `https://github.com/xkam7ar/atlas`, its raw installer and v0.1.0 archive, and
-  the documented tap are unavailable as of this audit.
+- The repository was unavailable when this audit ran and became public on
+  2026-07-16. Its raw release installer, v0.1.0 archive, and documented tap are
+  still unavailable.
 - PyPI `atlas` is an unrelated AI-agent package.
 - Homebrew core `atlas` is the unrelated AtlasGo database tool and installs the
   same executable name.
 
-Required decision: select a collision-free distribution/formula identity,
-confirm whether the CLI remains `atlas`, publish the repository, and update every
-installer/update/formula URL as one atomic release change.
+Resolved identity decision: use `atlas-download-manager` for the repository,
+distribution, and formula while keeping the CLI and import package as `atlas`.
+Public repository visibility remains separate from release activation: the
+local installer refuses uv installation without the verified release's full
+commit ID, and `atlas update` applies the same rule. Formula URLs still require
+an atomic release change.
 
 ### P0 — Homebrew formula cannot be published yet
 
 The formula still has a placeholder SHA, a nonexistent tag URL, and no generated
 Python resource blocks. A real immutable release archive, SHA-256, resources,
-tap repository, and conflict strategy are mandatory before publication.
+tap repository, and validation of the declared `atlas` executable conflict are
+mandatory before publication.
 
 ### P1 — uninstall and rollback contract is incomplete
 
@@ -179,12 +192,12 @@ Current mutation is previewed and bounded, but guided installation can add
 package-manager tools that are not automatically removed. Define ownership and
 document safe cleanup before calling installation fully reversible.
 
-### P1 — immutable release/dependency policy
+### P1 — release/dependency policy
 
-Planned Git installs use a mutable branch and resolve dependency ranges rather
-than consuming this checkout's lockfile. Publish tagged/commit-pinned artifacts
-and define whether release dependencies are locked, constrained, or tested at
-both minimum and newest supported versions.
+Git installs are now blocked unless the operator supplies the verified release's
+full commit ID. A release must still publish checksums and define whether
+release dependencies are locked, constrained, or tested at both minimum and
+newest supported versions.
 
 ### P2 — release hygiene and platform matrix
 

@@ -400,6 +400,7 @@ def test_install_script_no_install_does_not_require_homebrew(tmp_path: Path) -> 
     script = Path(__file__).resolve().parents[1] / "install.sh"
     env = {
         **os.environ,
+        "ATLAS_OS": "Darwin",
         "PATH": "/usr/bin:/bin",
         "HOME": str(tmp_path),
     }
@@ -429,14 +430,19 @@ def test_update_plan_uses_install_method_specific_commands(
     assert build_update_plan(install_method="homebrew").command == (
         "brew",
         "upgrade",
-        "xkam7ar/tap/atlas",
+        "xkam7ar/tap/atlas-download-manager",
     )
-    assert build_update_plan(install_method="uv-tool").command == (
+    blocked_uv_update = build_update_plan(install_method="uv-tool")
+    assert blocked_uv_update.command is None
+    assert blocked_uv_update.can_update is False
+    assert "--release-ref" in blocked_uv_update.detail
+    release_ref = "a" * 40
+    assert build_update_plan(install_method="uv-tool", release_ref=release_ref).command == (
         "uv",
         "tool",
         "install",
         "--force",
-        "git+https://github.com/xkam7ar/atlas.git",
+        f"git+https://github.com/xkam7ar/atlas-download-manager.git@{release_ref}",
     )
     assert build_update_plan(install_method="source-checkout").command == (
         "git",
@@ -446,6 +452,33 @@ def test_update_plan_uses_install_method_specific_commands(
         "--ff-only",
     )
     assert build_update_plan(install_method="unknown").can_update is False
+
+
+@pytest.mark.parametrize(
+    "release_ref",
+    ["main", "master", "HEAD", "v1.2", "v1.2.3", "feature/v1.2.3", "a" * 39],
+)
+def test_uv_update_rejects_mutable_or_malformed_refs(release_ref: str) -> None:
+    plan = build_update_plan(install_method="uv-tool", release_ref=release_ref)
+
+    assert plan.can_update is False
+    assert plan.command is None
+
+
+def test_uv_update_accepts_full_commit_id() -> None:
+    release_ref = "a" * 40
+
+    plan = build_update_plan(install_method="uv-tool", release_ref=release_ref)
+
+    assert plan.command is not None
+    assert plan.command[-1].endswith(f"@{release_ref}")
+
+
+def test_ytdlp_repair_hint_never_tracks_the_default_branch() -> None:
+    hint = install_hint_for_tool("yt-dlp")
+
+    assert hint == "atlas update --release-ref <40-character-commit-id>"
+    assert "git+" not in hint
 
 
 def test_detect_install_method_resolves_uv_tool_launcher_symlink(tmp_path: Path) -> None:

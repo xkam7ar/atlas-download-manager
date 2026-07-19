@@ -97,14 +97,14 @@ atlas doctor
 
 ## Homebrew formula is not available
 
-Before the public repository and tap are published, both
-`xkam7ar/tap/atlas` and the bootstrap installer's GitHub fallback are
-unavailable. Install this checkout with `uv tool install . --force`; use the
-installer only in `--no-install` mode to review its future plan. Do not replace
-the tap-qualified command with `brew install atlas`, which installs an unrelated
-database tool.
+Until the tap and an immutable release are published,
+`xkam7ar/tap/atlas-download-manager` and the bootstrap installer's remote Git
+fallback are unavailable. Install this checkout with `uv tool install . --force`;
+use the installer only in `--no-install` mode to review its future plan. Do not
+replace the tap-qualified command with `brew install atlas`, which installs an
+unrelated database tool.
 
-The checked-in Homebrew formula under `packaging/homebrew/atlas.rb` is a release
+The checked-in Homebrew formula under `packaging/homebrew/atlas-download-manager.rb` is a release
 template. The tap formula must have the release tarball SHA and generated Python
 resource blocks before it is publishable.
 
@@ -310,9 +310,12 @@ Symptoms:
 Try updating the installed tool:
 
 ```bash
-atlas update
-uv tool install --force git+https://github.com/xkam7ar/atlas.git
+atlas update --release-ref 0123456789abcdef0123456789abcdef01234567
 ```
+
+Use only the full commit ID published and verified with the release you intend
+to install. Atlas will not update a uv-tool installation from a branch or tag
+name.
 
 From a local development checkout, update dependencies or reinstall that
 checkout explicitly:

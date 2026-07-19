@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/xkam7ar/atlas-download-manager/security/advisories/new
+    about: Report vulnerabilities privately. Do not disclose security details in an issue.
+  - name: Support and usage questions
+    url: https://github.com/xkam7ar/atlas-download-manager/blob/main/SUPPORT.md
+    about: Read the support policy before opening an issue.
+  - name: Questions and ideas
+    url: https://github.com/xkam7ar/atlas-download-manager/discussions
+    about: Ask a usage question or discuss an idea before filing a focused issue.

@@ -5,12 +5,25 @@ welcome, including bug fixes, patches, performance improvements, upgrades,
 new features, documentation, tests, accessibility work, design feedback, and
 maintenance updates.
 
+Participation in this project is governed by the
+[Code of Conduct](CODE_OF_CONDUCT.md). For usage questions and security
+reporting routes, see [SUPPORT.md](SUPPORT.md) and [SECURITY.md](SECURITY.md).
+
 ## Before you start
 
 1. Check existing issues and pull requests to avoid duplicate work.
 2. For a substantial change, open an issue first to discuss the approach.
 3. Keep contributions focused, well tested, and consistent with the project's
    existing style.
+
+## Start small
+
+New contributors are welcome. Browse
+[`good first issue`](https://github.com/xkam7ar/atlas-download-manager/labels/good%20first%20issue)
+or [`help wanted`](https://github.com/xkam7ar/atlas-download-manager/labels/help%20wanted),
+or improve a focused test, accessibility detail, troubleshooting path, or
+backend-specific example. If no suitable issue is open, use the contribution
+routes above before investing in a larger change.
 
 ## Development setup
 

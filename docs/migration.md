@@ -8,6 +8,8 @@ directories.
 
 | Area | Atlas value |
 | --- | --- |
+| Product | Atlas Download Manager |
+| Distribution/repository/formula | `atlas-download-manager` |
 | CLI command | `atlas` |
 | Python package | `atlas` |
 | Config env prefix | `ATLAS_` |
@@ -19,10 +21,11 @@ directories.
 
 ## Install This Pre-release Checkout
 
-The documented GitHub repository, raw installer, release tag, and Homebrew tap
-are not public yet. The unqualified PyPI and Homebrew `atlas` names also belong
-to unrelated projects, so do not install either one expecting this application.
-Install the current checkout with uv:
+This repository is distributed as a source preview, not as a supported package
+release. The unqualified PyPI and Homebrew `atlas` names belong to unrelated
+projects; this project uses the collision-safe distribution name
+`atlas-download-manager` while keeping the `atlas` command. No package release
+exists yet, so install the current checkout with uv:
 
 ```bash
 uv tool install . --force
@@ -34,12 +37,17 @@ The local guided installer can be reviewed without mutation:
 bash install.sh --no-install --no-menu --yes
 ```
 
-After a public repository and collision-free release identity exist, the
-intended GitHub path is:
+A future supported release must publish a tag and its full commit ID. Verify the
+release metadata, then install using the commit ID:
 
 ```bash
-uv tool install git+https://github.com/xkam7ar/atlas.git
+release_commit=0123456789abcdef0123456789abcdef01234567
+uv tool install "git+https://github.com/xkam7ar/atlas-download-manager.git@${release_commit}"
 ```
+
+Do not execute an installer from `main`; verify the installer and checksum
+manifest from the same immutable release before passing that ref to
+`install.sh --release-ref`.
 
 Then review and install the full system runtime:
 

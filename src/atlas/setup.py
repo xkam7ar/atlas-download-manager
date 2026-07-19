@@ -18,10 +18,10 @@ from atlas.config import AtlasSettings, settings_as_toml
 from atlas.paths import config_path, ensure_app_dirs
 from atlas.private_files import write_private_text
 
-ATLAS_REPOSITORY = "https://github.com/xkam7ar/atlas.git"
-ATLAS_RAW_INSTALL_URL = "https://raw.githubusercontent.com/xkam7ar/atlas/main/install.sh"
+ATLAS_REPOSITORY = "https://github.com/xkam7ar/atlas-download-manager.git"
 HOMEBREW_INSTALL_URL = "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
 LINUXBREW_PATH = "/home/linuxbrew/.linuxbrew/bin/brew"
+RELEASE_REF_PLACEHOLDER = "<40-character-commit-id>"
 
 
 class SetupMode(StrEnum):
@@ -300,9 +300,9 @@ def install_hint_for_tool(
     """Return a host-aware one-line install hint for a runtime tool."""
 
     if executable == "yt-dlp":
-        return f"uv tool install --force git+{ATLAS_REPOSITORY}"
+        return f"atlas update --release-ref {RELEASE_REF_PLACEHOLDER}"
     if executable == "atlas package":
-        return "brew install xkam7ar/tap/atlas"
+        return "brew install xkam7ar/tap/atlas-download-manager"
     tool = next((item for item in TOOL_SPECS if item.executable == executable), None)
     if tool is None:
         return "atlas doctor"
@@ -359,23 +359,49 @@ def apply_setup_plan(
 def build_update_plan(
     *,
     install_method: str | None = None,
+    release_ref: str | None = None,
     which: Callable[[str], str | None] = shutil.which,
 ) -> UpdatePlan:
-    """Return the command Atlas should use for the detected install method."""
+    """Return a safe update command for the detected install method.
+
+    Remote uv-tool updates require an explicit full commit ID so
+    making the repository public cannot silently turn the default branch into
+    an update channel. Source-checkout updates remain a deliberate local
+    development workflow.
+    """
 
     method = install_method or detect_install_method(which=which)
     if method == "homebrew":
         return UpdatePlan(
             install_method=method,
-            command=("brew", "upgrade", "xkam7ar/tap/atlas"),
+            command=("brew", "upgrade", "xkam7ar/tap/atlas-download-manager"),
             detail="Atlas appears to be installed through Homebrew.",
             can_update=True,
         )
     if method == "uv-tool":
+        if not is_immutable_release_ref(release_ref):
+            return UpdatePlan(
+                install_method=method,
+                command=None,
+                detail=(
+                    "Atlas remote updates are disabled for mutable branches. "
+                    "Resolve the intended release tag and pass --release-ref with its full "
+                    "40-character commit ID."
+                ),
+                can_update=False,
+            )
+        assert release_ref is not None
+        resolved_ref = release_ref.strip()
         return UpdatePlan(
             install_method=method,
-            command=("uv", "tool", "install", "--force", f"git+{ATLAS_REPOSITORY}"),
-            detail="Atlas appears to be installed as a uv tool.",
+            command=(
+                "uv",
+                "tool",
+                "install",
+                "--force",
+                f"git+{ATLAS_REPOSITORY}@{resolved_ref}",
+            ),
+            detail=f"Atlas appears to be installed as a uv tool; release ref: {resolved_ref}.",
             can_update=True,
         )
     if method == "source-checkout":
@@ -399,10 +425,21 @@ def build_update_plan(
         install_method=method,
         command=None,
         detail=(
-            "Atlas could not determine its install method. Use Homebrew, the curl installer, "
-            "or uv tool install to update."
+            "Atlas could not determine its install method. Reinstall from this local checkout "
+            "or from a verified, immutable release artifact."
         ),
         can_update=False,
+    )
+
+
+def is_immutable_release_ref(release_ref: str | None) -> bool:
+    """Return whether a ref is a full Git commit object ID."""
+
+    if release_ref is None:
+        return False
+    candidate = release_ref.strip()
+    return len(candidate) == 40 and all(
+        character in "0123456789abcdefABCDEF" for character in candidate
     )
 
 

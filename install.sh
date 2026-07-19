@@ -1,8 +1,9 @@
 #!/usr/bin/env sh
 set -eu
 
-ATLAS_REPO="${ATLAS_REPO:-https://github.com/xkam7ar/atlas.git}"
-ATLAS_TAP_FORMULA="${ATLAS_TAP_FORMULA:-xkam7ar/tap/atlas}"
+ATLAS_REPO="${ATLAS_REPO:-https://github.com/xkam7ar/atlas-download-manager.git}"
+ATLAS_RELEASE_REF="${ATLAS_RELEASE_REF:-}"
+ATLAS_TAP_FORMULA="${ATLAS_TAP_FORMULA:-xkam7ar/tap/atlas-download-manager}"
 HOMEBREW_INSTALL_URL="https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
 UV_INSTALL_URL="https://astral.sh/uv/install.sh"
 MODE="full"
@@ -22,8 +23,8 @@ usage() {
 Atlas installer
 
 Usage:
-  curl -fsSL https://raw.githubusercontent.com/xkam7ar/atlas/main/install.sh | bash
-  bash install.sh [--full|--minimal|--media-only|--mirrors] [--yes] [--no-install] [--no-menu]
+  bash install.sh --no-install --no-menu --yes
+  bash install.sh --release-ref COMMIT_ID [--full|--minimal|--media-only|--mirrors] [--yes] [--no-menu]
 
 Options:
   --full        Install/check ffmpeg, ffprobe, aria2, wget2, and wget. Default.
@@ -31,6 +32,8 @@ Options:
   --media-only  Install/check ffmpeg and ffprobe only.
   --mirrors     Install/check wget2 and wget only.
   --yes, -y     Approve the displayed plan without an Atlas confirmation prompt.
+  --release-ref Full 40-character commit ID for a verified release.
+                Required before this script may install Atlas with uv.
   --no-install  Print the plan only; do not install packages or create Atlas paths.
   --no-menu     Do not launch atlas after install.
   --help        Show this help.
@@ -44,6 +47,11 @@ while [ "$#" -gt 0 ]; do
     --media-only) MODE="media-only" ;;
     --mirrors) MODE="mirrors" ;;
     --yes|-y) YES="1" ;;
+    --release-ref)
+      [ "$#" -ge 2 ] || { echo "--release-ref requires a value." >&2; exit 2; }
+      ATLAS_RELEASE_REF="$2"
+      shift
+      ;;
     --no-install) NO_INSTALL="1" ;;
     --no-menu) OPEN_MENU="0" ;;
     --help|-h) usage; exit 0 ;;
@@ -51,6 +59,20 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+is_immutable_release_ref() {
+  candidate="$1"
+  [ "${#candidate}" -eq 40 ] || return 1
+  case "$candidate" in
+    *[!0123456789abcdefABCDEF]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+if [ -n "$ATLAS_RELEASE_REF" ] && ! is_immutable_release_ref "$ATLAS_RELEASE_REF"; then
+  echo "Invalid --release-ref: use the verified release's full 40-character commit ID." >&2
+  exit 2
+fi
 
 confirm_plan() {
   [ "$YES" = "1" ] && return 0
@@ -203,6 +225,11 @@ show_plan() {
   echo "OS: $OS_NAME"
   echo "Package manager: $PACKAGE_MANAGER"
   echo "Repository: $ATLAS_REPO"
+  if [ -n "$ATLAS_RELEASE_REF" ]; then
+    echo "Release ref: $ATLAS_RELEASE_REF"
+  else
+    echo "Release ref: not set (remote uv installation disabled)"
+  fi
   echo
   echo "Plan:"
   if [ -n "$NATIVE_PACKAGES" ]; then
@@ -246,10 +273,14 @@ show_plan() {
 
 show_uv_plan() {
   indent="$1"
+  if [ -z "$ATLAS_RELEASE_REF" ]; then
+    echo "${indent}blocked: resolve the release tag and pass its full 40-character commit ID"
+    return
+  fi
   if ! command -v uv >/dev/null 2>&1; then
     echo "${indent}curl -LsSf $UV_INSTALL_URL | sh"
   fi
-  echo "${indent}uv tool install --force git+$ATLAS_REPO"
+  echo "${indent}uv tool install --force git+$ATLAS_REPO@$ATLAS_RELEASE_REF"
 }
 
 install_homebrew() {
@@ -368,8 +399,12 @@ install_atlas() {
   }; then
     "$BREW" install "$ATLAS_TAP_FORMULA" || "$BREW" upgrade "$ATLAS_TAP_FORMULA"
   else
+    if [ -z "$ATLAS_RELEASE_REF" ]; then
+      echo "Atlas uv installation requires --release-ref; mutable default branches are not an install channel." >&2
+      return 1
+    fi
     install_uv
-    "$UV" tool install --force "git+$ATLAS_REPO"
+    "$UV" tool install --force "git+$ATLAS_REPO@$ATLAS_RELEASE_REF"
   fi
   resolve_atlas
   if [ -z "$ATLAS_BIN" ]; then
@@ -404,6 +439,15 @@ if [ "$NO_INSTALL" = "1" ]; then
   echo "Plan only; no changes made."
   exit 0
 fi
+
+case "$ATLAS_INSTALL_METHOD" in
+  uv|formula-after-bootstrap)
+    if [ -z "$ATLAS_RELEASE_REF" ]; then
+      echo "Atlas remote installation is disabled without --release-ref; no changes made." >&2
+      exit 1
+    fi
+    ;;
+esac
 
 if [ "$PACKAGE_MANAGER" = "none" ] && [ "$OS_NAME" != "Darwin" ] && \
    [ -n "$BREW_PACKAGES" ]; then

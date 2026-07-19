@@ -15,13 +15,19 @@ def _executable(path: Path, source: str) -> None:
 
 
 def _installer_env(tmp_path: Path, bin_dir: Path) -> dict[str, str]:
+    # Keep package-manager discovery hermetic.  In particular, GitHub's Ubuntu
+    # runners provide /usr/bin/apt-get, which would otherwise take precedence
+    # over a fake dnf or pacman created by an individual test.
+    shell = bin_dir / "sh"
+    if not shell.exists():
+        shell.symlink_to("/bin/sh")
     return {
         **os.environ,
         "ATLAS_OS": "Linux",
         "ATLAS_TEST_BIN": str(bin_dir),
         "ATLAS_TEST_LOG": str(tmp_path / "commands.log"),
         "HOME": str(tmp_path / "home"),
-        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "PATH": str(bin_dir),
     }
 
 
@@ -152,7 +158,15 @@ def test_installer_bootstraps_uv_with_official_installer(tmp_path: Path) -> None
     }
 
     result = subprocess.run(
-        ["sh", str(INSTALLER), "--full", "--yes", "--no-menu"],
+        [
+            "/bin/sh",
+            str(INSTALLER),
+            "--full",
+            "--yes",
+            "--no-menu",
+            "--release-ref",
+            "a" * 40,
+        ],
         check=False,
         capture_output=True,
         text=True,
@@ -163,7 +177,56 @@ def test_installer_bootstraps_uv_with_official_installer(tmp_path: Path) -> None
     assert result.returncode == 0, result.stdout + result.stderr
     assert "curl -LsSf https://astral.sh/uv/install.sh" in log
     assert "uv tool install --force git+" in log
+    assert f"@{'a' * 40}" in log
     assert "atlas setup --full --no-install" in log
+
+
+def test_installer_refuses_remote_uv_install_without_release_ref(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _executable(bin_dir / "id", "#!/bin/sh\necho 1000\n")
+    env = _installer_env(tmp_path, bin_dir)
+
+    result = subprocess.run(
+        ["/bin/sh", str(INSTALLER), "--full", "--yes", "--no-menu"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode == 1
+    assert "remote installation is disabled without --release-ref" in result.stderr
+    assert "git+https://github.com/xkam7ar/atlas-download-manager.git\n" not in result.stdout
+    assert not (tmp_path / "commands.log").exists()
+
+
+@pytest.mark.parametrize("release_ref", ["main", "master", "HEAD", "v1.2", "v1.2.3", "a" * 39])
+def test_installer_rejects_mutable_or_malformed_release_ref(
+    tmp_path: Path,
+    release_ref: str,
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    env = _installer_env(tmp_path, bin_dir)
+
+    result = subprocess.run(
+        [
+            "/bin/sh",
+            str(INSTALLER),
+            "--no-install",
+            "--no-menu",
+            "--release-ref",
+            release_ref,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode == 2
+    assert "Invalid --release-ref" in result.stderr
 
 
 def test_installer_yes_runs_plan_once_and_second_run_is_idempotent(tmp_path: Path) -> None:
@@ -182,7 +245,7 @@ def test_installer_yes_runs_plan_once_and_second_run_is_idempotent(tmp_path: Pat
         'if [ "${1:-}" = "install" ]; then\n'
         "  for tool in ffmpeg ffprobe aria2c wget2 wget; do\n"
         "    printf '#!/bin/sh\\nexit 0\\n' > \"$ATLAS_TEST_BIN/$tool\"\n"
-        '    chmod +x "$ATLAS_TEST_BIN/$tool"\n'
+        '    /bin/chmod +x "$ATLAS_TEST_BIN/$tool"\n'
         "  done\n"
         "fi\n",
     )

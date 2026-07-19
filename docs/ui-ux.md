@@ -854,7 +854,8 @@ Runtime tools
 ○ wget      mirror fallback backend
 ```
 
-`atlas update` should show the detected install method and one command. Unknown
+`atlas update` should show the detected install method and either one safe
+command or an explicit blocked reason. Unknown
 install methods should be explanatory, not alarming.
 
 Required missing dependencies should include an install hint.

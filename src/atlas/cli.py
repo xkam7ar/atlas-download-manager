@@ -1831,7 +1831,6 @@ def _print_backend_plan_preview(plan: dict[str, object], *, explain: bool) -> No
                 adaptive=adaptive,
                 scheduler_policy=scheduler_policy,
             ),
-            actions=("Start", "Customize", "Dry run", "Save manifest"),
         )
     )
 
@@ -1840,7 +1839,7 @@ def _print_backend_plan_preview(plan: dict[str, object], *, explain: bool) -> No
         command = shlex.join(str(arg) for arg in args)
         console.print(
             view.preview_panel(
-                title="Equivalent Backend Command",
+                title="Resolved Backend Plan",
                 content=command,
                 syntax="bash",
             )
@@ -1856,6 +1855,10 @@ def _backend_plan_sections(
     scheduler_policy: dict[str, object],
 ) -> dict[str, tuple[ViewField, ...]]:
     sections: dict[str, tuple[ViewField, ...]] = {}
+    mode = route.get("kind") or summary.get("mirror_kind") or session.get("intent")
+    detected = session.get("detected_kind")
+    if detected == mode:
+        detected = None
 
     discovery_rows = _scan_discovery_rows(adaptive)
     if discovery_rows:
@@ -1863,8 +1866,7 @@ def _backend_plan_sections(
 
     scope_rows = _plan_rows(
         (
-            ("Kind", route.get("kind") or summary.get("mirror_kind")),
-            ("Detected", session.get("detected_kind")),
+            ("Detected", detected),
             ("Depth", summary.get("depth")),
             ("No parent", summary.get("no_parent")),
             ("Domains", summary.get("domains")),
@@ -1902,15 +1904,28 @@ def _backend_plan_sections(
     if network_rows:
         sections["Network"] = network_rows
 
+    backend = str(adaptive.get("backend") or summary.get("backend") or "").lower()
+    route_engine = str(route.get("engine") or "").lower()
+    visible_backend = backend if backend != route_engine else None
+    connections = adaptive.get("max_total_connections") or summary.get("connections")
+    segments = adaptive.get("per_file_segments") or summary.get("splits")
+    if backend not in {"aria2", "wget2"}:
+        connections = None
+    if backend != "aria2":
+        segments = None
+    decision = adaptive.get("strategy") or scheduler_policy.get("strategy")
+    header_strategy = decision or summary.get("backend_reason") or "fixed backend plan"
+    if decision == header_strategy:
+        decision = None
     scheduler_rows = _plan_rows(
         (
             ("Mode", scheduler_policy.get("mode") or ("adaptive" if adaptive else None)),
             ("Queue", adaptive.get("queue_concurrency")),
             ("Per host", adaptive.get("per_host_concurrency")),
-            ("Connections", adaptive.get("max_total_connections") or summary.get("connections")),
-            ("Segments", adaptive.get("per_file_segments") or summary.get("splits")),
-            ("Backend", adaptive.get("backend") or summary.get("backend")),
-            ("Decision", adaptive.get("strategy") or scheduler_policy.get("strategy")),
+            ("Connections", connections),
+            ("Segments", segments),
+            ("Backend", visible_backend),
+            ("Decision", decision),
         ),
         active_labels={"Decision"},
     )
@@ -2560,23 +2575,19 @@ def _run_hub_get(
         checksum=checksum,
     )
     machine_progress = not json_output and progress_mode == ProgressMode.json
-    if explain and execution_plan.route.kind in {HubKind.audio, HubKind.video}:
+    if explain or dry_run:
+        preview = plan_as_dict(execution_plan.preview)
         if json_output:
-            _print_json(plan_as_dict(execution_plan.preview))
+            _print_json(preview)
         elif machine_progress:
             _print_dry_run_ndjson(
                 kind=execution_plan.route.kind,
                 url=url,
-                plan=plan_as_dict(execution_plan.preview),
+                plan=preview,
             )
         elif not quiet:
-            _print_hub_plan(execution_plan)
+            _print_backend_plan(preview, json_output=False, explain=explain)
         return []
-    if dry_run and json_output:
-        _print_json(plan_as_dict(execution_plan.preview))
-        return []
-    if not quiet and not json_output and not machine_progress:
-        _print_hub_plan(execution_plan)
     return _execute_hub_plan(settings, execution_plan)
 
 
@@ -9006,11 +9017,18 @@ def update_command(
         bool,
         typer.Option("--json", help="Machine-readable update plan."),
     ] = False,
+    release_ref: Annotated[
+        str | None,
+        typer.Option(
+            "--release-ref",
+            help="Full 40-character commit ID for a verified uv-tool release update.",
+        ),
+    ] = None,
 ) -> None:
     """Update Atlas using the detected install method."""
 
     try:
-        plan = build_update_plan()
+        plan = build_update_plan(release_ref=release_ref) if release_ref else build_update_plan()
         if json_output:
             _print_json(_update_plan_as_dict(plan))
             return

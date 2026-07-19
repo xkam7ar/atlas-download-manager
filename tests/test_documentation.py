@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import re
 from pathlib import Path
 from urllib.parse import SplitResult, unquote, urlsplit
@@ -17,6 +18,13 @@ MARKDOWN_FILES = (
     *sorted((ROOT / "docs").glob("*.md")),
 )
 MARKDOWN_LINK = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
+IPV4_LITERAL = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
+HOST_LIKE_TARGET = re.compile(
+    r"(?<![@\w.-])(?:https?://)?"
+    r"(?P<host>(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63})"
+    r"(?::\d{1,5})?(?:/[^\s`|)]*)?",
+    flags=re.IGNORECASE,
+)
 
 
 def _link_parts(raw_target: str) -> SplitResult:
@@ -78,6 +86,78 @@ def test_documentation_code_fences_are_balanced() -> None:
     ]
 
     assert not unbalanced, f"Unbalanced Markdown code fences: {unbalanced}"
+
+
+def test_first_download_example_is_executable_and_explicit() -> None:
+    guides = (ROOT / "README.md", ROOT / "docs" / "quick-start.md")
+    example_url = "https://raw.githubusercontent.com/xkam7ar/atlas-download-manager/main/LICENSE"
+
+    for guide in guides:
+        text = guide.read_text(encoding="utf-8")
+        assert "https://example.com/archive.zip" not in text
+        assert example_url in text
+        assert "--output-dir ./atlas-demo" in text
+        assert "--kind file --backend native --output-dir ./atlas-demo" in text
+
+    quick_start = (ROOT / "docs" / "quick-start.md").read_text(encoding="utf-8")
+    assert "test -f ./atlas-demo/LICENSE" in quick_start
+    assert "atlas inspect-session OUTPUT" in quick_start
+
+
+def test_public_docs_do_not_activate_mutable_remote_install_sources() -> None:
+    forbidden = (
+        re.compile(r"raw\.githubusercontent\.com/xkam7ar/atlas-download-manager/main/install\.sh"),
+        re.compile(
+            r"uv tool install(?: --force)? [\"']?"
+            r"git\+https://github\.com/xkam7ar/atlas-download-manager\.git(?!@)"
+        ),
+    )
+    violations: list[str] = []
+
+    for document in MARKDOWN_FILES:
+        text = document.read_text(encoding="utf-8")
+        for pattern in forbidden:
+            if match := pattern.search(text):
+                violations.append(
+                    f"{document.relative_to(ROOT)}: mutable remote source {match.group(0)!r}"
+                )
+
+    assert not violations, "Mutable remote install sources in public docs:\n" + "\n".join(
+        violations
+    )
+
+
+def test_public_documentation_has_no_public_ipv4_targets() -> None:
+    exposed: list[str] = []
+
+    for document in MARKDOWN_FILES:
+        for candidate in IPV4_LITERAL.findall(document.read_text(encoding="utf-8")):
+            try:
+                address = ipaddress.ip_address(candidate)
+            except ValueError:
+                continue
+            if address.is_global:
+                exposed.append(f"{document.relative_to(ROOT)}: {candidate}")
+
+    assert not exposed, "Public IPv4 literals in documentation:\n" + "\n".join(exposed)
+
+
+def test_open_directory_audit_does_not_publish_live_target_inventory() -> None:
+    audit = ROOT / "docs" / "open-directory-audit-2026-07-15.md"
+    text = audit.read_text(encoding="utf-8")
+    live_hosts = sorted(
+        {
+            match.group("host").lower()
+            for match in HOST_LIKE_TARGET.finditer(text)
+            if not match.group("host")
+            .lower()
+            .endswith((".example", ".invalid", ".localhost", ".test"))
+        }
+    )
+
+    assert "Raw target identities are intentionally omitted" in text
+    assert not re.search(r"^\|\s*#\s*\|\s*Target\b", text, flags=re.IGNORECASE | re.MULTILINE)
+    assert not live_hosts, f"Live hosts in public open-directory audit: {live_hosts}"
 
 
 def test_local_documentation_fragments_resolve() -> None:

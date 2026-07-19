@@ -145,11 +145,15 @@ atlas update
 atlas update --dry-run
 atlas update --yes
 atlas update --json
+atlas update --release-ref 0123456789abcdef0123456789abcdef01234567
 ```
 
 Unknown install methods are not modified automatically.
 Source checkout updates use `git -C <checkout> pull --ff-only`, so the command
 works even when Atlas is launched from another current directory.
+Homebrew upgrades consume the tap formula's versioned archive and checksum.
+uv-tool updates are blocked unless `--release-ref` is the verified release's
+full 40-character commit ID; branches and tag names are not update channels.
 
 ## `atlas get URL`
 

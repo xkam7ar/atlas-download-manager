@@ -3,12 +3,14 @@ from __future__ import annotations
 import gzip
 from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import HTTPCookieProcessor, ProxyHandler, Request
 
 import pytest
 
 from atlas.network import (
     FetchClient,
+    FetchError,
     FetchOptions,
     FetchResponse,
     _fetch_with_curl,
@@ -39,6 +41,29 @@ class _Response:
 
     def read(self, size: int) -> bytes:
         return self._body.read(size)
+
+
+def test_fetch_client_closes_http_error_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response_body = BytesIO(b"service unavailable")
+    error = HTTPError(
+        "https://example.com/files/",
+        503,
+        "Service Unavailable",
+        {},
+        response_body,
+    )
+
+    def raise_http_error(*_args: object, **_kwargs: object) -> None:
+        raise error
+
+    monkeypatch.setattr("atlas.network.open_request", raise_http_error)
+
+    with pytest.raises(FetchError, match="HTTP 503: Service Unavailable"):
+        FetchClient().get("https://example.com/files/")
+
+    assert response_body.closed
 
 
 def test_fetch_response_normalizes_case_insensitive_header_names() -> None:

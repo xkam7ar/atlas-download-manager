@@ -20,10 +20,10 @@ plain `atlas doctor` creates/checks those paths and uses temporary write probes.
 
 | Method | Availability | What it changes |
 | --- | --- | --- |
-| Local guided installer | Preview-only until public release | `--no-install` shows the complete plan; its Atlas install source is not public yet. |
+| Local guided installer | Source-preview plan | `--no-install` shows the complete plan; uv installation is blocked without `--release-ref`. |
 | `uv tool` | Tested on macOS and Linux | Installs Atlas only; system runtime tools remain explicit. |
 | Local checkout | Contributor path | Installs the current working tree. |
-| Remote installer / GitHub uv tool | Pre-release target | Unavailable until the documented repository and tag are public. |
+| Remote installer / GitHub uv tool | Release-only target | Requires the verified release's full 40-character commit ID; the default branch and tag names are never install channels. |
 | Homebrew tap | Pre-release packaging target | Unavailable until a complete, collision-safe formula is published to the tap. |
 
 Windows is not in the current CI or guided-installer support matrix. A Python
@@ -41,11 +41,13 @@ bash install.sh --no-install --no-menu --yes
 ```
 
 > [!IMPORTANT]
-> This repository snapshot is pre-release. The documented GitHub repository,
-> raw installer URL, release tag, and tap are not currently public. Do not use
+> This repository is a source preview rather than a supported package release.
+> Repository visibility alone does not make the raw installer, a release tag,
+> or the tap supported. Do not use
 > `pip install atlas` or `brew install atlas`: those names resolve to unrelated
-> projects. A collision-free distribution identity and public release must be
-> established before remote install instructions can become active.
+> projects. Atlas uses `atlas-download-manager` as its distribution and formula
+> identity, but a public release must still be published before remote install
+> instructions can become active.
 
 The installer detects the host and missing executables, shows every bootstrap,
 package-manager, Atlas, and verification command, then asks once. `--yes`
@@ -62,7 +64,9 @@ Linux mappings:
 | pacman | `ffmpeg aria2 wget`; Linuxbrew supplies `wget2` |
 
 `install.sh --no-install` prints the same plan and exits without installing
-packages, installing Atlas, or creating Atlas paths.
+packages, installing Atlas, or creating Atlas paths. Without an explicit
+`--release-ref`, the plan marks remote uv installation blocked; if uv would be
+needed to install Atlas, a mutating run exits before changing the host.
 
 The mutation order is fixed: detect and plan, render the complete plan, obtain
 one Atlas-level approval, run each listed bootstrap/package/Atlas command in
@@ -80,6 +84,8 @@ bash install.sh --minimal
 bash install.sh --media-only
 bash install.sh --mirrors
 bash install.sh --no-install --no-menu --yes
+# Release only, after verifying a downloaded release installer and checksums:
+bash install.sh --release-ref 0123456789abcdef0123456789abcdef01234567
 ```
 
 The installer verifies an existing `atlas` command by checking that it supports
@@ -94,7 +100,7 @@ Once the tap contains a release-complete and collision-safe formula, the
 intended install path is:
 
 ```bash
-brew install xkam7ar/tap/atlas
+brew install xkam7ar/tap/atlas-download-manager
 ```
 
 The formula is expected to depend on the full runtime:
@@ -105,12 +111,13 @@ brew install ffmpeg aria2 wget2 wget
 
 > [!NOTE]
 > The checked-in formula is not itself a published release. The template lives at
-> [`packaging/homebrew/atlas.rb`](../packaging/homebrew/atlas.rb). Copy it into
-> the tap, replace the release SHA, and run `brew update-python-resources atlas`
+> [`packaging/homebrew/atlas-download-manager.rb`](../packaging/homebrew/atlas-download-manager.rb). Copy it into
+> the tap, replace the release SHA, and run `brew update-python-resources atlas-download-manager`
 > before publishing so Python dependencies are declared as Homebrew resources.
 > It is release-ready only after the tap has a tagged tarball SHA and generated
 > Python resource blocks. Homebrew core already has an unrelated `atlas`
-> executable, so the tap formula also needs an explicit conflict/naming plan.
+> executable; this template uses the collision-safe formula name and declares
+> the executable conflict explicitly.
 
 ## Manual and developer fallback
 
@@ -121,8 +128,18 @@ uv tool install . --force
 atlas setup
 ```
 
-After a public repository exists, the corresponding remote command is intended
-to be `uv tool install git+https://github.com/xkam7ar/atlas.git`.
+A supported remote release publishes a version tag and its full commit ID. Verify
+both against the release metadata, then install by commit ID rather than a mutable
+ref name:
+
+```bash
+release_commit=0123456789abcdef0123456789abcdef01234567
+uv tool install "git+https://github.com/xkam7ar/atlas-download-manager.git@${release_commit}"
+```
+
+Do not execute `install.sh` from `main`. Download it and the published checksum
+manifest from the same immutable release, verify the checksum, inspect the
+script, and pass the same ref through `--release-ref`.
 
 `uv tool install` does not install system tools such as `ffmpeg`, `aria2c`,
 `wget2`, or `wget`. Initialize Atlas paths/configuration and preview the full
@@ -209,19 +226,22 @@ atlas update
 atlas update --dry-run
 atlas update --yes
 atlas update --json
+atlas update --release-ref 0123456789abcdef0123456789abcdef01234567
 ```
 
 `atlas update` detects Homebrew, uv-tool, source-checkout, or unknown installs
-and shows the matching update command. Unknown installs are not modified
-automatically. The remote commands below are release targets and will not work
-until the repository and tap are published.
+and shows the matching update command. Unknown installs are not modified.
+Homebrew consumes a versioned formula archive and checksum. uv-tool updates are
+blocked until the operator supplies the verified release's full commit ID.
+Source-checkout pulls remain an explicit local development workflow.
 
 Detected update plans:
 
 | Install method | Update command |
 | --- | --- |
-| Homebrew | `brew upgrade xkam7ar/tap/atlas` |
-| uv tool | `uv tool install --force git+https://github.com/xkam7ar/atlas.git` |
+| Homebrew | `brew upgrade xkam7ar/tap/atlas-download-manager` |
+| uv tool without a release ref | blocked; explain `--release-ref` and do not modify the system |
+| uv tool with a full `--release-ref COMMIT_ID` | `uv tool install --force git+https://github.com/xkam7ar/atlas-download-manager.git@COMMIT_ID` |
 | source checkout | `git -C <checkout> pull --ff-only` |
 | unknown | explain the situation and do not modify the system |
 
@@ -234,6 +254,8 @@ Atlas setup must be explicit and reversible:
 - show all package-manager commands before running them
 - keep `--no-install` and `--json` non-mutating
 - allow installer `--no-install` even when Homebrew is missing
+- never treat `main`, `master`, `HEAD`, or another mutable branch as a remote Atlas install/update source
+- require the same verified full commit ID in guided uv installation and `atlas update`
 - create config/output paths before reporting setup success
 - run `atlas doctor` before a guided installer declares success
 - keep the interactive menu as the first post-install human experience

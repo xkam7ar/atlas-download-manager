@@ -135,7 +135,10 @@ class EngineRouter:
             notes.append("manifest file is not saved unless Metalink mode is disabled")
         else:
             notes.append("resume enabled by default")
-            notes.append("native fallback available if aria2c is unavailable")
+            if request.backend == "native":
+                notes.append("built-in downloader; no external transfer tool required")
+            else:
+                notes.append("native fallback available if aria2c is unavailable")
         if request.dry_run:
             notes.append("dry run: no network request or download")
         return notes

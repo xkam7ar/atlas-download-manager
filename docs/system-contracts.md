@@ -105,17 +105,20 @@ apt, dnf, or pacman as appropriate; Arch uses Homebrew on Linux for `wget2`.
 Target install paths:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xkam7ar/atlas/main/install.sh | bash
-brew install xkam7ar/tap/atlas
-uv tool install git+https://github.com/xkam7ar/atlas.git
+brew install xkam7ar/tap/atlas-download-manager
+uv tool install "git+https://github.com/xkam7ar/atlas-download-manager.git@COMMIT_ID"
 atlas setup
 ```
 
-These remote paths are not yet release-available: the documented repository,
-raw installer, tag, and tap are unpublished, while the unqualified PyPI and
-Homebrew `atlas` names belong to unrelated projects. Until a collision-free
-release identity is chosen, the supported working path is a local checkout via
-`uv tool install . --force`; `install.sh --no-install` is safe for plan review.
+Repository visibility establishes a public-source preview, not a release
+channel. The unqualified PyPI and Homebrew `atlas` names belong to unrelated
+projects. Atlas uses `atlas-download-manager` for the distribution, repository,
+and formula while keeping the `atlas` command and import package. Until an
+immutable release exists, the supported working path is a local checkout via `uv tool install . --force`;
+`install.sh --no-install` is safe for plan review. A release installer must be
+downloaded with its checksum manifest from the same immutable release,
+verified, inspected, and invoked with `--release-ref`. Executing the copy on
+`main` is never a supported install path.
 
 The installer/setup layer must:
 
@@ -132,6 +135,10 @@ The installer/setup layer must:
 - keep `--no-install` and JSON planning output non-mutating
 - allow `install.sh --no-install` to report every missing prerequisite without
   attempting installation
+- block guided uv installation before mutation unless `--release-ref` is the
+  verified release's full 40-character commit ID
+- block uv-tool updates without the same explicit release ref; never install or
+  update Atlas from `main`, `master`, `HEAD`, or another mutable branch
 - verify an existing `atlas` command supports `atlas setup` before treating it
   as a complete installation
 - use the detected package-manager executable path in generated install commands
